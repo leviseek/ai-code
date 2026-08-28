@@ -42,12 +42,25 @@ impl DesktopShell {
         Ok(window)
     }
 
+    fn publish_state_changed(&mut self) {
+        let snapshot = self.snapshot();
+        self.events.publish(nextide_kernel::Event::new(
+            "shell.state.changed",
+            format!(
+                "tabs={},views={},tree={}",
+                snapshot.tabs, snapshot.editor_views, snapshot.tree_nodes
+            ),
+        ));
+    }
+
     pub fn scan_workspace<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
         path: &std::path::Path,
     ) -> std::io::Result<()> {
-        self.app.scan_workspace(fs, path)
+        self.app.scan_workspace(fs, path)?;
+        self.publish_state_changed();
+        Ok(())
     }
 
     pub fn open_file<F: nextide_kernel::FileSystem>(
@@ -55,15 +68,23 @@ impl DesktopShell {
         fs: &F,
         path: &std::path::Path,
     ) -> std::io::Result<()> {
-        self.app.open_file(fs, path)
+        self.app.open_file(fs, path)?;
+        self.publish_state_changed();
+        Ok(())
     }
 
     pub fn save_file<F: nextide_kernel::FileSystem>(&mut self, fs: &F) -> std::io::Result<()> {
-        self.app.save_file(fs)
+        self.app.save_file(fs)?;
+        self.publish_state_changed();
+        Ok(())
     }
 
     pub fn close_file(&mut self, path: &std::path::Path, force: bool) -> std::io::Result<bool> {
-        self.app.close_file(path, force)
+        let closed = self.app.close_file(path, force)?;
+        if closed {
+            self.publish_state_changed();
+        }
+        Ok(closed)
     }
 
     pub fn present_frame(&mut self) -> std::io::Result<()> {
