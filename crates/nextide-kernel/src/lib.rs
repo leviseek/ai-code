@@ -15,6 +15,7 @@ pub mod process;
 pub mod rpc;
 pub mod task;
 pub mod task_manager;
+pub mod terminal;
 pub mod vfs;
 
 pub use application::ApplicationContext;
@@ -25,6 +26,7 @@ pub use process::{run_capture, run_capture_timeout, ProcessOutput};
 pub use rpc::{LocalRpcRouter, RpcError, RpcHandler, RpcRequest, RpcResponse};
 pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
 pub use task_manager::TaskManager;
+pub use terminal::TerminalProfile;
 pub use vfs::{FileSystem, LocalFileSystem};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
