@@ -1,4 +1,4 @@
-use crate::ShellCommand;
+use crate::{CommandExecutionResult, CommandOutcome, ShellCommand};
 
 #[derive(Clone, Debug)]
 pub struct CommandDescriptor {
@@ -102,6 +102,32 @@ pub fn command_summaries() -> Vec<CommandSummary> {
     COMMANDS.iter().map(CommandSummary::from).collect()
 }
 
+/// Resolves the display title of a registered command id, or `None` when the
+/// id is not registered.
+pub fn command_title(id: &str) -> Option<&'static str> {
+    get_command(id).map(|command| command.title)
+}
+
+/// Returns whether the given id is a registered command.
+pub fn is_registered(id: &str) -> bool {
+    get_command(id).is_some()
+}
+
+/// Renders a UI-friendly description of an execution result using the
+/// registered command title when the id is known, falling back to the id.
+pub fn describe_execution(result: &CommandExecutionResult) -> String {
+    let id = result.command_id();
+    let title = command_title(id)
+        .map(str::to_owned)
+        .unwrap_or_else(|| id.to_owned());
+    match (result.outcome(), result.error()) {
+        (CommandOutcome::Failed, Some(error)) => {
+            format!("{title} ({id}): failed: {error}")
+        }
+        _ => format!("{title} ({id}): {}", result.outcome()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +207,40 @@ mod tests {
                 command.id
             );
         }
+    }
+
+    #[test]
+    fn command_title_resolves_registered_titles() {
+        assert_eq!(command_title("file.open"), Some("Open File"));
+        assert_eq!(command_title("file.save"), Some("Save File"));
+        assert_eq!(command_title("missing"), None);
+    }
+
+    #[test]
+    fn is_registered_queries_registry() {
+        assert!(is_registered("file.save"));
+        assert!(!is_registered("missing"));
+    }
+
+    #[test]
+    fn describe_execution_uses_registered_title() {
+        let applied = CommandExecutionResult::applied("file.save");
+        assert_eq!(
+            describe_execution(&applied),
+            "Save File (file.save): applied"
+        );
+        let failed = CommandExecutionResult::failed(
+            "file.open",
+            crate::CommandError::invalid_state("no file"),
+        );
+        assert_eq!(
+            describe_execution(&failed),
+            "Open File (file.open): failed: no file"
+        );
+        let unknown = CommandExecutionResult::applied("not.registered");
+        assert_eq!(
+            describe_execution(&unknown),
+            "not.registered (not.registered): applied"
+        );
     }
 }

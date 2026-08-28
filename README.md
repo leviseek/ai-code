@@ -21,6 +21,8 @@ Capability metadata is observable through `CapabilityRegistry::ids`, `iter`, `su
 
 Shell command metadata is observable through `command_ids`, `get_command`, `command_summary`, and `command_summaries`: ids enumerate in stable declaration order, and `CommandSummary` is a cloneable, UI-safe snapshot of a command's id, title, and search keywords, decoupled from the static `COMMANDS` descriptor table so the command palette, UI, and plugins can observe commands without borrowing. `search_commands`/`command_id`/`COMMANDS` remain unchanged.
 
+Shell command execution is observable through `CommandExecutionResult`, `CommandOutcome`, and `CommandError`: `DesktopShell::execute_observed` runs a `ShellCommand` and returns a typed, cloneable record (stable command id, tri-state outcome, structured error) that UI and plugins can consume without borrowing. Every execution publishes a `shell.command.executed` event with a stable payload (`id=<id>,outcome=<outcome>` or `id=<id>,outcome=failed,error=<kind>,message=<message>`); failures keep publishing `shell.command.failed` plus an error notification. `command_title`, `is_registered`, and `describe_execution` resolve execution results back to registered command metadata, and `CommandError`/`CommandErrorKind` classify failures (`io`, `not-found`, `invalid-state`, `unknown`) with a message, round-tripping through `std::io::Error`. Existing `execute`, `execute_checked`, `execute_selected`, and `CommandResult` signatures and behavior are unchanged; the checked/selected paths now route through the observable one, so every executed command also emits `shell.command.executed`.
+
 ## Development
 
 ```powershell

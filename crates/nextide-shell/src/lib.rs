@@ -12,10 +12,14 @@ mod renderer;
 mod view_model;
 
 pub use command_registry::{
-    command_id, command_ids, command_summaries, command_summary, get_command,
-    search as search_commands, CommandDescriptor, CommandSummary, COMMANDS,
+    command_id, command_ids, command_summaries, command_summary, command_title, describe_execution,
+    get_command, is_registered, search as search_commands, CommandDescriptor, CommandSummary,
+    COMMANDS,
 };
-pub use commands::{from_id as command_from_id, CommandResult, ShellCommand};
+pub use commands::{
+    from_id as command_from_id, CommandError, CommandErrorKind, CommandExecutionResult,
+    CommandOutcome, CommandResult, ShellCommand,
+};
 pub use event_loop::{EventLoop, HeadlessEventLoop};
 pub use input::{command_for_input, UiInput};
 pub use keymap::{command_for, KeyChord};
@@ -208,23 +212,39 @@ impl DesktopShell {
         }
     }
 
+    /// Executes a command through the observable path, returning a typed
+    /// [`CommandExecutionResult`] that UI and plugins can consume. Every
+    /// execution publishes a `shell.command.executed` event with a stable
+    /// payload; failures additionally publish `shell.command.failed` and an
+    /// error notification, matching [`execute_checked`]'s reporting.
+    pub fn execute_observed<F: nextide_kernel::FileSystem>(
+        &mut self,
+        fs: &F,
+        command: ShellCommand,
+    ) -> CommandExecutionResult {
+        let id = command_id(&command);
+        let observed = CommandExecutionResult::from_io_result(id, self.execute(fs, command));
+        self.events.publish(nextide_kernel::Event::new(
+            "shell.command.executed",
+            observed.to_event_payload(),
+        ));
+        if let Some(error) = observed.error() {
+            let message = error.to_string();
+            self.events.publish(nextide_kernel::Event::new(
+                "shell.command.failed",
+                message.clone(),
+            ));
+            self.notifications.push(NotificationLevel::Error, message);
+        }
+        observed
+    }
+
     pub fn execute_checked<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
         command: ShellCommand,
     ) -> std::io::Result<CommandResult> {
-        match self.execute(fs, command) {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                let message = error.to_string();
-                self.events.publish(nextide_kernel::Event::new(
-                    "shell.command.failed",
-                    message.clone(),
-                ));
-                self.notifications.push(NotificationLevel::Error, message);
-                Err(error)
-            }
-        }
+        self.execute_observed(fs, command).into_io_result()
     }
 
     pub fn execute_selected<F: nextide_kernel::FileSystem>(
@@ -242,13 +262,13 @@ impl DesktopShell {
         let Some(command) = command_from_id(id, path) else {
             return Ok(CommandResult::Noop);
         };
-        let result = self.execute(fs, command)?;
-        if result == CommandResult::Applied {
+        let observed = self.execute_observed(fs, command);
+        if observed.is_applied() {
             self.events
                 .publish(nextide_kernel::Event::new("palette.command.executed", id));
             self.palette.close();
         }
-        Ok(result)
+        observed.into_io_result()
     }
 
     pub fn selected_command_id(&self) -> Option<&'static str> {
@@ -721,6 +741,56 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(shell.events.pending("shell.command.failed"), 1);
+        assert_eq!(shell.events.pending("shell.command.executed"), 1);
+    }
+
+    #[test]
+    fn execute_observed_publishes_typed_execution_result() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let result = shell.execute_observed(&NoopFs, ShellCommand::SaveActive);
+        assert!(result.is_noop());
+        assert_eq!(result.command_id(), "file.save");
+        assert_eq!(result.outcome(), CommandOutcome::Noop);
+        assert!(result.error().is_none());
+        assert_eq!(shell.events.pending("shell.command.executed"), 1);
+        assert_eq!(shell.events.pending("shell.command.failed"), 0);
+        assert_eq!(
+            shell.events.drain("shell.command.executed")[0].payload,
+            "id=file.save,outcome=noop"
+        );
+    }
+
+    #[test]
+    fn execute_observed_returns_typed_failure_and_publishes_events() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let path = std::path::PathBuf::from("main.rs");
+        shell.app.workspace.open_file(path.clone());
+        shell.app.tabs.open(path.clone());
+        shell
+            .app
+            .views
+            .push(nextide_kernel::EditorViewState::new(path.clone()));
+        shell.app.views[0].mark_dirty(true);
+        let result =
+            shell.execute_observed(&NoopFs, ShellCommand::CloseFile { path, force: false });
+        assert!(result.is_failed());
+        assert!(!result.is_success());
+        assert_eq!(result.error().unwrap().kind(), CommandErrorKind::Io);
+        assert_eq!(shell.events.pending("shell.command.executed"), 1);
+        assert_eq!(shell.events.pending("shell.command.failed"), 1);
+        assert_eq!(shell.notifications.items().len(), 1);
+        assert_eq!(
+            shell.notifications.items()[0].level,
+            NotificationLevel::Error
+        );
+        let payload = shell.events.drain("shell.command.executed")[0]
+            .payload
+            .clone();
+        assert!(payload.starts_with("id=file.close,outcome=failed,error=io,message="));
+        assert_eq!(
+            shell.events.drain("shell.command.failed")[0].payload,
+            "document has unsaved changes"
+        );
     }
 
     struct TreeFs;
