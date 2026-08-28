@@ -1,4 +1,4 @@
-use crate::{EventLoop, HeadlessEventLoop, PlatformEvent};
+use crate::{EventLoop, HeadlessEventLoop};
 use std::io;
 
 pub trait PlatformBackend {
@@ -19,6 +19,7 @@ impl PlatformBackend for HeadlessBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PlatformEvent;
     #[test]
     fn headless_backend_creates_an_empty_loop() {
         let backend = HeadlessBackend::default();
