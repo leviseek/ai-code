@@ -28,6 +28,7 @@ impl FileTreeModel {
         if self.nodes.iter().any(|node| node.path == path) {
             return;
         }
+        let depth = path.components().count().saturating_sub(1);
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -37,7 +38,7 @@ impl FileTreeModel {
             name,
             kind,
             expanded: false,
-            depth: path.components().count().saturating_sub(1),
+            depth,
         });
         self.nodes.sort_by(|a, b| a.path.cmp(&b.path));
     }
