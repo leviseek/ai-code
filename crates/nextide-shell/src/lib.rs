@@ -1,7 +1,9 @@
 mod commands;
+mod keymap;
 mod view_model;
 
 pub use commands::{CommandResult, ShellCommand};
+pub use keymap::{command_for, KeyChord};
 pub use view_model::ShellSnapshot;
 
 use nextide_kernel::{
