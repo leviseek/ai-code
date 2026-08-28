@@ -273,6 +273,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn publishes_document_changed_after_transaction() {
+        let mut kernel = EditorKernel::new("a");
+        let mut bus = EventBus::default();
+        kernel
+            .apply_with_events(
+                EditTransaction::new("insert", 0, vec![TextEdit::replace(1, 1, "b")]),
+                &mut bus,
+            )
+            .unwrap();
+        assert_eq!(bus.pending("document.changed"), 1);
+        assert_eq!(bus.drain("document.changed")[0].payload, "revision=1");
+    }
+
+    #[test]
     fn applies_multiple_edits_in_reverse_order() {
         let mut kernel = EditorKernel::new("hello world");
         let tx = EditTransaction::new(
