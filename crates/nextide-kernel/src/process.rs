@@ -25,6 +25,46 @@ pub fn run_capture(
     })
 }
 
+pub fn run_capture_timeout(
+    program: &str,
+    args: &[String],
+    working_directory: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<ProcessOutput> {
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(working_directory)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            child.kill()?;
+            let output = child.wait_with_output()?;
+            return Ok(ProcessOutput {
+                exit_code: None,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: format!(
+                    "{}process timed out after {:?}",
+                    String::from_utf8_lossy(&output.stderr),
+                    timeout
+                ),
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let output = child.wait_with_output()?;
+    Ok(ProcessOutput {
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

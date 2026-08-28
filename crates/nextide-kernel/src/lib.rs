@@ -21,7 +21,7 @@ pub use application::ApplicationContext;
 pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
 pub use events::{Event, EventBus};
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
-pub use process::{run_capture, ProcessOutput};
+pub use process::{run_capture, run_capture_timeout, ProcessOutput};
 pub use rpc::{LocalRpcRouter, RpcError, RpcHandler, RpcRequest, RpcResponse};
 pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
 pub use task_manager::TaskManager;
