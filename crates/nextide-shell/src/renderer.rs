@@ -1,8 +1,31 @@
 use crate::ShellSnapshot;
 use std::io;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeRenderRow {
+    pub path: std::path::PathBuf,
+    pub label: String,
+    pub x: u32,
+    pub y: u32,
+    pub selected: bool,
+}
+
 pub trait UiRenderer {
     fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()>;
+    fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
+        Ok(snapshot
+            .visible_tree
+            .iter()
+            .enumerate()
+            .map(|(index, item)| TreeRenderRow {
+                path: item.path.clone(),
+                label: item.name.clone(),
+                x: item.indent,
+                y: index as u32 * 24,
+                selected: item.selected,
+            })
+            .collect())
+    }
 }
 
 #[derive(Default, Debug)]
