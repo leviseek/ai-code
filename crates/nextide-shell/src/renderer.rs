@@ -8,6 +8,7 @@ pub struct TreeRenderRow {
     pub x: u32,
     pub y: u32,
     pub selected: bool,
+    pub icon: &'static str,
 }
 
 pub trait UiRenderer {
@@ -23,6 +24,7 @@ pub trait UiRenderer {
                 x: item.indent,
                 y: index as u32 * 24,
                 selected: item.selected,
+                icon: if item.directory { "folder" } else { "file" },
             })
             .collect())
     }
