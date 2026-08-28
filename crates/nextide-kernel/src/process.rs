@@ -97,6 +97,7 @@ mod tests {
         }
         .unwrap();
         assert_eq!(result.exit_code, None);
+        assert!(!result.is_success());
         assert!(result.stderr.contains("timed out"));
     }
 
