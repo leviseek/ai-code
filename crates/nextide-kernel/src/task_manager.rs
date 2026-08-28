@@ -4,6 +4,13 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskSummary {
+    pub id: String,
+    pub state: crate::TaskState,
+    pub program: String,
+}
+
 #[derive(Default, Debug)]
 pub struct TaskManager {
     tasks: BTreeMap<String, Task>,
@@ -37,6 +44,17 @@ impl TaskManager {
             }
             Some(_) | None => Err(TaskError::InvalidTransition),
         }
+    }
+
+    pub fn summaries(&self) -> Vec<TaskSummary> {
+        self.tasks
+            .iter()
+            .map(|(id, task)| TaskSummary {
+                id: id.clone(),
+                state: task.state,
+                program: task.spec.program.clone(),
+            })
+            .collect()
     }
 
     pub fn contains(&self, id: &str) -> bool {

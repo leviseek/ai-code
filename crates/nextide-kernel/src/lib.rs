@@ -35,7 +35,7 @@ pub use render::{HeadlessSurface, RenderSurface, SurfaceSize};
 pub use rpc::{LocalRpcRouter, RpcError, RpcHandler, RpcRequest, RpcResponse};
 pub use tabs::{Tab, TabModel};
 pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
-pub use task_manager::TaskManager;
+pub use task_manager::{TaskManager, TaskSummary};
 pub use terminal::TerminalProfile;
 pub use vfs::{FileSystem, LocalFileSystem};
 pub use window::{
