@@ -168,6 +168,19 @@ impl EditorKernel {
         Ok(())
     }
 
+    pub fn save_with_events<F: FileSystem>(
+        &mut self,
+        fs: &F,
+        bus: &mut EventBus,
+    ) -> io::Result<()> {
+        self.save(fs)?;
+        bus.publish(Event::new(
+            "document.saved",
+            format!("revision={}", self.document.revision),
+        ));
+        Ok(())
+    }
+
     pub fn save_as<F: FileSystem>(&mut self, fs: &F, path: &Path) -> io::Result<()> {
         fs.atomic_write(path, self.document.text())?;
         self.path = Some(path.to_string_lossy().into_owned());
@@ -378,6 +391,26 @@ mod tests {
         kernel.save(&fs).unwrap();
         assert!(!kernel.is_dirty());
         assert_eq!(fs.read(path).unwrap(), "fn start() {}\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publishes_saved_after_vfs_save() {
+        let root = std::env::temp_dir().join(format!("nextide-saved-{}", std::process::id()));
+        let fs = LocalFileSystem::rooted(&root);
+        let path = Path::new("main.rs");
+        fs.write(path, "a").unwrap();
+        let mut kernel = EditorKernel::open(&fs, path).unwrap();
+        kernel
+            .apply(EditTransaction::new(
+                "edit",
+                0,
+                vec![TextEdit::replace(0, 1, "b")],
+            ))
+            .unwrap();
+        let mut bus = EventBus::default();
+        kernel.save_with_events(&fs, &mut bus).unwrap();
+        assert_eq!(bus.drain("document.saved")[0].payload, "revision=1");
         let _ = std::fs::remove_dir_all(root);
     }
 
