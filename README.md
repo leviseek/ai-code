@@ -15,6 +15,7 @@ The repository currently contains the first Phase 0 vertical slice:
 - incremental file-tree rendering with structured change batches and events
 - task runtime with lifecycle events, summaries, cancellation, timeout, cleanup, and task queries
 - VFS read-only, typed file metadata queries (`exists` returning `io::Result<bool>` plus `is_file`/`is_dir`/`metadata` returning `FileKind` + `FileMetadata` with kind/len/readonly): `exists` reports `Ok(true)` for existing entries and `Ok(false)` for missing ones, and rooted filesystems reject path escapes with `Err(PermissionDenied)` instead of silently reporting `false`; missing entries report `Ok(false)` from `exists`/`is_file`/`is_dir` and `NotFound` from `metadata`
+- VFS typed, stable-sorted directory enumeration (`read_dir` returning `io::Result<Vec<FileEntry>>` with name/path/kind/len): entries sort by name in stable order, missing paths report `NotFound`, non-directory paths report `NotADirectory`, and root escapes keep reporting `PermissionDenied`; the trait default returns `Unsupported`, so existing `FileSystem` implementations (`LocalFileSystem`, `MemoryFs`, `TreeFs`, `NoopFs`) compile and behave unchanged, and `LocalFileSystem::list` now delegates to `read_dir`
 
 Task state and summary APIs are available through `TaskManager::state`, `summary`, `summaries`, and `ids`; pending tasks can be removed and terminal tasks can be cleaned with lifecycle events.
 

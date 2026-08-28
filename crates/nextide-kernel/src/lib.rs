@@ -41,7 +41,7 @@ pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
 pub use task_events::{AsyncTaskEventSink, TaskEventReceiver};
 pub use task_manager::{TaskManager, TaskSummary};
 pub use terminal::TerminalProfile;
-pub use vfs::{FileKind, FileMetadata, FileSystem, LocalFileSystem};
+pub use vfs::{FileEntry, FileKind, FileMetadata, FileSystem, LocalFileSystem};
 pub use window::{
     HeadlessWindowService, WindowEvent, WindowHandle, WindowOptions, WindowService, WindowSize,
 };

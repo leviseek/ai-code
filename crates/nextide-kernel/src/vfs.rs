@@ -36,6 +36,19 @@ impl FileMetadata {
     }
 }
 
+/// A typed directory entry as reported by [`FileSystem::read_dir`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileEntry {
+    /// The bare name of the entry (e.g. `main.rs`).
+    pub name: String,
+    /// The full path of the entry, joined against the requested directory.
+    pub path: PathBuf,
+    /// The kind of the entry.
+    pub kind: FileKind,
+    /// Size of the entry in bytes (0 for directories and non-file entries).
+    pub len: u64,
+}
+
 pub trait FileSystem {
     fn read(&self, path: &Path) -> io::Result<String>;
     fn write(&self, path: &Path, text: &str) -> io::Result<()>;
@@ -102,6 +115,25 @@ pub trait FileSystem {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "directory listing is not supported",
+        ))
+    }
+
+    /// Enumerates the direct children of `path` as typed, stable-sorted
+    /// [`FileEntry`] records.
+    ///
+    /// Entries are sorted by name in ascending order; the sort is stable, so
+    /// entries whose names compare equal keep their underlying read order.
+    ///
+    /// Implementations must keep workspace-root safety constraints: paths that
+    /// escape the workspace root must fail with
+    /// [`io::ErrorKind::PermissionDenied`], missing paths with
+    /// [`io::ErrorKind::NotFound`], and non-directory paths with
+    /// [`io::ErrorKind::NotADirectory`].
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileEntry>> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory enumeration is not supported",
         ))
     }
 }
@@ -203,14 +235,42 @@ impl FileSystem for LocalFileSystem {
     }
 
     fn list(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+        Ok(self
+            .read_dir(path)?
+            .into_iter()
+            .map(|entry| (entry.path, entry.kind == FileKind::Directory))
+            .collect())
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileEntry>> {
         let directory = self.resolve(path)?;
+        let metadata = fs::metadata(&directory)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a directory", path.display()),
+            ));
+        }
         let mut entries = fs::read_dir(directory)?
             .map(|entry| {
                 let entry = entry?;
-                Ok((path.join(entry.file_name()), entry.file_type()?.is_dir()))
+                let metadata = entry.metadata()?;
+                let kind = if metadata.is_dir() {
+                    FileKind::Directory
+                } else if metadata.is_file() {
+                    FileKind::File
+                } else {
+                    FileKind::Other
+                };
+                Ok(FileEntry {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    path: path.join(entry.file_name()),
+                    kind,
+                    len: metadata.len(),
+                })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
 }
@@ -367,5 +427,100 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn rooted_filesystem_read_dir_lists_typed_stable_sorted_entries() {
+        let root = std::env::temp_dir().join(format!("nextide-vfs-readdir-{}", std::process::id()));
+        let fs = LocalFileSystem::rooted(&root);
+        fs.write(Path::new("src/z-last.txt"), "zzz").unwrap();
+        fs.write(Path::new("src/a-first.txt"), "a").unwrap();
+        fs.write(Path::new("src/mid/dir.txt"), "mid").unwrap();
+
+        let entries = fs.read_dir(Path::new("src")).unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["a-first.txt", "mid", "z-last.txt"]);
+
+        let file = entries
+            .iter()
+            .find(|entry| entry.name == "a-first.txt")
+            .unwrap();
+        assert_eq!(file.path, Path::new("src").join("a-first.txt"));
+        assert_eq!(file.kind, FileKind::File);
+        assert_eq!(file.len, 1);
+
+        let directory = entries.iter().find(|entry| entry.name == "mid").unwrap();
+        assert_eq!(directory.path, Path::new("src").join("mid"));
+        assert_eq!(directory.kind, FileKind::Directory);
+        assert_eq!(directory.len, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_dir_reports_not_found_and_not_a_directory() {
+        let root =
+            std::env::temp_dir().join(format!("nextide-vfs-readdir-errors-{}", std::process::id()));
+        let fs = LocalFileSystem::rooted(&root);
+        fs.write(Path::new("file.txt"), "x").unwrap();
+        assert_eq!(
+            fs.read_dir(Path::new("missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs.read_dir(Path::new("file.txt")).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_dir_rejects_escape_and_empty_directories_list_empty() {
+        let root =
+            std::env::temp_dir().join(format!("nextide-vfs-readdir-safe-{}", std::process::id()));
+        let fs = LocalFileSystem::rooted(&root);
+        assert_eq!(
+            fs.read_dir(Path::new("..")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        assert!(fs.read_dir(Path::new("empty")).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_dir_default_is_unsupported_for_minimal_implementations() {
+        struct MinimalFs;
+        impl FileSystem for MinimalFs {
+            fn read(&self, _: &Path) -> io::Result<String> {
+                Ok(String::new())
+            }
+            fn write(&self, _: &Path, _: &str) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            MinimalFs.read_dir(Path::new(".")).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn list_and_read_dir_agree() {
+        let root =
+            std::env::temp_dir().join(format!("nextide-vfs-list-agree-{}", std::process::id()));
+        let fs = LocalFileSystem::rooted(&root);
+        fs.write(Path::new("a.txt"), "a").unwrap();
+        fs.write(Path::new("b.txt"), "bb").unwrap();
+        fs.write(Path::new("dir/c.txt"), "c").unwrap();
+
+        let listed = fs.list(Path::new(".")).unwrap();
+        let entries = fs.read_dir(Path::new(".")).unwrap();
+        assert_eq!(listed.len(), entries.len());
+        for (entry, (path, is_dir)) in entries.iter().zip(&listed) {
+            assert_eq!(entry.path, *path);
+            assert_eq!(entry.kind == FileKind::Directory, *is_dir);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
