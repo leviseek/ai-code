@@ -30,6 +30,17 @@ impl TaskManager {
             .ok_or(TaskError::InvalidTransition)?
             .append_output(chunk)
     }
+    pub fn append_output_with_events(
+        &mut self,
+        id: &str,
+        chunk: &str,
+        events: &mut EventBus,
+    ) -> Result<(), TaskError> {
+        self.append_output(id, chunk)?;
+        events.publish(Event::new("task.output", format!("{id}:{chunk}")));
+        Ok(())
+    }
+
     pub fn cancel(&mut self, id: &str, events: &mut EventBus) -> Result<(), TaskError> {
         self.tasks
             .get_mut(id)
@@ -54,7 +65,7 @@ impl TaskManager {
             .spec;
         let output = run_capture(&spec.program, &spec.args, working_directory)?;
         let combined = format!("{}{}", output.stdout, output.stderr);
-        self.append_output(id, &combined)
+        self.append_output_with_events(id, &combined, events)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
         self.finish(id, output.exit_code.unwrap_or(-1), events)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
@@ -71,7 +82,10 @@ impl TaskManager {
             .get_mut(id)
             .ok_or(TaskError::InvalidTransition)?
             .finish(code)?;
-        events.publish(Event::new("task.finished", format!("{id}:{}", code)));
+        if code != 0 {
+            events.publish(Event::new("task.failed", format!("{id}:{code}")));
+        }
+        events.publish(Event::new("task.finished", format!("{id}:{code}")));
         Ok(result)
     }
 }
