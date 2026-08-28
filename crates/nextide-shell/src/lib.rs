@@ -456,6 +456,22 @@ mod tests {
     }
 
     #[test]
+    fn pump_once_routes_mouse_click_to_file_command() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        let mut events = HeadlessEventLoop::default();
+        events.push(PlatformEvent::MouseClick { x: 10, y: 0 });
+        assert_eq!(
+            shell.pump_once(&mut events, &NoopFs).unwrap(),
+            Some(CommandResult::Applied)
+        );
+        assert_eq!(shell.selected_tree, Some("main.rs".into()));
+    }
+
+    #[test]
     fn pump_once_translates_platform_events_to_shell_actions() {
         let mut shell = DesktopShell::new("NextIDE");
         let mut events = HeadlessEventLoop::default();
