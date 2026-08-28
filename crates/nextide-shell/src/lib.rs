@@ -54,6 +54,14 @@ impl DesktopShell {
         self.app.open_file(fs, path)
     }
 
+    pub fn save_file<F: nextide_kernel::FileSystem>(&mut self, fs: &F) -> std::io::Result<()> {
+        self.app.save_file(fs)
+    }
+
+    pub fn close_file(&mut self, path: &std::path::Path, force: bool) -> std::io::Result<bool> {
+        self.app.close_file(path, force)
+    }
+
     pub fn present_frame(&mut self) -> std::io::Result<()> {
         self.surface.present()
     }
