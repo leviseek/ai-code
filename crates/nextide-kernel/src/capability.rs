@@ -82,6 +82,19 @@ impl CapabilityRegistry {
         Ok(())
     }
 
+    pub fn invoke<T, F>(
+        &self,
+        id: &str,
+        granted: &[String],
+        operation: F,
+    ) -> Result<T, RegistryError>
+    where
+        F: FnOnce(&CapabilityDescriptor) -> T,
+    {
+        self.authorize(id, granted)?;
+        Ok(operation(self.get(id)?))
+    }
+
     pub fn get(&self, id: &str) -> Result<&CapabilityDescriptor, RegistryError> {
         self.entries
             .get(id)
@@ -131,6 +144,19 @@ mod tests {
         );
         let granted = vec!["terminal.execute".into()];
         assert!(registry.authorize("terminal", &granted).is_ok());
+    }
+
+    #[test]
+    fn invokes_only_after_authorization() {
+        let mut registry = CapabilityRegistry::default();
+        registry
+            .register(CapabilityDescriptor::new("search", "1.0").with_permission("workspace.read"))
+            .unwrap();
+        let granted = vec!["workspace.read".to_owned()];
+        let version = registry
+            .invoke("search", &granted, |descriptor| descriptor.version.clone())
+            .unwrap();
+        assert_eq!(version, "1.0");
     }
 
     #[test]
