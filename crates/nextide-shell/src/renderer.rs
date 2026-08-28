@@ -85,6 +85,21 @@ impl UiRenderer for HeadlessRenderer {
 mod tests {
     use super::*;
     #[test]
+    fn tree_render_row_hit_respects_indent_and_bounds() {
+        let row = TreeRenderRow {
+            path: "src/main.rs".into(),
+            label: "main.rs".into(),
+            x: 16,
+            y: 24,
+            selected: false,
+            icon: "file",
+        };
+        assert!(row.hit(crate::Point { x: 20, y: 30 }, 280));
+        assert!(!row.hit(crate::Point { x: 10, y: 30 }, 280));
+        assert!(!row.hit(crate::Point { x: 20, y: 50 }, 280));
+    }
+
+    #[test]
     fn headless_renderer_keeps_latest_snapshot() {
         let mut renderer = HeadlessRenderer::default();
         let snapshot = ShellSnapshot {
