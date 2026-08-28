@@ -433,6 +433,19 @@ mod tests {
     }
 
     #[test]
+    fn tree_snapshot_marks_selected_item() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        let _ = shell.tree_input_at(Point { x: 10, y: 0 });
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.selected_tree, Some("main.rs".into()));
+        assert!(snapshot.visible_tree[0].selected);
+    }
+
+    #[test]
     fn tree_input_at_selects_and_classifies_visible_nodes() {
         let mut shell = DesktopShell::new("NextIDE");
         shell
