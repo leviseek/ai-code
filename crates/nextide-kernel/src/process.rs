@@ -584,10 +584,9 @@ fn kill_child_tree(child: &mut Child) -> io::Result<()> {
         {
             Ok(status) if status.success() => return Ok(()),
             Ok(_) => {
-                last_err = Some(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("kill -KILL {group} did not succeed"),
-                ));
+                last_err = Some(io::Error::other(format!(
+                    "kill -KILL {group} did not succeed"
+                )));
             }
             Err(err) => last_err = Some(err),
         }
@@ -973,7 +972,7 @@ mod tests {
         let started = std::time::Instant::now();
         loop {
             if let Ok(text) = std::fs::read_to_string(path) {
-                if let Some(pid) = text.trim().parse::<u32>().ok() {
+                if let Ok(pid) = text.trim().parse::<u32>() {
                     return Some(pid);
                 }
             }

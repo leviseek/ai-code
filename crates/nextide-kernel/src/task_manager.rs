@@ -199,9 +199,9 @@ impl TaskManager {
         let output = run_capture(&spec.program, &spec.args, working_directory)?;
         let combined = output.combined();
         self.append_output_with_events(id, &combined, events)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+            .map_err(io::Error::other)?;
         self.finish(id, output.exit_code.unwrap_or(-1), events)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+            .map_err(io::Error::other)
     }
 
     pub fn run_capture_timeout(
@@ -221,21 +221,20 @@ impl TaskManager {
         let output = run_capture_timeout(&spec.program, &spec.args, working_directory, timeout)?;
         let combined = output.combined();
         self.append_output_with_events(id, &combined, events)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        if output.exit_code.is_none() {
+            .map_err(io::Error::other)?;
+        if let Some(exit_code) = output.exit_code {
+            self.finish(id, exit_code, events).map_err(io::Error::other)
+        } else {
             let result = self
                 .tasks
                 .get(id)
                 .ok_or(TaskError::InvalidTransition)
                 .map(lock_task)
                 .and_then(|mut task| task.timeout())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             events.publish(Event::new("task.timeout", id));
             events.publish(Event::new("task.finished", format!("{id}:timeout")));
             Ok(result)
-        } else {
-            self.finish(id, output.exit_code.unwrap(), events)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
     }
 
@@ -282,7 +281,7 @@ impl TaskManager {
         let output = proc.wait()?;
         flush_decoders(self, id, &mut decoders)?;
         self.finish(id, output.exit_code.unwrap_or(-1), events)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+            .map_err(io::Error::other)
     }
 
     /// Like [`TaskManager::run_streaming`], but capped by a hard deadline.
@@ -367,7 +366,7 @@ impl TaskManager {
                 .ok_or(TaskError::InvalidTransition)
                 .map(lock_task)
                 .and_then(|mut task| task.timeout())
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                .map_err(io::Error::other)?;
             events.publish(Event::new("task.timeout", id));
             events.publish(Event::new("task.finished", format!("{id}:timeout")));
             Ok(result)
@@ -375,7 +374,7 @@ impl TaskManager {
             let output = proc.wait()?;
             flush_decoders(self, id, &mut decoders)?;
             self.finish(id, output.exit_code.unwrap_or(-1), events)
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+                .map_err(io::Error::other)
         }
     }
 
@@ -818,9 +817,7 @@ fn append_chunk(
     // chunk boundaries lands intact in the task's final output instead of as
     // replacement characters.
     let text = decoders.for_kind(chunk.kind).feed(&chunk.data);
-    manager
-        .append_output(id, &text)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    manager.append_output(id, &text).map_err(io::Error::other)?;
     // `task.output` events keep the lossy per-chunk view; `on_chunk` already
     // hands callers the raw bytes to decode however they need.
     events.publish(Event::new("task.output", format!("{id}:{}", chunk.text())));
@@ -836,9 +833,7 @@ fn flush_decoders(
 ) -> io::Result<()> {
     let tail = format!("{}{}", decoders.stdout.finish(), decoders.stderr.finish());
     if !tail.is_empty() {
-        manager
-            .append_output(id, &tail)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        manager.append_output(id, &tail).map_err(io::Error::other)?;
     }
     Ok(())
 }

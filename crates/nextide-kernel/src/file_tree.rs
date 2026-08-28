@@ -152,7 +152,7 @@ mod tests {
         assert!(
             tree.nodes()
                 .iter()
-                .find(|node| node.path == PathBuf::from("src"))
+                .find(|node| node.path == Path::new("src"))
                 .unwrap()
                 .expanded
         );

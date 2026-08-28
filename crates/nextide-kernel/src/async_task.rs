@@ -539,9 +539,9 @@ mod tests {
 
         {
             let mut state = handle.state.lock().unwrap();
-            state.output.push_str("a");
+            state.output.push('a');
             state.publish(AsyncTaskEvent::Output("a".to_owned()));
-            state.output.push_str("b");
+            state.output.push('b');
             state.publish(AsyncTaskEvent::Output("b".to_owned()));
         }
         // Both clones receive every event, independently and in order.
@@ -568,7 +568,7 @@ mod tests {
         // Publish one event before the clone exists.
         {
             let mut state = handle.state.lock().unwrap();
-            state.output.push_str("a");
+            state.output.push('a');
             state.publish(AsyncTaskEvent::Output("a".to_owned()));
         }
         let clone = handle.clone();
@@ -578,7 +578,7 @@ mod tests {
         // independently of the original handle's queue.
         {
             let mut state = handle.state.lock().unwrap();
-            state.output.push_str("b");
+            state.output.push('b');
             state.publish(AsyncTaskEvent::Output("b".to_owned()));
             state.publish(AsyncTaskEvent::Output("c".to_owned()));
         }
@@ -613,7 +613,7 @@ mod tests {
         // so a long-running task does not accumulate dead channels.
         {
             let mut state = handle.state.lock().unwrap();
-            state.output.push_str("x");
+            state.output.push('x');
             state.publish(AsyncTaskEvent::Output("x".to_owned()));
             assert_eq!(state.event_senders.len(), 1);
         }

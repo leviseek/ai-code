@@ -1,20 +1,10 @@
 use crate::{search_commands, CommandDescriptor};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CommandPalette {
     query: String,
     selected: usize,
     open: bool,
-}
-
-impl Default for CommandPalette {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            selected: 0,
-            open: false,
-        }
-    }
 }
 
 impl CommandPalette {

@@ -22,7 +22,7 @@ mod tests {
     use crate::PlatformEvent;
     #[test]
     fn headless_backend_creates_an_empty_loop() {
-        let backend = HeadlessBackend::default();
+        let backend = HeadlessBackend;
         let mut event_loop = backend.create_event_loop().unwrap();
         assert!(event_loop.next().is_none());
         let _ = PlatformEvent::CloseRequested;

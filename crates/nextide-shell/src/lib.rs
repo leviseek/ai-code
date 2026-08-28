@@ -537,7 +537,7 @@ mod tests {
                 .file_tree
                 .nodes()
                 .iter()
-                .find(|node| node.path == std::path::PathBuf::from("src"))
+                .find(|node| node.path == std::path::Path::new("src"))
                 .unwrap()
                 .expanded
         );

@@ -104,8 +104,13 @@ impl CapabilityRegistry {
     pub fn contains(&self, id: &str) -> bool {
         self.entries.contains_key(id)
     }
+
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
