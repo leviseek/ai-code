@@ -26,6 +26,15 @@ pub struct TaskManager {
     /// synchronous API keeps operating on it from the caller's thread. The
     /// public API is unchanged; the lock is only ever held briefly.
     tasks: BTreeMap<String, Arc<Mutex<Task>>>,
+    /// Cancellation flags of tasks spawned through [`TaskManager::spawn_async`]
+    /// / [`TaskManager::spawn_async_timeout`], keyed by task id and shared with
+    /// the returned [`AsyncTaskHandle`] and its worker thread. A
+    /// [`TaskManager::cancel`] flips the flag so the worker kills the process
+    /// and drives both the handle and the manager record to `Cancelled`;
+    /// without it the record would say `Cancelled` while the handle stayed
+    /// `Running` and the process kept going. Entries are dropped when their
+    /// task is removed or cleaned up, mirroring the task records themselves.
+    async_cancels: BTreeMap<String, Arc<AtomicBool>>,
 }
 
 /// Locks a task's shared record, recovering from a poisoned mutex so a
@@ -51,6 +60,10 @@ impl TaskManager {
                 crate::TaskState::Pending | crate::TaskState::Running
             )
         });
+        // Drop the async cancel flags of cleaned-up tasks so a later task
+        // reusing the id starts with a fresh, unset flag.
+        self.async_cancels
+            .retain(|id, _| self.tasks.contains_key(id));
         before - self.tasks.len()
     }
 
@@ -64,6 +77,7 @@ impl TaskManager {
         match self.tasks.get(id).map(|task| lock_task(task).state) {
             Some(crate::TaskState::Pending) => {
                 self.tasks.remove(id);
+                self.async_cancels.remove(id);
                 Ok(())
             }
             Some(_) | None => Err(TaskError::InvalidTransition),
@@ -146,8 +160,24 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Cancels a task, killing the background process when the task was started
+    /// with [`TaskManager::spawn_async`] / [`TaskManager::spawn_async_timeout`].
+    ///
+    /// The manager record transitions to [`crate::TaskState::Cancelled`] and —
+    /// for async tasks — the handle's shared cancellation flag is set *first*,
+    /// so the worker kills the process and drives the handle to
+    /// [`AsyncTaskStatus::Cancelled`] as well: the two views converge instead
+    /// of the process outliving the cancellation and the handle landing on
+    /// `Succeeded`/`Failed` while the record says `Cancelled`. A task that
+    /// already reached a terminal state is rejected exactly as before.
     pub fn cancel(&mut self, id: &str, events: &mut EventBus) -> Result<(), TaskError> {
         let task = self.tasks.get(id).ok_or(TaskError::InvalidTransition)?;
+        // Signal the async worker before transitioning the record, so a worker
+        // that is about to finish naturally still converges on Cancelled
+        // instead of letting the handle and the record disagree.
+        if let Some(flag) = self.async_cancels.get(id) {
+            flag.store(true, Ordering::SeqCst);
+        }
         lock_task(task).cancel()?;
         events.publish(Event::new("task.cancelled", id));
         Ok(())
@@ -373,7 +403,10 @@ impl TaskManager {
     /// handle with [`AsyncTaskHandle::poll`] /
     /// [`AsyncTaskHandle::drain_output`] and block on completion with
     /// [`AsyncTaskHandle::wait`] / [`AsyncTaskHandle::wait_timeout`], or
-    /// request termination with [`AsyncTaskHandle::cancel`].
+    /// request termination with [`AsyncTaskHandle::cancel`] — which the
+    /// manager-side [`TaskManager::cancel`] does too, killing the background
+    /// process and driving both the handle and the manager record to
+    /// `Cancelled`.
     ///
     /// The task is started (and `task.started` is published) synchronously,
     /// exactly like the sync run methods. Output is decoded incrementally per
@@ -439,6 +472,11 @@ impl TaskManager {
             }
         };
         let handle = AsyncTaskHandle::new(id);
+        // Register the handle's cancellation flag so TaskManager::cancel can
+        // stop this background worker; the worker itself holds a clone in
+        // AsyncTaskShared. Removed again when the task is cleaned up.
+        self.async_cancels
+            .insert(id.to_owned(), handle.cancelled.clone());
         let shared = AsyncTaskShared {
             task,
             state: handle.state.clone(),
@@ -453,7 +491,8 @@ impl TaskManager {
             Err(error) => {
                 // Dropping the closure drops `proc`, which kills and reaps the
                 // child; finish the task as failed so the manager stays
-                // consistent.
+                // consistent, and drop the now-unused cancel flag.
+                self.async_cancels.remove(id);
                 let _ = self.finish(id, -1, events);
                 Err(io::Error::other(error))
             }
@@ -624,7 +663,19 @@ fn drain_async_output(
 
 /// Records the terminal status in the handle's shared state, transitions the
 /// manager's task record to match, and wakes every waiter.
+///
+/// The shared cancellation flag is authoritative: once cancellation has been
+/// requested — through either [`AsyncTaskHandle::cancel`] or
+/// [`TaskManager::cancel`] — the task ends `Cancelled` even if the process
+/// happened to exit around the same time, so the handle and the manager record
+/// can never diverge (one landing on `Succeeded`/`Failed`/`TimedOut` while the
+/// other says `Cancelled`).
 fn finish_async(shared: &AsyncTaskShared, status: AsyncTaskStatus) {
+    let status = if shared.cancelled.load(Ordering::SeqCst) {
+        AsyncTaskStatus::Cancelled
+    } else {
+        status
+    };
     if let Ok(mut state) = shared.state.lock() {
         state.status = status.clone();
     }
@@ -1341,6 +1392,81 @@ mod tests {
             .expect("cancelled task never completed");
         assert_eq!(snapshot.status, AsyncTaskStatus::Cancelled);
         assert_eq!(manager.state("run"), Some(crate::TaskState::Cancelled));
+    }
+
+    /// A command that runs for 30s so a test can prove cancellation actually
+    /// stopped the process: if the worker were not signalled, the process
+    /// would outlive the short wait below and `wait_timeout` would time out.
+    fn long_running_command() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    "Start-Sleep -Seconds 30".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "exec sleep 30".to_string()],
+            )
+        }
+    }
+
+    #[test]
+    fn manager_cancel_stops_async_process_and_converges_state() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = long_running_command();
+        manager
+            .add(TaskSpec {
+                id: "run".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("run", Path::new("."), &mut events)
+            .unwrap();
+        assert!(handle.is_running());
+        assert_eq!(manager.state("run"), Some(crate::TaskState::Running));
+        // Cancelling through the manager must signal the async worker: the
+        // 30s background process is killed (otherwise the wait below would
+        // time out while the handle stayed Running), and both the handle and
+        // the manager record converge on Cancelled instead of diverging.
+        manager.cancel("run", &mut events).unwrap();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("manager.cancel did not stop the async process");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Cancelled);
+        assert_eq!(handle.state(), crate::TaskState::Cancelled);
+        assert!(!handle.is_running());
+        assert_eq!(manager.state("run"), Some(crate::TaskState::Cancelled));
+        assert_eq!(manager.summaries()[0].state, crate::TaskState::Cancelled);
+        assert_eq!(events.drain("task.cancelled")[0].payload, "run");
+        // The finished record (and its cancel flag) is cleaned up by the
+        // existing synchronous cleanup API.
+        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.state("run"), None);
+    }
+
+    #[test]
+    fn manager_cancel_keeps_working_for_sync_tasks() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "sync".into(),
+                program: "sh".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("sync", &mut events).unwrap();
+        manager.cancel("sync", &mut events).unwrap();
+        assert_eq!(manager.state("sync"), Some(crate::TaskState::Cancelled));
+        assert_eq!(events.drain("task.cancelled")[0].payload, "sync");
     }
 
     #[test]
