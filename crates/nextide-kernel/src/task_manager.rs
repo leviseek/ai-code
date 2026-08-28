@@ -511,14 +511,42 @@ struct AsyncTaskShared {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Runs the async worker's body so a panic can never leave the handle stuck in
+/// [`AsyncTaskStatus::Running`]: on unwind the shared state is driven to
+/// `Failed` and waiters are woken, then the panic is re-raised so it stays
+/// observable. The dropped [`RunningProcess`] (unwound inside the body) has
+/// already killed and reaped the child, so nothing leaks and
+/// [`TaskManager::clear_finished`] can still clean the task up.
+fn run_worker_safely(shared: &AsyncTaskShared, body: impl FnOnce()) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    if let Err(payload) = outcome {
+        finish_async(shared, AsyncTaskStatus::Failed { exit_code: -1 });
+        std::panic::resume_unwind(payload);
+    }
+}
+
 /// Drives a spawned process in the background until it exits, times out, or is
 /// cancelled, feeding decoded output into both the handle's shared state and
 /// the manager's task record, then transitioning the task to its terminal
 /// state. The worker never blocks a poller: all shared access goes through the
 /// handle's mutexes, which are only ever held briefly.
+///
+/// The body runs inside [`run_worker_safely`], so even a panicking worker
+/// converges the handle and the manager record onto a terminal state instead
+/// of leaving the handle `Running` forever.
 fn run_async_worker(
     shared: AsyncTaskShared,
     mut proc: RunningProcess,
+    timeout: Option<std::time::Duration>,
+) {
+    run_worker_safely(&shared, || {
+        run_async_worker_inner(&shared, &mut proc, timeout);
+    });
+}
+
+fn run_async_worker_inner(
+    shared: &AsyncTaskShared,
+    proc: &mut RunningProcess,
     timeout: Option<std::time::Duration>,
 ) {
     let started = std::time::Instant::now();
@@ -528,10 +556,10 @@ fn run_async_worker(
     loop {
         if shared.cancelled.load(Ordering::SeqCst) {
             let _ = proc.kill();
-            drain_async_output(&mut proc, &mut decoders, &shared);
+            drain_async_output(proc, &mut decoders, shared);
             let _ = proc.wait();
-            flush_async_decoders(&shared, &mut decoders);
-            finish_async(&shared, AsyncTaskStatus::Cancelled);
+            flush_async_decoders(shared, &mut decoders);
+            finish_async(shared, AsyncTaskStatus::Cancelled);
             return;
         }
         let wait = match timeout {
@@ -575,7 +603,7 @@ fn run_async_worker(
         };
         match wait {
             Ok(StreamWait::Chunk(chunk)) => {
-                append_async_chunk(&chunk, &mut decoders, &shared);
+                append_async_chunk(&chunk, &mut decoders, shared);
             }
             Ok(StreamWait::Closed) => streams_closed = true,
             Ok(StreamWait::Timeout) => {
@@ -593,23 +621,23 @@ fn run_async_worker(
         let _ = proc.kill();
         // Drain whatever the reader threads had buffered so the handle keeps
         // every byte the process produced before it was killed.
-        drain_async_output(&mut proc, &mut decoders, &shared);
+        drain_async_output(proc, &mut decoders, shared);
         let _ = proc.wait();
-        flush_async_decoders(&shared, &mut decoders);
-        finish_async(&shared, AsyncTaskStatus::TimedOut);
+        flush_async_decoders(shared, &mut decoders);
+        finish_async(shared, AsyncTaskStatus::TimedOut);
     } else {
         let exit_code = proc
             .wait()
             .ok()
             .and_then(|output| output.exit_code)
             .unwrap_or(-1);
-        flush_async_decoders(&shared, &mut decoders);
+        flush_async_decoders(shared, &mut decoders);
         let status = if exit_code == 0 {
             AsyncTaskStatus::Succeeded { exit_code }
         } else {
             AsyncTaskStatus::Failed { exit_code }
         };
-        finish_async(&shared, status);
+        finish_async(shared, status);
     }
 }
 
@@ -682,10 +710,14 @@ fn finish_async(shared: &AsyncTaskShared, status: AsyncTaskStatus) {
     if let Ok(mut task) = shared.task.lock() {
         match &status {
             AsyncTaskStatus::Succeeded { exit_code } | AsyncTaskStatus::Failed { exit_code } => {
-                let _ = task.finish(*exit_code);
+                // Retain the output: the sync run methods hand the drained
+                // TaskResult to their caller, but the async caller reads output
+                // through the handle, so draining it here would silently wipe
+                // the manager's task record.
+                let _ = task.finish_retain_output(*exit_code);
             }
             AsyncTaskStatus::TimedOut => {
-                let _ = task.timeout();
+                let _ = task.timeout_retain_output();
             }
             AsyncTaskStatus::Cancelled => {
                 let _ = task.cancel();
@@ -1505,6 +1537,163 @@ mod tests {
             "output was {:?}",
             snapshot.output
         );
+    }
+
+    #[test]
+    fn async_completion_keeps_manager_record_output() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/C".into(), "echo hello".into()])
+        } else {
+            ("sh", vec!["-c".into(), "printf hello".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "out".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("out", Path::new("."), &mut events)
+            .unwrap();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        assert!(
+            snapshot.output.contains("hello"),
+            "handle output was {:?}",
+            snapshot.output
+        );
+        // The manager's task record must keep its own copy of the streamed
+        // output: finish_async must not drain it into a discarded TaskResult.
+        let task = manager.tasks.get("out").expect("record missing");
+        assert_eq!(lock_task(task).state, crate::TaskState::Succeeded);
+        assert!(
+            lock_task(task).output().contains("hello"),
+            "manager record lost its output after async completion: {:?}",
+            lock_task(task).output()
+        );
+        // The finished record is still cleaned up by the sync API.
+        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.state("out"), None);
+    }
+
+    #[test]
+    fn async_timeout_keeps_manager_record_output() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/C".into(), "echo hi & ping -n 10 127.0.0.1".into()],
+            )
+        } else {
+            ("sh", vec!["-c".into(), "printf hi; sleep 30".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "slow".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async_timeout(
+                "slow",
+                Path::new("."),
+                std::time::Duration::from_millis(150),
+                &mut events,
+            )
+            .unwrap();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("timed-out task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::TimedOut);
+        assert!(
+            snapshot.output.contains("hi"),
+            "handle output was {:?}",
+            snapshot.output
+        );
+        // TimedOut must retain the output in the manager record too, exactly
+        // like Succeeded/Failed/Cancelled.
+        let task = manager.tasks.get("slow").expect("record missing");
+        assert_eq!(lock_task(task).state, crate::TaskState::TimedOut);
+        assert!(
+            lock_task(task).output().contains("hi"),
+            "manager record lost its output after async timeout: {:?}",
+            lock_task(task).output()
+        );
+    }
+
+    #[test]
+    fn async_worker_panic_never_leaves_handle_running() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "boom".into(),
+                program: "sh".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("boom", &mut events).unwrap();
+        let task = manager.tasks.get("boom").unwrap().clone();
+        let handle = AsyncTaskHandle::new("boom");
+        let shared = AsyncTaskShared {
+            task,
+            state: handle.state.clone(),
+            done: handle.done.clone(),
+            cancelled: handle.cancelled.clone(),
+        };
+        let thread = std::thread::spawn(move || {
+            run_worker_safely(&shared, || panic!("simulated async worker panic"));
+        });
+        // The panic stays observable on the worker thread ...
+        assert!(thread.join().is_err());
+        // ... but the handle and the manager record converge on a terminal
+        // state, so no waiter hangs and clear_finished can still clean up.
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .expect("handle stayed Running forever after worker panic");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Failed { exit_code: -1 });
+        assert!(!handle.is_running());
+        assert_eq!(handle.state(), crate::TaskState::Failed);
+        assert_eq!(manager.state("boom"), Some(crate::TaskState::Failed));
+        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.state("boom"), None);
+    }
+
+    #[test]
+    fn clear_finished_keeps_running_async_tasks() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = long_running_command();
+        manager
+            .add(TaskSpec {
+                id: "run".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("run", Path::new("."), &mut events)
+            .unwrap();
+        assert!(handle.is_running());
+        // A task whose worker is still driving it must survive cleanup; only
+        // terminal records are removed.
+        assert_eq!(manager.clear_finished(), 0);
+        assert_eq!(manager.state("run"), Some(crate::TaskState::Running));
+        assert_eq!(manager.len(), 1);
+        manager.cancel("run", &mut events).unwrap();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("cancelled task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Cancelled);
+        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.state("run"), None);
     }
 
     /// Runs `f` on a helper thread and returns `None` if it does not finish

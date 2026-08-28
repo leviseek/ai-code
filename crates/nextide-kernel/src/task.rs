@@ -77,6 +77,13 @@ impl Task {
         Ok(())
     }
 
+    /// The output accumulated so far. Kept after a terminal transition by
+    /// [`Task::finish_retain_output`] / [`Task::timeout_retain_output`];
+    /// drained by [`Task::finish`] / [`Task::timeout`].
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
     pub fn finish(&mut self, exit_code: i32) -> Result<TaskResult, TaskError> {
         if self.state != TaskState::Running {
             return Err(TaskError::InvalidTransition);
@@ -93,6 +100,25 @@ impl Task {
         })
     }
 
+    /// Like [`Task::finish`], but leaves the accumulated output in the record
+    /// instead of draining it into the returned result.
+    ///
+    /// The async worker uses this so the manager's task record keeps the
+    /// streamed output after completion — the sync run methods hand the
+    /// drained `TaskResult` to their caller, but the async caller observes
+    /// output through the handle, so the record must not lose it.
+    pub fn finish_retain_output(&mut self, exit_code: i32) -> Result<(), TaskError> {
+        if self.state != TaskState::Running {
+            return Err(TaskError::InvalidTransition);
+        }
+        self.state = if exit_code == 0 {
+            TaskState::Succeeded
+        } else {
+            TaskState::Failed
+        };
+        Ok(())
+    }
+
     pub fn timeout(&mut self) -> Result<TaskResult, TaskError> {
         if self.state != TaskState::Running {
             return Err(TaskError::InvalidTransition);
@@ -103,6 +129,16 @@ impl Task {
             exit_code: None,
             output: std::mem::take(&mut self.output),
         })
+    }
+
+    /// Like [`Task::timeout`], but leaves the accumulated output in the record
+    /// instead of draining it; see [`Task::finish_retain_output`].
+    pub fn timeout_retain_output(&mut self) -> Result<(), TaskError> {
+        if self.state != TaskState::Running {
+            return Err(TaskError::InvalidTransition);
+        }
+        self.state = TaskState::TimedOut;
+        Ok(())
     }
 
     pub fn cancel(&mut self) -> Result<(), TaskError> {
@@ -131,5 +167,35 @@ mod tests {
         assert_eq!(result.state, TaskState::Succeeded);
         assert_eq!(result.output, "compiled\n");
         assert_eq!(task.cancel(), Err(TaskError::InvalidTransition));
+    }
+
+    #[test]
+    fn terminal_transitions_can_retain_output() {
+        let spec = TaskSpec {
+            id: "keep".into(),
+            program: "cargo".into(),
+            args: vec![],
+        };
+        let mut task = Task::new(spec.clone()).unwrap();
+        task.start().unwrap();
+        task.append_output("compiled\n").unwrap();
+        task.finish_retain_output(0).unwrap();
+        assert_eq!(task.state, TaskState::Succeeded);
+        // The output survives the transition; finish() on a terminal task is
+        // rejected exactly like the draining variant.
+        assert_eq!(task.output(), "compiled\n");
+        assert_eq!(task.finish(0), Err(TaskError::InvalidTransition));
+        assert_eq!(
+            task.finish_retain_output(0),
+            Err(TaskError::InvalidTransition)
+        );
+
+        let mut task = Task::new(spec.clone()).unwrap();
+        task.start().unwrap();
+        task.append_output("slow\n").unwrap();
+        task.timeout_retain_output().unwrap();
+        assert_eq!(task.state, TaskState::TimedOut);
+        assert_eq!(task.output(), "slow\n");
+        assert_eq!(task.timeout(), Err(TaskError::InvalidTransition));
     }
 }

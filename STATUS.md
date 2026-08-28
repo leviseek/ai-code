@@ -23,6 +23,8 @@ Phase 0：技术基线与核心内核起步。
 - 增加 `.gitignore`，排除 Rust target、日志、环境文件和 IDE 临时目录。
 - TaskManager 支持异步任务句柄：`spawn_async`/`spawn_async_timeout` 立即返回可轮询的 `AsyncTaskHandle`（线程 + `Arc<Mutex>` 共享输出/状态，`AtomicBool` 取消，`Condvar` 完成通知），现有同步 API 保持不变。
 - 修复异步 TaskManager 取消一致性：`TaskManager::cancel(id)` 现在通过共享 cancel flag 同时取消 `spawn_async` 任务的后台进程，最终进程停止且 manager 状态与 `AsyncTaskHandle` 一致收敛为 `Cancelled`。
+- 修复异步 worker 完成后的 manager 记录输出丢失：`finish_async` 不再用 `Task::finish`/`timeout` 把记录输出 drain 进被丢弃的 `TaskResult`，改为保留输出的终态转换（`Task::finish_retain_output`/`timeout_retain_output`），manager 记录在 Succeeded/Failed/TimedOut 后仍保留完整输出。
+- 修复异步 worker panic 导致句柄永久 Running：worker 主体包裹在 panic 安全运行器中，panic 时句柄与 manager 记录收敛为 `Failed` 并唤醒所有 waiter，然后重新抛出 panic；`clear_finished` 因此也能清理这类任务。
 
 ## 下一步
 
