@@ -10,6 +10,17 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    pub fn clear_finished(&mut self) -> usize {
+        let before = self.tasks.len();
+        self.tasks.retain(|_, task| {
+            matches!(
+                task.state,
+                crate::TaskState::Pending | crate::TaskState::Running
+            )
+        });
+        before - self.tasks.len()
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<(), TaskError> {
         match self.tasks.get(id).map(|task| task.state) {
             Some(crate::TaskState::Pending) => {
@@ -184,6 +195,7 @@ mod tests {
         manager.remove("build").unwrap();
         assert!(manager.ids().next().is_none());
         assert_eq!(manager.remove("missing"), Err(TaskError::InvalidTransition));
+        assert_eq!(manager.clear_finished(), 0);
     }
 
     #[test]
