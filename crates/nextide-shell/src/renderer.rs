@@ -89,6 +89,7 @@ pub struct HeadlessRenderer {
     last: Option<ShellSnapshot>,
     frames: u64,
     tree_rows: Vec<TreeRenderRow>,
+    tree_changes: Vec<TreeRowChange>,
 }
 
 impl HeadlessRenderer {
@@ -101,11 +102,15 @@ impl HeadlessRenderer {
     pub fn tree_rows(&self) -> &[TreeRenderRow] {
         &self.tree_rows
     }
+    pub fn tree_changes(&self) -> &[TreeRowChange] {
+        &self.tree_changes
+    }
 }
 
 impl UiRenderer for HeadlessRenderer {
     fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
         let rows = tree_rows(snapshot);
+        self.tree_changes = diff_tree_rows(&self.tree_rows, &rows);
         self.tree_rows = rows.clone();
         Ok(rows)
     }
