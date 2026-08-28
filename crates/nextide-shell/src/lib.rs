@@ -628,6 +628,13 @@ mod tests {
         shell.render_ui(&mut renderer).unwrap();
         assert!(shell.tree_changes().is_empty());
         assert_eq!(shell.events.pending("workspace.tree.changed"), 0);
+        shell.tree_input_at(Point { x: 10, y: 0 });
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(shell.tree_changes().len(), 2);
+        assert_eq!(
+            shell.events.drain("workspace.tree.changed")[0].payload,
+            "added=0,removed=0,updated=2"
+        );
     }
 
     #[test]
