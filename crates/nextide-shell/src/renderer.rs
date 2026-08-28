@@ -81,19 +81,7 @@ impl HeadlessRenderer {
 
 impl UiRenderer for HeadlessRenderer {
     fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
-        let rows = snapshot
-            .visible_tree
-            .iter()
-            .enumerate()
-            .map(|(index, item)| TreeRenderRow {
-                path: item.path.clone(),
-                label: item.name.clone(),
-                x: item.indent,
-                y: index as u32 * 24,
-                selected: item.selected,
-                icon: if item.directory { "folder" } else { "file" },
-            })
-            .collect::<Vec<_>>();
+        let rows = tree_rows(snapshot);
         self.tree_rows = rows.clone();
         Ok(rows)
     }
