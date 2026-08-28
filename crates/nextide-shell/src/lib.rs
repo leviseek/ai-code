@@ -1,5 +1,7 @@
+mod commands;
 mod view_model;
 
+pub use commands::{CommandResult, ShellCommand};
 pub use view_model::ShellSnapshot;
 
 use nextide_kernel::{
@@ -107,6 +109,47 @@ impl DesktopShell {
             window.id.to_string(),
         ));
         Ok(())
+    }
+
+    pub fn execute<F: nextide_kernel::FileSystem>(
+        &mut self,
+        fs: &F,
+        command: ShellCommand,
+    ) -> std::io::Result<CommandResult> {
+        let result = match command {
+            ShellCommand::OpenFile(path) => {
+                self.open_file(fs, &path)?;
+                CommandResult::Applied
+            }
+            ShellCommand::CloseFile { path, force } => {
+                if self.close_file(&path, force)? {
+                    CommandResult::Applied
+                } else {
+                    CommandResult::Noop
+                }
+            }
+            ShellCommand::SaveActive => {
+                if self.app.tabs.active().is_some() {
+                    self.save_file(fs)?;
+                    CommandResult::Applied
+                } else {
+                    CommandResult::Noop
+                }
+            }
+            ShellCommand::ScanWorkspace(path) => {
+                self.scan_workspace(fs, &path)?;
+                CommandResult::Applied
+            }
+            ShellCommand::ToggleDirectory(path) => {
+                if self.app.file_tree.toggle(&path) {
+                    self.publish_state_changed();
+                    CommandResult::Applied
+                } else {
+                    CommandResult::Noop
+                }
+            }
+        };
+        Ok(result)
     }
 
     pub fn snapshot(&self) -> ShellSnapshot {
