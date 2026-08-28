@@ -43,6 +43,7 @@ pub struct DesktopShell {
     pub layout: ShellLayout,
     pub running: bool,
     pub selected_tree: Option<std::path::PathBuf>,
+    pub previous_tree_rows: Vec<TreeRenderRow>,
 }
 
 impl DesktopShell {
@@ -61,6 +62,7 @@ impl DesktopShell {
             layout: ShellLayout::default_1280x800(),
             running: true,
             selected_tree: None,
+            previous_tree_rows: Vec::new(),
         }
     }
 
@@ -281,7 +283,9 @@ impl DesktopShell {
 
     pub fn render_ui<R: UiRenderer>(&mut self, renderer: &mut R) -> std::io::Result<()> {
         let snapshot = self.snapshot();
-        let _ = renderer.render_tree(&snapshot)?;
+        let rows = renderer.render_tree(&snapshot)?;
+        let _changes = diff_tree_rows(&self.previous_tree_rows, &rows);
+        self.previous_tree_rows = rows;
         renderer.render(&snapshot)?;
         self.surface.present()?;
         self.events
