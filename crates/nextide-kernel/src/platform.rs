@@ -40,6 +40,25 @@ pub struct WindowsPlatform;
 
 #[cfg(windows)]
 impl PlatformServices for WindowsPlatform {
+    fn terminate(&self, process: &ProcessHandle) -> io::Result<()> {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &process.id.to_string(), "/T", "/F"])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "taskkill failed"))
+        }
+    }
+
+    fn is_running(&self, process: &ProcessHandle) -> io::Result<bool> {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", process.id)])
+            .output()?;
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains(&process.id.to_string()))
+    }
+
     fn open_terminal(&self, _working_directory: &Path) -> io::Result<Box<dyn TerminalSession>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
