@@ -154,11 +154,11 @@ mod tests {
             .any(|change| matches!(change, TreeRowChange::Updated(row) if row.selected)));
         assert!(changes
             .iter()
-            .any(|change| matches!(change, TreeRowChange::Added(row) if row.path == "new.rs")));
+            .any(|change| matches!(change, TreeRowChange::Added(row) if row.path == std::path::PathBuf::from("new.rs"))));
         let removed = diff_tree_rows(&current, &old);
         assert!(removed
             .iter()
-            .any(|change| matches!(change, TreeRowChange::Removed(path) if path == "new.rs")));
+            .any(|change| matches!(change, TreeRowChange::Removed(path) if path == &std::path::PathBuf::from("new.rs"))));
     }
 
     #[test]
