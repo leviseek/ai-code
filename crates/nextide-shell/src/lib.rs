@@ -267,6 +267,16 @@ mod tests {
     }
 
     #[test]
+    fn render_ui_renders_snapshot_and_presents_frame() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let mut renderer = HeadlessRenderer::default();
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(renderer.frames(), 1);
+        assert_eq!(shell.surface.frames_presented(), 1);
+        assert_eq!(shell.events.pending("ui.frame.presented"), 1);
+    }
+
+    #[test]
     fn shell_snapshot_exposes_ui_state_counts() {
         let shell = DesktopShell::new("NextIDE");
         let snapshot = shell.snapshot();
