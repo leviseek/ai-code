@@ -289,6 +289,13 @@ impl DesktopShell {
         let rows = renderer.render_tree(&snapshot)?;
         self.last_tree_changes = diff_tree_rows(&self.previous_tree_rows, &rows);
         self.previous_tree_rows = rows;
+        if !self.last_tree_changes.is_empty() {
+            let (added, removed, updated) = tree_change_counts(&self.last_tree_changes);
+            self.events.publish(nextide_kernel::Event::new(
+                "workspace.tree.changed",
+                format!("added={added},removed={removed},updated={updated}"),
+            ));
+        }
         renderer.render(&snapshot)?;
         self.surface.present()?;
         self.events
