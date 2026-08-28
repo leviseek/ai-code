@@ -23,6 +23,26 @@ impl CapabilityDescriptor {
     }
 }
 
+/// A stable, UI-safe snapshot of a registered capability's identity and
+/// declared permissions, decoupled from the registry's internal storage so it
+/// can cross API boundaries (e.g. RPC or UI rendering) without borrowing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilitySummary {
+    pub id: String,
+    pub version: String,
+    pub permissions: Vec<String>,
+}
+
+impl From<&CapabilityDescriptor> for CapabilitySummary {
+    fn from(descriptor: &CapabilityDescriptor) -> Self {
+        Self {
+            id: descriptor.id.clone(),
+            version: descriptor.version.clone(),
+            permissions: descriptor.permissions.clone(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegistryError {
     EmptyId,
@@ -112,6 +132,32 @@ impl CapabilityRegistry {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Returns the ids of all registered capabilities in stable (sorted)
+    /// order.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    /// Iterates over every registered capability as `(id, descriptor)` pairs
+    /// in stable (sorted) id order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &CapabilityDescriptor)> {
+        self.entries
+            .iter()
+            .map(|(id, descriptor)| (id.as_str(), descriptor))
+    }
+
+    /// Returns a snapshot projection of one capability, or `None` when the id
+    /// is not registered.
+    pub fn summary(&self, id: &str) -> Option<CapabilitySummary> {
+        self.entries.get(id).map(CapabilitySummary::from)
+    }
+
+    /// Returns snapshot projections of all registered capabilities in stable
+    /// (sorted) id order.
+    pub fn summaries(&self) -> Vec<CapabilitySummary> {
+        self.entries.values().map(CapabilitySummary::from).collect()
+    }
 }
 
 #[cfg(test)]
@@ -178,5 +224,81 @@ mod tests {
             registry.get("lsp"),
             Err(RegistryError::NotFound("lsp".into()))
         );
+    }
+
+    #[test]
+    fn lists_ids_in_stable_sorted_order() {
+        let mut registry = CapabilityRegistry::default();
+        for id in ["zeta", "alpha", "mid"] {
+            registry
+                .register(CapabilityDescriptor::new(id, "1.0"))
+                .unwrap();
+        }
+        let ids: Vec<&str> = registry.ids().collect();
+        assert_eq!(ids, ["alpha", "mid", "zeta"]);
+        assert_eq!(registry.len(), 3);
+    }
+
+    #[test]
+    fn iterates_capabilities_in_stable_sorted_order() {
+        let mut registry = CapabilityRegistry::default();
+        registry
+            .register(
+                CapabilityDescriptor::new("terminal", "2.0").with_permission("terminal.execute"),
+            )
+            .unwrap();
+        registry
+            .register(CapabilityDescriptor::new("search", "1.0"))
+            .unwrap();
+        let entries: Vec<(&str, &CapabilityDescriptor)> = registry.iter().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "search");
+        assert_eq!(entries[0].1.version, "1.0");
+        assert_eq!(entries[1].0, "terminal");
+        assert_eq!(entries[1].1.version, "2.0");
+        assert_eq!(entries[1].1.permissions, ["terminal.execute"]);
+    }
+
+    #[test]
+    fn summaries_project_metadata_in_stable_order() {
+        let mut registry = CapabilityRegistry::default();
+        registry
+            .register(
+                CapabilityDescriptor::new("git", "1.2")
+                    .with_permission("git.commit")
+                    .with_permission("git.push"),
+            )
+            .unwrap();
+        registry
+            .register(CapabilityDescriptor::new("lsp", "0.9"))
+            .unwrap();
+        let summaries = registry.summaries();
+        assert_eq!(
+            summaries,
+            vec![
+                CapabilitySummary {
+                    id: "git".into(),
+                    version: "1.2".into(),
+                    permissions: vec!["git.commit".into(), "git.push".into()],
+                },
+                CapabilitySummary {
+                    id: "lsp".into(),
+                    version: "0.9".into(),
+                    permissions: Vec::new(),
+                },
+            ]
+        );
+        assert_eq!(registry.summary("lsp"), Some(summaries[1].clone()));
+        assert_eq!(registry.summary("missing"), None);
+    }
+
+    #[test]
+    fn empty_registry_reports_no_capabilities() {
+        let registry = CapabilityRegistry::default();
+        assert!(registry.is_empty());
+        assert_eq!(registry.ids().count(), 0);
+        assert!(registry.iter().next().is_none());
+        assert!(registry.summaries().is_empty());
+        assert_eq!(registry.summary("anything"), None);
     }
 }

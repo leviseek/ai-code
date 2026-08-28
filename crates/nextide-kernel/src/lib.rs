@@ -28,7 +28,7 @@ pub mod workspace;
 
 pub use application::ApplicationContext;
 pub use async_task::{AsyncTaskEvent, AsyncTaskHandle, AsyncTaskSnapshot, AsyncTaskStatus};
-pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
+pub use capability::{CapabilityDescriptor, CapabilityRegistry, CapabilitySummary, RegistryError};
 pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};
 pub use file_tree::{FileNode, FileNodeKind, FileTreeModel};

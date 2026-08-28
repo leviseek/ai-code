@@ -17,6 +17,8 @@ The repository currently contains the first Phase 0 vertical slice:
 
 Task state and summary APIs are available through `TaskManager::state`, `summary`, `summaries`, and `ids`; pending tasks can be removed and terminal tasks can be cleaned with lifecycle events.
 
+Capability metadata is observable through `CapabilityRegistry::ids`, `iter`, `summary`, and `summaries`: iteration and projections are returned in stable, sorted id order, and `CapabilitySummary` is a cloneable, UI-safe snapshot of a capability's id, version, and declared permissions. `is_empty`/`len`/`contains` remain available for cheap registry checks.
+
 ## Development
 
 ```powershell
