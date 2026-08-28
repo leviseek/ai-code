@@ -39,6 +39,38 @@ pub struct ShellLayout {
 }
 
 impl ShellLayout {
+    pub fn for_size(width: u32, height: u32) -> Self {
+        let tree_width = width.min(280);
+        let tabs_height = height.min(40);
+        let status_height = height.min(40);
+        Self {
+            file_tree: Rect {
+                x: 0,
+                y: 0,
+                width: tree_width,
+                height: height.saturating_sub(status_height),
+            },
+            tabs: Rect {
+                x: tree_width,
+                y: 0,
+                width: width.saturating_sub(tree_width),
+                height: tabs_height,
+            },
+            editor: Rect {
+                x: tree_width,
+                y: tabs_height,
+                width: width.saturating_sub(tree_width),
+                height: height.saturating_sub(tabs_height + status_height),
+            },
+            status: Rect {
+                x: 0,
+                y: height.saturating_sub(status_height),
+                width,
+                height: status_height,
+            },
+        }
+    }
+
     pub fn default_1280x800() -> Self {
         Self {
             file_tree: Rect {

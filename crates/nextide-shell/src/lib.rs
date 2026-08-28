@@ -32,6 +32,7 @@ pub struct DesktopShell {
     pub events: nextide_kernel::EventBus,
     pub palette: CommandPalette,
     pub notifications: NotificationCenter,
+    pub layout: ShellLayout,
 }
 
 impl DesktopShell {
@@ -47,6 +48,7 @@ impl DesktopShell {
             events: nextide_kernel::EventBus::default(),
             palette: CommandPalette::default(),
             notifications: NotificationCenter::default(),
+            layout: ShellLayout::default_1280x800(),
         }
     }
 
@@ -197,6 +199,7 @@ impl DesktopShell {
 
     pub fn resize_surface(&mut self, size: SurfaceSize) -> std::io::Result<()> {
         self.surface.resize(size)?;
+        self.layout = ShellLayout::for_size(size.width, size.height);
         self.events.publish(nextide_kernel::Event::new(
             "window.resized",
             format!("{}x{}", size.width, size.height),
