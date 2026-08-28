@@ -23,6 +23,9 @@ Task state and summary APIs are available through `TaskManager::state`, `summary
 cargo test --workspace
 cargo run -p nextide-cli -- smoke
 cargo run -p nextide-cli -- bootstrap
+cargo run -p nextide-cli -- task-smoke
 ```
+
+`task-smoke` exercises the background task runtime: it registers a cross-platform echo command (`cmd.exe /C echo` on Windows, `sh -c printf` elsewhere), spawns it through `TaskManager::spawn_async`, polls `AsyncTaskHandle::wait_timeout` within a finite deadline, and prints the task's status and output, panicking on failure or timeout.
 
 The editor kernel is the single source of truth for document mutations. UI, AI, collaboration, and extensions must eventually submit changes through the same transaction API.
