@@ -220,7 +220,12 @@ impl DesktopShell {
     }
 
     pub fn snapshot(&self) -> ShellSnapshot {
-        ShellSnapshot::from_context(self.title.clone(), &self.app, &self.palette)
+        ShellSnapshot::from_context(
+            self.title.clone(),
+            &self.app,
+            &self.palette,
+            &self.notifications,
+        )
     }
 
     pub fn start(&self) -> String {

@@ -1,4 +1,4 @@
-use crate::CommandPalette;
+use crate::{CommandPalette, NotificationCenter};
 use nextide_kernel::ApplicationContext;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub struct ShellSnapshot {
     pub tree_paths: Vec<std::path::PathBuf>,
     pub palette_open: bool,
     pub palette_query: String,
+    pub notifications: usize,
 }
 
 impl ShellSnapshot {
@@ -20,6 +21,7 @@ impl ShellSnapshot {
         title: impl Into<String>,
         app: &ApplicationContext,
         palette: &CommandPalette,
+        notifications: &NotificationCenter,
     ) -> Self {
         Self {
             title: title.into(),
@@ -37,6 +39,7 @@ impl ShellSnapshot {
                 .collect(),
             palette_open: palette.is_open(),
             palette_query: palette.query().to_string(),
+            notifications: notifications.items().len(),
         }
     }
 }
