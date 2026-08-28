@@ -132,6 +132,19 @@ mod tests {
     }
 
     #[test]
+    fn save_file_clears_view_and_tab_dirty_state() {
+        let mut context = ApplicationContext::new("");
+        let path = Path::new("src/main.rs");
+        context.open_file(&MemoryFs, path).unwrap();
+        context.views[0].mark_dirty(true);
+        context.tabs.set_dirty(&path.to_path_buf(), true);
+        context.save_file(&MemoryFs).unwrap();
+        assert!(!context.views[0].dirty);
+        assert!(!context.tabs.active().unwrap().dirty);
+        assert_eq!(context.events.pending("document.saved"), 1);
+    }
+
+    #[test]
     fn bootstrap_registers_core_capabilities() {
         let context = ApplicationContext::bootstrap("");
         assert!(context.capabilities.contains("workspace.read"));
