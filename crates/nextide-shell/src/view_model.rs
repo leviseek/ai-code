@@ -1,5 +1,14 @@
 use crate::{CommandPalette, NotificationCenter};
-use nextide_kernel::ApplicationContext;
+use nextide_kernel::{ApplicationContext, FileNodeKind};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeItem {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub depth: usize,
+    pub directory: bool,
+    pub expanded: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellSnapshot {
@@ -12,6 +21,7 @@ pub struct ShellSnapshot {
     pub active_tab: Option<std::path::PathBuf>,
     pub tree_paths: Vec<std::path::PathBuf>,
     pub visible_tree_paths: Vec<std::path::PathBuf>,
+    pub visible_tree: Vec<TreeItem>,
     pub palette_open: bool,
     pub palette_query: String,
     pub notifications: usize,
@@ -43,6 +53,18 @@ impl ShellSnapshot {
                 .visible_nodes()
                 .iter()
                 .map(|node| node.path.clone())
+                .collect(),
+            visible_tree: app
+                .file_tree
+                .visible_nodes()
+                .iter()
+                .map(|node| TreeItem {
+                    path: node.path.clone(),
+                    name: node.name.clone(),
+                    depth: node.depth,
+                    directory: node.kind == FileNodeKind::Directory,
+                    expanded: node.expanded,
+                })
                 .collect(),
             palette_open: palette.is_open(),
             palette_query: palette.query().to_string(),
