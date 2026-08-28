@@ -87,6 +87,19 @@ impl DesktopShell {
         self.layout.hit_test(point)
     }
 
+    pub fn tree_input_at(&self, point: Point) -> Option<UiInput> {
+        let path = self.tree_item_at(point)?;
+        let directory =
+            self.app.file_tree.nodes().iter().any(|node| {
+                node.path == path && node.kind == nextide_kernel::FileNodeKind::Directory
+            });
+        Some(if directory {
+            UiInput::ClickDirectory(path)
+        } else {
+            UiInput::ClickFile(path)
+        })
+    }
+
     pub fn tree_item_at(&self, point: Point) -> Option<std::path::PathBuf> {
         if !self.layout.file_tree.contains(point) {
             return None;
