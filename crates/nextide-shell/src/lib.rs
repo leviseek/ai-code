@@ -1,11 +1,13 @@
 mod command_registry;
 mod commands;
 mod keymap;
+mod palette;
 mod view_model;
 
 pub use command_registry::{command_id, search as search_commands, CommandDescriptor, COMMANDS};
 pub use commands::{CommandResult, ShellCommand};
 pub use keymap::{command_for, KeyChord};
+pub use palette::CommandPalette;
 pub use view_model::ShellSnapshot;
 
 use nextide_kernel::{
