@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "nextide-kernel"
 version = "0.1.0"
+
+[[package]]
+name = "nextide-shell"
+version = "0.1.0"
+dependencies = [
+ "nextide-kernel",
+]
