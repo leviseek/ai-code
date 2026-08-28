@@ -9,6 +9,13 @@ pub trait FileSystem {
         self.write(path, text)
     }
     fn exists(&self, path: &Path) -> bool;
+    fn list(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory listing is not supported",
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +95,18 @@ impl FileSystem for LocalFileSystem {
         self.resolve(path)
             .map(|path| path.exists())
             .unwrap_or(false)
+    }
+
+    fn list(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+        let directory = self.resolve(path)?;
+        let mut entries = fs::read_dir(directory)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok((path.join(entry.file_name()), entry.file_type()?.is_dir()))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
     }
 }
 

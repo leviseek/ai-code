@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use crate::FileSystem;
+use std::io;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileNodeKind {
@@ -37,6 +39,21 @@ impl FileTreeModel {
         });
         self.nodes.sort_by(|a, b| a.path.cmp(&b.path));
     }
+    pub fn scan<F: FileSystem>(&mut self, fs: &F, path: &Path) -> io::Result<()> {
+        self.nodes.clear();
+        for (entry, is_dir) in fs.list(path)? {
+            self.add(
+                entry,
+                if is_dir {
+                    FileNodeKind::Directory
+                } else {
+                    FileNodeKind::File
+                },
+            );
+        }
+        Ok(())
+    }
+
     pub fn toggle(&mut self, path: &PathBuf) -> bool {
         if let Some(node) = self.nodes.iter_mut().find(|node| &node.path == path) {
             node.expanded = !node.expanded;
