@@ -3,6 +3,7 @@ use crate::process::{
     spawn_streaming, OutputChunk, RunningProcess, StreamKind, StreamWait, Utf8Decoder,
     POLL_INTERVAL,
 };
+use crate::task_events::AsyncTaskEventSink;
 use crate::{run_capture, run_capture_timeout};
 use crate::{Event, EventBus, Task, TaskError, TaskResult, TaskSpec};
 use std::collections::BTreeMap;
@@ -420,6 +421,13 @@ impl TaskManager {
     /// a caller-held [`EventBus`], so it delivers the same events through the
     /// handle's own mpsc channel instead.
     ///
+    /// To bridge those events into a caller-owned [`EventBus`], use
+    /// [`TaskManager::spawn_async_with_sink`] /
+    /// [`TaskManager::spawn_async_timeout_with_sink`] instead: the worker
+    /// additionally pushes every event into an [`AsyncTaskEventSink`], and the
+    /// main thread replays it into the bus after polling the matching
+    /// [`crate::task_events::TaskEventReceiver`].
+    ///
     /// A spawn failure (e.g. the program does not exist) is reported
     /// synchronously and the task is finished as failed, mirroring
     /// [`TaskManager::run_streaming`]. If the worker thread cannot be created,
@@ -430,7 +438,7 @@ impl TaskManager {
         working_directory: &Path,
         events: &mut EventBus,
     ) -> io::Result<AsyncTaskHandle> {
-        self.spawn_async_inner(id, working_directory, None, events)
+        self.spawn_async_inner(id, working_directory, None, events, None)
     }
 
     /// Like [`TaskManager::spawn_async`], but capped by a hard deadline.
@@ -447,7 +455,44 @@ impl TaskManager {
         timeout: std::time::Duration,
         events: &mut EventBus,
     ) -> io::Result<AsyncTaskHandle> {
-        self.spawn_async_inner(id, working_directory, Some(timeout), events)
+        self.spawn_async_inner(id, working_directory, Some(timeout), events, None)
+    }
+
+    /// Like [`TaskManager::spawn_async`], but bridges the worker's lifecycle
+    /// and output events through a caller-owned [`AsyncTaskEventSink`].
+    ///
+    /// The worker never holds the caller's [`EventBus`] — it is not
+    /// thread-safe and belongs to the main thread. Instead it pushes the same
+    /// events it delivers through the handle into `sink`, and the caller
+    /// drains the matching [`crate::task_events::TaskEventReceiver`] —
+    /// typically from its UI frame loop — and replays them into the bus on the
+    /// main thread with
+    /// [`crate::task_events::TaskEventReceiver::publish_into`]. See
+    /// [`AsyncTaskEventSink`] for the full contract, including the
+    /// synchronously bridged `Started` event and the `Failed`/`Finished` pair
+    /// bridged when the process cannot be spawned.
+    pub fn spawn_async_with_sink(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        events: &mut EventBus,
+        sink: AsyncTaskEventSink,
+    ) -> io::Result<AsyncTaskHandle> {
+        self.spawn_async_inner(id, working_directory, None, events, Some(sink))
+    }
+
+    /// Like [`TaskManager::spawn_async_timeout`], but bridges the worker's
+    /// lifecycle and output events through a caller-owned
+    /// [`AsyncTaskEventSink`]; see [`TaskManager::spawn_async_with_sink`].
+    pub fn spawn_async_timeout_with_sink(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        timeout: std::time::Duration,
+        events: &mut EventBus,
+        sink: AsyncTaskEventSink,
+    ) -> io::Result<AsyncTaskHandle> {
+        self.spawn_async_inner(id, working_directory, Some(timeout), events, Some(sink))
     }
 
     fn spawn_async_inner(
@@ -456,9 +501,22 @@ impl TaskManager {
         working_directory: &Path,
         timeout: Option<std::time::Duration>,
         events: &mut EventBus,
+        sink: Option<AsyncTaskEventSink>,
     ) -> io::Result<AsyncTaskHandle> {
-        self.start(id, events)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if let Err(error) = self.start(id, events) {
+            // Nothing was started: end the bridge (if any) so the caller's
+            // receiver does not wait forever for a stream that never began.
+            if let Some(sink) = &sink {
+                sink.close();
+            }
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+        }
+        // Mirror the synchronous `task.started` publication through the
+        // bridge, queued before the worker can publish anything else, so
+        // `Started` is always the first bridged event.
+        if let Some(sink) = &sink {
+            sink.push(AsyncTaskEvent::Started);
+        }
         let task = self
             .tasks
             .get(id)
@@ -471,6 +529,7 @@ impl TaskManager {
                 // Mirrors run_streaming: a task whose process cannot be
                 // spawned is finished as failed.
                 let _ = self.finish(id, -1, events);
+                bridge_spawn_failure(&sink);
                 return Err(error);
             }
         };
@@ -485,6 +544,9 @@ impl TaskManager {
             state: handle.state.clone(),
             done: handle.done.clone(),
             cancelled: handle.cancelled.clone(),
+            // The worker holds its own clone, so the caller's original sink
+            // stays usable by the thread-spawn error path below.
+            sink: sink.clone(),
         };
         match std::thread::Builder::new()
             .name(format!("nextide-task-{id}"))
@@ -497,10 +559,19 @@ impl TaskManager {
                 // consistent, and drop the now-unused cancel flag.
                 self.async_cancels.remove(id);
                 let _ = self.finish(id, -1, events);
+                bridge_spawn_failure(&sink);
                 Err(io::Error::other(error))
             }
         }
     }
+}
+
+/// Mirrors a synchronous spawn failure through an event bridge (if any): the
+/// task failed to start its process, so the stream ends with the same
+/// `Failed` + `Finished` pair [`TaskManager::finish`] publishes for a failed
+/// task, and the stream is closed.
+fn bridge_spawn_failure(sink: &Option<AsyncTaskEventSink>) {
+    bridge_terminal(sink, &AsyncTaskStatus::Failed { exit_code: -1 });
 }
 
 /// Everything the background worker needs to drive one async task: a clone of
@@ -512,6 +583,11 @@ struct AsyncTaskShared {
     state: Arc<Mutex<AsyncTaskState>>,
     done: Arc<(Mutex<bool>, Condvar)>,
     cancelled: Arc<AtomicBool>,
+    /// Optional bridge through which the worker mirrors its events to a
+    /// caller-owned [`crate::task_events::TaskEventReceiver`] (see
+    /// [`AsyncTaskEventSink`]); `None` for `spawn_async`/`spawn_async_timeout`,
+    /// which keep the previous handle-only behavior.
+    sink: Option<AsyncTaskEventSink>,
 }
 
 /// Runs the async worker's body so a panic can never leave the handle stuck in
@@ -525,6 +601,39 @@ fn run_worker_safely(shared: &AsyncTaskShared, body: impl FnOnce()) {
     if let Err(payload) = outcome {
         finish_async(shared, AsyncTaskStatus::Failed { exit_code: -1 });
         std::panic::resume_unwind(payload);
+    }
+}
+
+/// Mirrors one terminal transition through the caller's event bridge (if
+/// any), exactly matching the events published to the handle's stream, then
+/// closes the bridge: once the terminal state is recorded, no further events
+/// will ever be pushed, so a poller can stop waiting.
+fn bridge_terminal(sink: &Option<AsyncTaskEventSink>, status: &AsyncTaskStatus) {
+    if let Some(sink) = sink {
+        match status {
+            AsyncTaskStatus::Succeeded { exit_code } => {
+                sink.push(AsyncTaskEvent::Finished {
+                    exit_code: Some(*exit_code),
+                });
+            }
+            AsyncTaskStatus::Failed { exit_code } => {
+                sink.push(AsyncTaskEvent::Failed {
+                    exit_code: *exit_code,
+                });
+                sink.push(AsyncTaskEvent::Finished {
+                    exit_code: Some(*exit_code),
+                });
+            }
+            AsyncTaskStatus::TimedOut => {
+                sink.push(AsyncTaskEvent::TimedOut);
+                sink.push(AsyncTaskEvent::Finished { exit_code: None });
+            }
+            AsyncTaskStatus::Cancelled => {
+                sink.push(AsyncTaskEvent::Cancelled);
+            }
+            AsyncTaskStatus::Running => {}
+        }
+        sink.close();
     }
 }
 
@@ -674,6 +783,12 @@ fn append_async_text(shared: &AsyncTaskShared, text: &str) {
     // reconstructs the handle's output exactly.
     state.publish(AsyncTaskEvent::Output(text.to_owned()));
     drop(state);
+    // Mirror the same output event through the caller's bridge (if any), so a
+    // UI that polls the receiver observes output without touching the
+    // EventBus.
+    if let Some(sink) = &shared.sink {
+        sink.push(AsyncTaskEvent::Output(text.to_owned()));
+    }
     let mut task = shared
         .task
         .lock()
@@ -756,6 +871,10 @@ fn finish_async(shared: &AsyncTaskShared, status: AsyncTaskStatus) {
             }
             AsyncTaskStatus::Running => {}
         }
+        // Mirror the same terminal events through the caller's bridge (if
+        // any) and close it: the stream has ended, so a poller can stop
+        // waiting.
+        bridge_terminal(&shared.sink, &status);
     }
     drop(state);
     let mut task = shared
@@ -859,6 +978,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_events::TaskEventReceiver;
     #[test]
     fn manager_runs_real_process_and_captures_output() {
         let mut manager = TaskManager::default();
@@ -1817,6 +1937,7 @@ mod tests {
             state: handle.state.clone(),
             done: handle.done.clone(),
             cancelled: handle.cancelled.clone(),
+            sink: None,
         };
         let thread = std::thread::spawn(move || {
             run_worker_safely(&shared, || panic!("simulated async worker panic"));
@@ -1856,6 +1977,7 @@ mod tests {
             state: handle.state.clone(),
             done: handle.done.clone(),
             cancelled: handle.cancelled.clone(),
+            sink: None,
         };
         // A normal terminal transition ...
         finish_async(&shared, AsyncTaskStatus::Failed { exit_code: 3 });
@@ -1918,6 +2040,7 @@ mod tests {
             state: handle.state.clone(),
             done: handle.done.clone(),
             cancelled: handle.cancelled.clone(),
+            sink: None,
         };
         append_async_text(&shared, "hi");
         finish_async(&shared, AsyncTaskStatus::Succeeded { exit_code: 0 });
@@ -1966,6 +2089,261 @@ mod tests {
         assert_eq!(snapshot.status, AsyncTaskStatus::Cancelled);
         assert_eq!(manager.clear_finished(), 1);
         assert_eq!(manager.state("run"), None);
+    }
+
+    /// Polls `receiver` until a terminal event ([`AsyncTaskEvent::Finished`]
+    /// or [`AsyncTaskEvent::Cancelled`]) arrives and returns the whole bridged
+    /// stream in arrival order, enforcing a total deadline so a regression
+    /// cannot hang the suite.
+    fn wait_terminal_stream(
+        receiver: &TaskEventReceiver,
+        deadline: std::time::Duration,
+    ) -> Vec<AsyncTaskEvent> {
+        let deadline = std::time::Instant::now() + deadline;
+        let mut stream = Vec::new();
+        loop {
+            match receiver.wait_timeout(std::time::Duration::from_millis(100)) {
+                Some(event) => {
+                    let terminal = matches!(
+                        event,
+                        AsyncTaskEvent::Finished { .. } | AsyncTaskEvent::Cancelled
+                    );
+                    stream.push(event);
+                    if terminal {
+                        return stream;
+                    }
+                }
+                None => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no terminal event within the deadline; stream was {stream:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_async_with_sink_bridges_lifecycle_and_output_events() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = async_staggered_command();
+        manager
+            .add(TaskSpec {
+                id: "bridged".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let (sink, receiver) = AsyncTaskEventSink::channel("bridged");
+        let handle = manager
+            .spawn_async_with_sink("bridged", Path::new("."), &mut events, sink)
+            .unwrap();
+        // Started is bridged synchronously, before the worker can publish
+        // anything else, mirroring the synchronous task.started publication.
+        let stream = wait_terminal_stream(&receiver, std::time::Duration::from_secs(10));
+        assert_eq!(stream.first(), Some(&AsyncTaskEvent::Started));
+        assert_eq!(
+            stream.last(),
+            Some(&AsyncTaskEvent::Finished { exit_code: Some(0) })
+        );
+        // Output events carry decoded text; concatenated they reconstruct the
+        // handle's snapshot output exactly.
+        let streamed: String = stream
+            .iter()
+            .filter_map(|event| match event {
+                AsyncTaskEvent::Output(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let snapshot = handle.poll();
+        assert_eq!(streamed, snapshot.output, "events were {stream:?}");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        // The worker closed the bridge after the terminal event.
+        assert!(receiver.is_closed());
+        // The worker never published into the caller's EventBus itself: the
+        // bus keeps only the synchronous task.started from the spawn call.
+        assert_eq!(events.drain("task.started")[0].payload, "bridged");
+        assert!(events.drain("task.output").is_empty());
+        assert!(events.drain("task.finished").is_empty());
+        // The bridge closes before the worker finishes the manager-record
+        // transition, so settle on the handle before exercising the cleanup
+        // API.
+        let settled = handle
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .expect("bridged task never completed");
+        assert_eq!(settled.status, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.state("bridged"), None);
+    }
+
+    #[test]
+    fn spawn_async_with_sink_publish_into_feeds_the_event_bus() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/C".into(), "echo via-sink".into()])
+        } else {
+            ("sh", vec!["-c".into(), "printf via-sink".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "feed".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let (sink, receiver) = AsyncTaskEventSink::channel("feed");
+        let _handle = manager
+            .spawn_async_with_sink("feed", Path::new("."), &mut events, sink)
+            .unwrap();
+        // A UI-style pump: consume the bridge on the main thread and replay
+        // each event into the EventBus until the stream is closed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !receiver.is_closed() {
+            receiver.publish_into(&mut events);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the bridged stream never closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finished = events.drain("task.finished");
+        assert_eq!(finished.last().map(|e| e.payload.as_str()), Some("feed:0"));
+        assert!(
+            events
+                .drain("task.output")
+                .iter()
+                .any(|event| event.payload.contains("via-sink")),
+            "bridged output never reached the EventBus"
+        );
+        assert!(!events.drain("task.started").is_empty());
+    }
+
+    #[test]
+    fn spawn_async_timeout_with_sink_bridges_timeout_events() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            ("ping", vec!["127.0.0.1".into(), "-n".into(), "10".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 30".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "slow".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let (sink, receiver) = AsyncTaskEventSink::channel("slow");
+        let handle = manager
+            .spawn_async_timeout_with_sink(
+                "slow",
+                Path::new("."),
+                std::time::Duration::from_millis(150),
+                &mut events,
+                sink,
+            )
+            .unwrap();
+        // A UI-style pump: consume the bridge on the main thread and replay
+        // each event into the EventBus until the stream is closed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !receiver.is_closed() {
+            receiver.publish_into(&mut events);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the bridged stream never closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The worker bridged the timeout cause and the no-exit-code finish,
+        // exactly like the synchronous timeout path publishes them.
+        assert_eq!(events.drain("task.timeout")[0].payload, "slow");
+        assert_eq!(events.drain("task.finished")[0].payload, "slow:timeout");
+        // The bridge closes before the worker finishes the manager-record
+        // transition, so settle on the handle before asserting manager state.
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("timed-out task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::TimedOut);
+        assert_eq!(manager.state("slow"), Some(crate::TaskState::TimedOut));
+    }
+
+    #[test]
+    fn spawn_async_with_sink_bridges_cancellation() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = long_running_command();
+        manager
+            .add(TaskSpec {
+                id: "run".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let (sink, receiver) = AsyncTaskEventSink::channel("run");
+        let handle = manager
+            .spawn_async_with_sink("run", Path::new("."), &mut events, sink)
+            .unwrap();
+        handle.cancel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !receiver.is_closed() {
+            receiver.publish_into(&mut events);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the bridged stream never closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Cancellation ends the bridged stream with Cancelled alone, mirroring
+        // the synchronous task.cancelled topic (which has no task.finished).
+        assert_eq!(events.drain("task.cancelled")[0].payload, "run");
+        assert!(events.drain("task.finished").is_empty());
+        // The bridge closes before the worker finishes the manager-record
+        // transition, so settle on the handle before asserting manager state.
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("cancelled task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Cancelled);
+        assert_eq!(manager.state("run"), Some(crate::TaskState::Cancelled));
+    }
+
+    #[test]
+    fn spawn_async_with_sink_bridges_spawn_failure_events() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "missing".into(),
+                program: "nextide-program-that-does-not-exist".into(),
+                args: vec![],
+            })
+            .unwrap();
+        let (sink, receiver) = AsyncTaskEventSink::channel("missing");
+        assert!(manager
+            .spawn_async_with_sink("missing", Path::new("."), &mut events, sink)
+            .is_err());
+        // The bridge mirrors the synchronous publication order: started, then
+        // failed + finished, then the stream is closed.
+        assert_eq!(
+            receiver.drain(),
+            vec![
+                AsyncTaskEvent::Started,
+                AsyncTaskEvent::Failed { exit_code: -1 },
+                AsyncTaskEvent::Finished {
+                    exit_code: Some(-1)
+                },
+            ]
+        );
+        assert!(receiver.is_closed());
+        assert_eq!(manager.state("missing"), Some(crate::TaskState::Failed));
+
+        // A task that cannot even start closes the bridge without events.
+        let (sink, receiver) = AsyncTaskEventSink::channel("nope");
+        assert!(manager
+            .spawn_async_with_sink("nope", Path::new("."), &mut events, sink)
+            .is_err());
+        assert!(receiver.is_closed());
+        assert!(receiver.drain().is_empty());
     }
 
     /// Runs `f` on a helper thread and returns `None` if it does not finish

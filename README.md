@@ -28,4 +28,6 @@ cargo run -p nextide-cli -- task-smoke
 
 `task-smoke` exercises the background task runtime: it registers a cross-platform echo command (`cmd.exe /C echo` on Windows, `sh -c printf` elsewhere), spawns it through `TaskManager::spawn_async`, polls `AsyncTaskHandle::wait_timeout` within a finite deadline, and prints the task's status and output, panicking on failure or timeout.
 
+Background async tasks can also be bridged to a caller-owned `EventBus`: `TaskManager::spawn_async_with_sink` / `spawn_async_timeout_with_sink` accept an `AsyncTaskEventSink`, and the UI thread polls the matching `TaskEventReceiver` (e.g. each frame) and replays what it consumed into the `EventBus` with `publish_into` — so the background worker never holds the non-thread-safe bus, while the async task's lifecycle and output still surface as `task.*` events.
+
 The editor kernel is the single source of truth for document mutations. UI, AI, collaboration, and extensions must eventually submit changes through the same transaction API.

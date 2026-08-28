@@ -25,6 +25,7 @@ Phase 0：技术基线与核心内核起步。
 - 修复异步 TaskManager 取消一致性：`TaskManager::cancel(id)` 现在通过共享 cancel flag 同时取消 `spawn_async` 任务的后台进程，最终进程停止且 manager 状态与 `AsyncTaskHandle` 一致收敛为 `Cancelled`。
 - 修复异步 worker 完成后的 manager 记录输出丢失：`finish_async` 不再用 `Task::finish`/`timeout` 把记录输出 drain 进被丢弃的 `TaskResult`，改为保留输出的终态转换（`Task::finish_retain_output`/`timeout_retain_output`），manager 记录在 Succeeded/Failed/TimedOut 后仍保留完整输出。
 - 修复异步 worker panic 导致句柄永久 Running：worker 主体包裹在 panic 安全运行器中，panic 时句柄与 manager 记录收敛为 `Failed` 并唤醒所有 waiter，然后重新抛出 panic；`clear_finished` 因此也能清理这类任务。
+- 新增线程安全事件桥 `AsyncTaskEventSink`/`TaskEventReceiver`（`task_events` 模块，std-only）：`spawn_async_with_sink`/`spawn_async_timeout_with_sink` 让后台 worker 把生命周期/输出事件写入 sink，主线程（UI）轮询 receiver 消费后通过 `publish_into` 回放进 `EventBus`（`task.started`/`task.output`/`task.failed`/`task.finished`/`task.timeout`/`task.cancelled`），worker 不再需要持有 `&mut EventBus`；现有 `spawn_async`/`spawn_async_timeout` 行为与签名不变。
 
 ## 下一步
 
