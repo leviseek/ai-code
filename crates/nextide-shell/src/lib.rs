@@ -3,6 +3,7 @@ mod commands;
 mod keymap;
 mod notifications;
 mod palette;
+mod renderer;
 mod view_model;
 
 pub use command_registry::{command_id, search as search_commands, CommandDescriptor, COMMANDS};
@@ -10,6 +11,7 @@ pub use commands::{from_id as command_from_id, CommandResult, ShellCommand};
 pub use keymap::{command_for, KeyChord};
 pub use notifications::{Notification, NotificationCenter, NotificationLevel};
 pub use palette::CommandPalette;
+pub use renderer::{HeadlessRenderer, UiRenderer};
 pub use view_model::ShellSnapshot;
 
 use nextide_kernel::{

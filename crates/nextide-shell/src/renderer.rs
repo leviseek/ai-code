@@ -1,0 +1,54 @@
+use crate::ShellSnapshot;
+use std::io;
+
+pub trait UiRenderer {
+    fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()>;
+}
+
+#[derive(Default, Debug)]
+pub struct HeadlessRenderer {
+    last: Option<ShellSnapshot>,
+    frames: u64,
+}
+
+impl HeadlessRenderer {
+    pub fn last_snapshot(&self) -> Option<&ShellSnapshot> {
+        self.last.as_ref()
+    }
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+}
+
+impl UiRenderer for HeadlessRenderer {
+    fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()> {
+        self.last = Some(snapshot.clone());
+        self.frames += 1;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn headless_renderer_keeps_latest_snapshot() {
+        let mut renderer = HeadlessRenderer::default();
+        let snapshot = ShellSnapshot {
+            title: "NextIDE".into(),
+            open_files: 0,
+            tabs: 0,
+            editor_views: 0,
+            tree_nodes: 0,
+            tab_paths: vec![],
+            active_tab: None,
+            tree_paths: vec![],
+            palette_open: false,
+            palette_query: String::new(),
+            notifications: 0,
+        };
+        renderer.render(&snapshot).unwrap();
+        assert_eq!(renderer.frames(), 1);
+        assert_eq!(renderer.last_snapshot().unwrap().title, "NextIDE");
+    }
+}
