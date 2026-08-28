@@ -75,6 +75,10 @@ impl DesktopShell {
         ));
     }
 
+    pub fn hit_test(&self, point: Point) -> Option<UiRegion> {
+        self.layout.hit_test(point)
+    }
+
     pub fn handle_input<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
