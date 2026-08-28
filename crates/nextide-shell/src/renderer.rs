@@ -78,6 +78,10 @@ pub fn diff_tree_rows(previous: &[TreeRenderRow], current: &[TreeRenderRow]) -> 
 
 pub trait UiRenderer {
     fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()>;
+    fn render_tree_changes(&mut self, changes: &[TreeRowChange]) -> io::Result<()> {
+        let _ = changes;
+        Ok(())
+    }
     fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
         Ok(snapshot
             .visible_tree
