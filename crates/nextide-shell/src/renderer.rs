@@ -34,6 +34,7 @@ pub trait UiRenderer {
 pub struct HeadlessRenderer {
     last: Option<ShellSnapshot>,
     frames: u64,
+    tree_rows: Vec<TreeRenderRow>,
 }
 
 impl HeadlessRenderer {
@@ -43,9 +44,30 @@ impl HeadlessRenderer {
     pub fn frames(&self) -> u64 {
         self.frames
     }
+    pub fn tree_rows(&self) -> &[TreeRenderRow] {
+        &self.tree_rows
+    }
 }
 
 impl UiRenderer for HeadlessRenderer {
+    fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
+        let rows = snapshot
+            .visible_tree
+            .iter()
+            .enumerate()
+            .map(|(index, item)| TreeRenderRow {
+                path: item.path.clone(),
+                label: item.name.clone(),
+                x: item.indent,
+                y: index as u32 * 24,
+                selected: item.selected,
+                icon: if item.directory { "folder" } else { "file" },
+            })
+            .collect::<Vec<_>>();
+        self.tree_rows = rows.clone();
+        Ok(rows)
+    }
+
     fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()> {
         self.last = Some(snapshot.clone());
         self.frames += 1;
