@@ -1,5 +1,6 @@
 mod command_registry;
 mod commands;
+mod event_loop;
 mod input;
 mod keymap;
 mod layout;
@@ -11,6 +12,7 @@ mod view_model;
 
 pub use command_registry::{command_id, search as search_commands, CommandDescriptor, COMMANDS};
 pub use commands::{from_id as command_from_id, CommandResult, ShellCommand};
+pub use event_loop::{EventLoop, HeadlessEventLoop};
 pub use input::{command_for_input, UiInput};
 pub use keymap::{command_for, KeyChord};
 pub use layout::{Point, Rect, ShellLayout, UiRegion};
