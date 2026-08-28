@@ -456,6 +456,31 @@ mod tests {
     }
 
     #[test]
+    fn pump_once_routes_mouse_click_to_directory_command() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("src", nextide_kernel::FileNodeKind::Directory);
+        let mut events = HeadlessEventLoop::default();
+        events.push(PlatformEvent::MouseClick { x: 10, y: 0 });
+        assert_eq!(
+            shell.pump_once(&mut events, &NoopFs).unwrap(),
+            Some(CommandResult::Applied)
+        );
+        assert!(
+            shell
+                .app
+                .file_tree
+                .nodes()
+                .iter()
+                .find(|node| node.path == std::path::PathBuf::from("src"))
+                .unwrap()
+                .expanded
+        );
+    }
+
+    #[test]
     fn pump_once_routes_mouse_click_to_file_command() {
         let mut shell = DesktopShell::new("NextIDE");
         shell
