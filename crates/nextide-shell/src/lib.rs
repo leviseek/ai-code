@@ -1,5 +1,6 @@
 use nextide_kernel::{
-    ApplicationContext, HeadlessWindowService, WindowHandle, WindowOptions, WindowService,
+    ApplicationContext, HeadlessSurface, HeadlessWindowService, RenderSurface, SurfaceSize,
+    WindowHandle, WindowOptions, WindowService,
 };
 
 #[derive(Debug)]
@@ -7,6 +8,7 @@ pub struct DesktopShell {
     pub app: ApplicationContext,
     pub title: String,
     pub windows: HeadlessWindowService,
+    pub surface: HeadlessSurface,
 }
 
 impl DesktopShell {
@@ -15,6 +17,10 @@ impl DesktopShell {
             app: ApplicationContext::bootstrap(""),
             title: title.into(),
             windows: HeadlessWindowService::default(),
+            surface: HeadlessSurface::new(SurfaceSize {
+                width: 1280,
+                height: 800,
+            }),
         }
     }
 
@@ -23,6 +29,14 @@ impl DesktopShell {
             title: self.title.clone(),
             ..WindowOptions::default()
         })
+    }
+
+    pub fn present_frame(&mut self) -> std::io::Result<()> {
+        self.surface.present()
+    }
+
+    pub fn resize_surface(&mut self, size: SurfaceSize) -> std::io::Result<()> {
+        self.surface.resize(size)
     }
 
     pub fn start(&self) -> String {
