@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "下一代编码 IDE：本地优先、AI 原生、协作可演进",
+    "output": "code-ide-architecture.html",
+    "quality_profile": "showcase",
+    "viewBox": [1800, 900],
+    "views": [
+      {
+        "id": "edit-path",
+        "label": "零延迟编辑主链",
+        "focus": ["developer", "desktop_shell", "editor_kernel", "workspace_store", "workspace_graph"],
+        "note": "编辑、保存与索引在本地闭环，网络不可用时仍保持核心生产力。"
+      },
+      {
+        "id": "ai-loop",
+        "label": "AI Agent 闭环",
+        "focus": ["editor_kernel", "workspace_graph", "agent_orchestrator", "model_gateway", "trust_center", "terminal_runtime"],
+        "note": "上下文证据进入 Agent，模型调用与执行能力经过策略和审计约束。"
+      },
+      {
+        "id": "ecosystem",
+        "label": "生态与协作",
+        "focus": ["language_tooling", "extension_sandbox", "collab_relay", "trust_center"],
+        "note": "用 LSP/DAP 复用生态，用 WASM 能力集和 CRDT 支持安全扩展与协作。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "developer",
+      "type": "external",
+      "label": "开发者",
+      "sublabel": "键盘 · 鼠标 · 远程会话",
+      "pos": [35, 350],
+      "size": [150, 80]
+    },
+    {
+      "id": "desktop_shell",
+      "type": "frontend",
+      "label": "桌面交互壳",
+      "sublabel": "GPU UI · 命令面板 · 工作区",
+      "tag": "React + Rust bridge",
+      "pos": [270, 350],
+      "size": [200, 100]
+    },
+    {
+      "id": "editor_kernel",
+      "type": "backend",
+      "label": "编辑器内核",
+      "sublabel": "增量编辑 · 多光标 · Undo/Redo",
+      "tag": "Rust core",
+      "pos": [565, 350],
+      "size": [210, 100]
+    },
+    {
+      "id": "workspace_graph",
+      "type": "backend",
+      "label": "工作区智能图",
+      "sublabel": "增量索引 · AST · Symbol · 语义检索",
+      "tag": "local context",
+      "pos": [565, 120],
+      "size": [210, 90]
+    },
+    {
+      "id": "workspace_store",
+      "type": "database",
+      "label": "本地工作区存储",
+      "sublabel": "VFS · SQLite · Git · Secret",
+      "tag": "offline-first",
+      "pos": [270, 650],
+      "size": [200, 90]
+    },
+    {
+      "id": "terminal_runtime",
+      "type": "backend",
+      "label": "终端与任务运行时",
+      "sublabel": "PTY · Build · Test · Debug",
+      "tag": "isolated process",
+      "pos": [565, 650],
+      "size": [210, 90]
+    },
+    {
+      "id": "agent_orchestrator",
+      "type": "backend",
+      "label": "AI Agent 编排器",
+      "sublabel": "Plan → Tool → Patch → Review",
+      "tag": "human-in-the-loop",
+      "pos": [850, 350],
+      "size": [220, 100]
+    },
+    {
+      "id": "language_tooling",
+      "type": "backend",
+      "label": "语言工具总线",
+      "sublabel": "LSP · DAP · Formatter · Test",
+      "tag": "adapter layer",
+      "pos": [850, 650],
+      "size": [220, 90]
+    },
+    {
+      "id": "extension_sandbox",
+      "type": "backend",
+      "label": "扩展沙箱",
+      "sublabel": "WASM-first · Capability API",
+      "tag": "least privilege",
+      "pos": [1200, 650],
+      "size": [230, 90]
+    },
+    {
+      "id": "trust_center",
+      "type": "security",
+      "label": "权限与信任中心",
+      "sublabel": "策略 · 授权 · 审计 · 密钥",
+      "tag": "fail-closed",
+      "pos": [1200, 500],
+      "size": [230, 90]
+    },
+    {
+      "id": "model_gateway",
+      "type": "cloud",
+      "label": "模型与远程计算网关",
+      "sublabel": "多模型路由 · Policy · 沙箱任务",
+      "tag": "optional cloud",
+      "pos": [1510, 350],
+      "size": [230, 100]
+    },
+    {
+      "id": "collab_relay",
+      "type": "messagebus",
+      "label": "协作同步中继",
+      "sublabel": "CRDT · Presence · Offline merge",
+      "tag": "optional cloud",
+      "pos": [1510, 120],
+      "size": [230, 90]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "本地优先运行平面",
+      "wraps": ["desktop_shell", "editor_kernel", "workspace_graph", "workspace_store", "terminal_runtime", "agent_orchestrator", "language_tooling", "extension_sandbox", "trust_center"],
+      "pad": 34
+    },
+    {
+      "kind": "region",
+      "label": "可选云端增强平面",
+      "wraps": ["model_gateway", "collab_relay"],
+      "pad": 30
+    }
+  ],
+  "connections": [
+    {
+      "id": "developer-input",
+      "from": "developer",
+      "to": "desktop_shell",
+      "label": "输入 / 命令",
+      "variant": "emphasis"
+    },
+    {
+      "id": "shell-edit",
+      "from": "desktop_shell",
+      "to": "editor_kernel",
+      "label": "编辑事务",
+      "variant": "emphasis"
+    },
+    {
+      "id": "shell-store",
+      "from": "desktop_shell",
+      "to": "workspace_store",
+      "label": "打开 / 保存",
+      "labelDy": 24
+    },
+    {
+      "id": "editor-index",
+      "from": "editor_kernel",
+      "to": "workspace_graph",
+      "label": "增量索引",
+      "variant": "dashed"
+    },
+    {
+      "id": "editor-terminal",
+      "from": "editor_kernel",
+      "to": "terminal_runtime",
+      "label": "任务 / 调试",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "editor-agent",
+      "from": "editor_kernel",
+      "to": "agent_orchestrator",
+      "label": "上下文请求",
+      "variant": "emphasis"
+    },
+    {
+      "id": "graph-agent",
+      "from": "workspace_graph",
+      "to": "agent_orchestrator",
+      "label": "上下文图 / 证据",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[670, 270], [960, 270]]
+    },
+    {
+      "id": "agent-language",
+      "from": "agent_orchestrator",
+      "to": "language_tooling",
+      "label": "LSP 请求",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "language-extensions",
+      "from": "language_tooling",
+      "to": "extension_sandbox",
+      "label": "LSP / DAP / 插件协议"
+    },
+    {
+      "id": "agent-model",
+      "from": "agent_orchestrator",
+      "to": "model_gateway",
+      "label": "流式推理",
+      "variant": "emphasis"
+    },
+    {
+      "id": "model-policy",
+      "from": "model_gateway",
+      "to": "trust_center",
+      "label": "模型策略 / 审计",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[1625, 480], [1315, 480]]
+    },
+    {
+      "id": "trust-extensions",
+      "from": "trust_center",
+      "to": "extension_sandbox",
+      "label": "授权",
+      "variant": "security",
+      "labelDy": 24
+    },
+    {
+      "id": "shell-collab",
+      "from": "desktop_shell",
+      "to": "collab_relay",
+      "label": "协作会话",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [[370, 60], [1625, 60]]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "体验基线",
+      "items": ["编辑、保存、跳转与撤销在本地闭环", "GPU 渲染与 Rust 内核承载高频状态"]
+    },
+    {
+      "dot": "violet",
+      "title": "AI 原生闭环",
+      "items": ["Agent 通过工具契约获取上下文、执行任务与生成补丁", "模型可替换，核心编辑路径不绑定单一云服务"]
+    },
+    {
+      "dot": "rose",
+      "title": "安全与演进",
+      "items": ["WASM-first 扩展 + 最小能力集 + fail-closed", "LSP/DAP 兼容生态，CRDT 支持离线协作"]
+    }
+  ]
+}
