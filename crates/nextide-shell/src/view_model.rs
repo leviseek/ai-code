@@ -6,6 +6,7 @@ pub struct TreeItem {
     pub path: std::path::PathBuf,
     pub name: String,
     pub depth: usize,
+    pub indent: u32,
     pub directory: bool,
     pub expanded: bool,
 }
@@ -65,6 +66,7 @@ impl ShellSnapshot {
                     path: node.path.clone(),
                     name: node.name.clone(),
                     depth: node.depth,
+                    indent: (node.depth as u32) * 16,
                     directory: node.kind == FileNodeKind::Directory,
                     expanded: node.expanded,
                 })
