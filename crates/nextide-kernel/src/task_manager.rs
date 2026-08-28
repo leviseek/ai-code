@@ -67,6 +67,14 @@ impl TaskManager {
             .collect()
     }
 
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.tasks.contains_key(id)
     }
@@ -237,6 +245,8 @@ mod tests {
                 program: "echo".into()
             }
         );
+        assert_eq!(manager.len(), 1);
+        assert!(!manager.is_empty());
         assert!(manager.contains("build"));
         assert!(!manager.contains("missing"));
         assert_eq!(manager.state("build"), Some(crate::TaskState::Pending));
