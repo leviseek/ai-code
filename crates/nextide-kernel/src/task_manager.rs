@@ -10,6 +10,14 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    pub fn state(&self, id: &str) -> Option<crate::TaskState> {
+        self.tasks.get(id).map(|task| task.state)
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.tasks.keys().map(String::as_str)
+    }
+
     pub fn add(&mut self, spec: TaskSpec) -> Result<(), TaskError> {
         let id = spec.id.clone();
         if self.tasks.contains_key(&id) {
