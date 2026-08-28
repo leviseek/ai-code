@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod application;
 pub mod capability;
+pub mod editor_view;
 pub mod events;
 pub mod platform;
 pub mod process;
@@ -24,6 +25,7 @@ pub mod workspace;
 
 pub use application::ApplicationContext;
 pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
+pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};
