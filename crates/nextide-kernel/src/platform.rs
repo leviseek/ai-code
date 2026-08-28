@@ -9,6 +9,20 @@ pub trait PlatformServices {
         args: &[String],
         working_directory: &Path,
     ) -> io::Result<ProcessHandle>;
+
+    fn terminate(&self, _process: &ProcessHandle) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process termination adapter pending",
+        ))
+    }
+
+    fn is_running(&self, _process: &ProcessHandle) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process status adapter pending",
+        ))
+    }
 }
 
 pub trait TerminalSession: Send {

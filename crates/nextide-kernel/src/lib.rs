@@ -7,12 +7,14 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
+pub mod application;
 pub mod capability;
 pub mod events;
 pub mod platform;
 pub mod rpc;
 pub mod vfs;
 
+pub use application::ApplicationContext;
 pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
 pub use events::{Event, EventBus};
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
