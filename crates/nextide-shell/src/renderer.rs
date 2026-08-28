@@ -97,6 +97,51 @@ impl UiRenderer for HeadlessRenderer {
 mod tests {
     use super::*;
     #[test]
+    fn tree_rows_projects_layout_and_metadata() {
+        let snapshot = ShellSnapshot {
+            title: "NextIDE".into(),
+            open_files: 0,
+            tabs: 0,
+            editor_views: 0,
+            tree_nodes: 2,
+            tab_paths: vec![],
+            active_tab: None,
+            tree_paths: vec![],
+            visible_tree_paths: vec![],
+            visible_tree: vec![
+                crate::TreeItem {
+                    path: "src".into(),
+                    name: "src".into(),
+                    depth: 0,
+                    indent: 0,
+                    directory: true,
+                    expanded: true,
+                    selected: false,
+                },
+                crate::TreeItem {
+                    path: "src/main.rs".into(),
+                    name: "main.rs".into(),
+                    depth: 1,
+                    indent: 16,
+                    directory: false,
+                    expanded: false,
+                    selected: true,
+                },
+            ],
+            selected_tree: Some("src/main.rs".into()),
+            palette_open: false,
+            palette_query: String::new(),
+            notifications: 0,
+        };
+        let rows = tree_rows(&snapshot);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[1].x, rows[1].y, rows[1].icon, rows[1].selected),
+            (16, 24, "file", true)
+        );
+    }
+
+    #[test]
     fn folder_toggle_hit_is_limited_to_arrow_region() {
         let row = TreeRenderRow {
             path: "src".into(),
