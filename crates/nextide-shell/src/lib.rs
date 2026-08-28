@@ -257,6 +257,37 @@ mod tests {
     }
 
     #[test]
+    fn checked_command_publishes_failures() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let path = std::path::PathBuf::from("main.rs");
+        shell.app.workspace.open_file(path.clone());
+        shell.app.tabs.open(path.clone());
+        shell
+            .app
+            .views
+            .push(nextide_kernel::EditorViewState::new(path.clone()));
+        shell.app.views[0].mark_dirty(true);
+        let error = shell
+            .execute_checked(&NoopFs, ShellCommand::CloseFile { path, force: false })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(shell.events.pending("shell.command.failed"), 1);
+    }
+
+    struct NoopFs;
+    impl nextide_kernel::FileSystem for NoopFs {
+        fn read(&self, _: &std::path::Path) -> std::io::Result<String> {
+            Ok(String::new())
+        }
+        fn write(&self, _: &std::path::Path, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn exists(&self, _: &std::path::Path) -> bool {
+            true
+        }
+    }
+
+    #[test]
     fn shell_starts_with_bootstrapped_application() {
         let shell = DesktopShell::new("NextIDE");
         assert_eq!(shell.start(), "NextIDE ready (3 capabilities)");
