@@ -1,5 +1,6 @@
 use crate::process::{
     spawn_streaming, OutputChunk, RunningProcess, StreamKind, StreamWait, Utf8Decoder,
+    POLL_INTERVAL,
 };
 use crate::{run_capture, run_capture_timeout};
 use crate::{Event, EventBus, Task, TaskError, TaskResult, TaskSpec};
@@ -239,12 +240,13 @@ impl TaskManager {
 
     /// Like [`TaskManager::run_streaming`], but capped by a hard deadline.
     ///
-    /// If no further chunk arrives (and the streams are not yet closed) once
-    /// `timeout` has elapsed since the process was spawned, the process is
-    /// killed, any still-buffered output is drained into the task, and the task
-    /// is marked [`crate::TaskState::TimedOut`], publishing `task.timeout` and
-    /// `task.finished` (`{id}:timeout`) events. Otherwise the task finishes
-    /// normally with the process's exit code.
+    /// If the process has not exited once `timeout` has elapsed since it was
+    /// spawned, the process is killed, any still-buffered output is drained
+    /// into the task, and the task is marked [`crate::TaskState::TimedOut`],
+    /// publishing `task.timeout` and `task.finished` (`{id}:timeout`) events.
+    /// The deadline applies even if the streams reached EOF early: a process
+    /// that closed its stdout/stderr without exiting is still subject to it.
+    /// Otherwise the task finishes normally with the process's exit code.
     pub fn run_streaming_timeout<F>(
         &mut self,
         id: &str,
@@ -272,6 +274,7 @@ impl TaskManager {
         };
         let started = std::time::Instant::now();
         let mut timed_out = false;
+        let mut streams_closed = false;
         let mut decoders = StreamDecoders::default();
         loop {
             let elapsed = started.elapsed();
@@ -279,12 +282,25 @@ impl TaskManager {
                 timed_out = true;
                 break;
             }
-            match proc.next_chunk_timeout(timeout - elapsed)? {
+            let remaining = timeout - elapsed;
+            if streams_closed {
+                // Both streams reached EOF, but the child may still be
+                // running (e.g. it closed its stdout/stderr without
+                // exiting). Keep honoring the deadline by polling the child
+                // itself; otherwise wait() here would block until the process
+                // exits on its own — possibly forever.
+                if proc.try_wait()?.is_some() {
+                    break;
+                }
+                std::thread::sleep(remaining.min(POLL_INTERVAL));
+                continue;
+            }
+            match proc.next_chunk_timeout(remaining)? {
                 StreamWait::Chunk(chunk) => {
                     append_chunk(self, id, &chunk, &mut decoders, events)?;
                     on_chunk(&chunk);
                 }
-                StreamWait::Closed => break,
+                StreamWait::Closed => streams_closed = true,
                 StreamWait::Timeout => {
                     timed_out = true;
                     break;
@@ -616,6 +632,43 @@ mod tests {
         assert_eq!(manager.state("slow"), Some(crate::TaskState::TimedOut));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_timeout_still_applies_when_streams_close_early() {
+        // The child closes its stdout/stderr immediately (so the stream
+        // channel reports Closed) but keeps running for 30s. The deadline must
+        // still apply instead of blocking on wait() until the process exits on
+        // its own.
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = silent_linger_command();
+        manager
+            .add(TaskSpec {
+                id: "silent".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let (result, manager, mut events) =
+            with_deadline(std::time::Duration::from_secs(15), || {
+                let result = manager.run_streaming_timeout(
+                    "silent",
+                    Path::new("."),
+                    std::time::Duration::from_millis(150),
+                    &mut events,
+                    |_| {},
+                );
+                (result, manager, events)
+            })
+            .expect("run_streaming_timeout hung: streams closed but the process kept running");
+        let result = result.unwrap();
+        assert_eq!(result.state, crate::TaskState::TimedOut);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(events.drain("task.timeout")[0].payload, "silent");
+        assert_eq!(events.drain("task.finished")[0].payload, "silent:timeout");
+        assert_eq!(manager.state("silent"), Some(crate::TaskState::TimedOut));
+    }
+
     #[test]
     fn manager_streaming_finishes_within_timeout() {
         let mut manager = TaskManager::default();
@@ -818,5 +871,38 @@ mod tests {
             "output was {:?}",
             result.output
         );
+    }
+
+    /// Runs `f` on a helper thread and returns `None` if it does not finish
+    /// within `deadline`, so a regression that blocks forever fails the test
+    /// instead of hanging the whole suite.
+    #[cfg(not(windows))]
+    fn with_deadline<T: Send + 'static>(
+        deadline: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(f());
+        });
+        receiver.recv_timeout(deadline).ok()
+    }
+
+    /// A command whose child closes both stdout and stderr immediately but
+    /// keeps running for 30s: the stream channel reports [`StreamWait::Closed`]
+    /// while the process is still alive. `exec 1>&- 2>&-` closes the shell's
+    /// own fds, so the pipe write ends are gone even though the child keeps
+    /// running (`sleep` inherits the closed descriptors).
+    ///
+    /// Windows cannot reproduce this with stock tools: closing the standard
+    /// handles from inside a process (PowerShell/.NET) leaves duplicate
+    /// references to the pipe write ends behind, so the streams never report
+    /// Closed while the child lives.
+    #[cfg(not(windows))]
+    fn silent_linger_command() -> (String, Vec<String>) {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), "exec 1>&- 2>&-; sleep 30".to_string()],
+        )
     }
 }

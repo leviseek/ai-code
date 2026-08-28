@@ -7,8 +7,10 @@ use std::thread::JoinHandle;
 
 /// How often [`RunningProcess::wait`] polls the child while draining the
 /// stream channel, so a descendant holding the pipes open is detected and
-/// reaped shortly after the direct child exits.
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+/// reaped shortly after the direct child exits. Also the sleep granularity
+/// used by the deadline-bounded callers while waiting for a child that has
+/// already closed its streams.
+pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessOutput {
@@ -58,18 +60,32 @@ pub fn run_capture_timeout(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut timed_out = false;
+    let mut streams_closed = false;
     loop {
         let elapsed = started.elapsed();
         if elapsed >= timeout {
             timed_out = true;
             break;
         }
-        match proc.next_chunk_timeout(timeout - elapsed)? {
+        let remaining = timeout - elapsed;
+        if streams_closed {
+            // Both streams reached EOF, but the child may still be running
+            // (e.g. it closed its stdout/stderr without exiting). Poll the
+            // child itself until the deadline so the timeout still applies,
+            // instead of blocking on wait() until the process exits on its
+            // own — possibly forever.
+            if proc.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(remaining.min(POLL_INTERVAL));
+            continue;
+        }
+        match proc.next_chunk_timeout(remaining)? {
             StreamWait::Chunk(chunk) => match chunk.kind {
                 StreamKind::Stdout => stdout.extend_from_slice(&chunk.data),
                 StreamKind::Stderr => stderr.extend_from_slice(&chunk.data),
             },
-            StreamWait::Closed => break,
+            StreamWait::Closed => streams_closed = true,
             StreamWait::Timeout => {
                 timed_out = true;
                 break;
@@ -208,6 +224,11 @@ pub enum StreamWait {
     /// A chunk arrived before the deadline.
     Chunk(OutputChunk),
     /// Both streams reached EOF; no further chunk will ever arrive.
+    ///
+    /// This does **not** imply the process has exited: a process may close
+    /// its stdout/stderr (or be replaced by one that does) while still
+    /// running. Use [`RunningProcess::try_wait`] or [`RunningProcess::wait`]
+    /// to determine whether it has actually exited.
     Closed,
     /// No chunk arrived before the deadline; the process may still be running.
     Timeout,
@@ -230,6 +251,10 @@ pub enum StreamWait {
 /// handle.
 pub struct RunningProcess {
     child: Option<Child>,
+    /// The child's exit status once [`RunningProcess::try_wait`] has observed
+    /// it (on Unix `try_wait` reaps the child, so the status must be cached
+    /// for [`RunningProcess::wait`] to reuse instead of waiting again).
+    exit_status: Option<std::process::ExitStatus>,
     chunks: Option<mpsc::Receiver<OutputChunk>>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -238,6 +263,31 @@ impl RunningProcess {
     /// The child's OS process id, if the process has not been waited on yet.
     pub fn id(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
+    }
+
+    /// Returns the child's exit status if it has already exited, without
+    /// blocking.
+    ///
+    /// This is how a caller keeps honoring a deadline once the streams have
+    /// closed: [`StreamWait::Closed`] only means no more output will arrive,
+    /// not that the process exited, so poll this instead of calling
+    /// [`RunningProcess::wait`] when the process may still be running. The
+    /// first call that observes an exit reaps the child; the status is cached,
+    /// so later calls and [`RunningProcess::wait`] return it again. Returns
+    /// `Ok(None)` while the child is still running (or after it has been
+    /// waited on).
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        if let Some(status) = self.exit_status {
+            return Ok(Some(status));
+        }
+        match self.child.as_mut() {
+            Some(child) => {
+                let status = child.try_wait()?;
+                self.exit_status = status;
+                Ok(status)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Returns the next chunk if one is already buffered; never blocks.
@@ -271,6 +321,9 @@ impl RunningProcess {
     /// Use this to enforce a deadline while streaming: [`StreamWait::Timeout`]
     /// means no output arrived in time and the process may still be running
     /// (kill it explicitly if it must not outlive the wait).
+    /// [`StreamWait::Closed`] means no more output will ever arrive but does
+    /// *not* mean the process has exited; check
+    /// [`RunningProcess::try_wait`] before treating the wait as complete.
     pub fn next_chunk_timeout(&mut self, timeout: std::time::Duration) -> io::Result<StreamWait> {
         let chunks = self.chunks.as_ref().ok_or_else(already_waited)?;
         match chunks.recv_timeout(timeout) {
@@ -307,15 +360,18 @@ impl RunningProcess {
     /// draining, the direct child is polled: once it has exited but its
     /// streams are still open, a descendant must be holding the pipes, so the
     /// whole process tree is killed (best effort) to unblock the readers
-    /// instead of hanging forever. May only be called once; later calls return
-    /// an error.
+    /// instead of hanging forever. If the streams closed early — the child
+    /// exited, or it closed its stdout/stderr while still running — this
+    /// blocks until the child actually exits, so deadline-bounded callers
+    /// should poll [`RunningProcess::try_wait`] instead of calling this while
+    /// the child may still be alive. May only be called once; later calls
+    /// return an error.
     pub fn wait(&mut self) -> io::Result<ProcessOutput> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         if self.chunks.is_none() {
             return Err(already_waited());
         }
-        let mut reaped: Option<std::process::ExitStatus> = None;
         let mut tree_killed = false;
         loop {
             let chunks = self.chunks.as_ref().expect("checked above");
@@ -325,15 +381,7 @@ impl RunningProcess {
                     StreamKind::Stderr => stderr.extend_from_slice(&chunk.data),
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if reaped.is_none() {
-                        reaped = self
-                            .child
-                            .as_mut()
-                            .map(|child| child.try_wait())
-                            .transpose()?
-                            .flatten();
-                    }
-                    if !tree_killed && reaped.is_some() {
+                    if !tree_killed && self.try_wait()?.is_some() {
                         // The direct child exited but its streams are still
                         // open: a descendant is holding the pipes. Reap the
                         // tree so the reader threads hit EOF instead of
@@ -346,7 +394,7 @@ impl RunningProcess {
             }
         }
         let mut child = self.child.take().ok_or_else(already_waited)?;
-        let status = match reaped {
+        let status = match self.exit_status.take() {
             Some(status) => status,
             None => child.wait()?,
         };
@@ -438,6 +486,7 @@ pub fn spawn_streaming(
 
     Ok(RunningProcess {
         child: Some(child),
+        exit_status: None,
         chunks: Some(receiver),
         threads,
     })
@@ -638,6 +687,96 @@ mod tests {
         assert_eq!(result.exit_code, None);
         assert!(!result.is_success());
         assert!(result.stderr.contains("timed out"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn timeout_applies_when_streams_close_but_process_keeps_running() {
+        // The child closes both stdout and stderr immediately (so the stream
+        // channel reports Closed) but stays alive for 30s. run_capture_timeout
+        // must still honor the deadline instead of blocking on wait() until
+        // the process exits on its own.
+        let (program, args) = silent_linger_command();
+        let result = with_deadline(std::time::Duration::from_secs(15), move || {
+            run_capture_timeout(
+                &program,
+                &args,
+                Path::new("."),
+                std::time::Duration::from_millis(150),
+            )
+        })
+        .expect("run_capture_timeout hung: streams closed but the process kept running")
+        .expect("run_capture_timeout failed");
+        assert_eq!(result.exit_code, None);
+        assert!(!result.is_success());
+        assert!(result.stderr.contains("timed out"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streams_close_early_while_process_keeps_running() {
+        // Premise for the "streams closed but process still running" tests:
+        // the child must actually close both streams while staying alive, so
+        // the stream channel reports Closed before the process exits.
+        let (program, args) = silent_linger_command();
+        let mut proc = spawn_streaming(&program, &args, Path::new(".")).unwrap();
+        assert_eq!(
+            proc.next_chunk_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            StreamWait::Closed,
+            "test premise broken: the child did not close its streams while running"
+        );
+        assert!(
+            proc.try_wait().unwrap().is_none(),
+            "test premise broken: the child should still be running"
+        );
+        proc.kill().unwrap();
+        let output = proc.wait().unwrap();
+        assert_ne!(output.exit_code, Some(0));
+    }
+
+    #[test]
+    fn try_wait_caches_exit_status_for_later_wait() {
+        // try_wait() reaps the child on Unix the first time it observes the
+        // exit; the status must be cached so a later wait() reuses it instead
+        // of failing with "no child processes". This is what lets the
+        // deadline-bounded loops call try_wait() freely and still finish with
+        // wait().
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell.exe",
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Seconds 30".into(),
+                ],
+            )
+        } else {
+            ("sh", vec!["-c".into(), "exec sleep 30".into()])
+        };
+        let mut proc = spawn_streaming(program, &args, Path::new(".")).unwrap();
+        assert!(
+            proc.try_wait().unwrap().is_none(),
+            "child should still be running right after spawn"
+        );
+        proc.kill().unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = proc.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "killed child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_ne!(status.code(), Some(0));
+        // Cached: a second poll returns the same status.
+        assert_eq!(proc.try_wait().unwrap(), Some(status));
+        // wait() reuses the cached status and still returns the full output.
+        let output = proc.wait().unwrap();
+        assert_eq!(output.exit_code, status.code());
     }
 
     #[test]
@@ -972,5 +1111,23 @@ mod tests {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    /// A command whose child closes both stdout and stderr immediately but
+    /// keeps running for 30s: the stream channel reports [`StreamWait::Closed`]
+    /// while the process is still alive. `exec 1>&- 2>&-` closes the shell's
+    /// own fds, so the pipe write ends are gone even though the child keeps
+    /// running (`sleep` inherits the closed descriptors).
+    ///
+    /// Windows cannot reproduce this with stock tools: closing the standard
+    /// handles from inside a process (PowerShell/.NET) leaves duplicate
+    /// references to the pipe write ends behind, so the streams never report
+    /// Closed while the child lives.
+    #[cfg(not(windows))]
+    fn silent_linger_command() -> (String, Vec<String>) {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), "exec 1>&- 2>&-; sleep 30".to_string()],
+        )
     }
 }
