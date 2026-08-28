@@ -1,11 +1,12 @@
 use crate::{KeyChord, Point, UiInput};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)
 pub enum PlatformEvent {
     MouseMove { x: u32, y: u32 },
     KeyDown(KeyChord),
     Resize { width: u32, height: u32 },
     CloseRequested,
+    FileClicked { path: std::path::PathBuf, directory: bool },
 }
 
 pub fn to_ui_input(event: PlatformEvent) -> Option<UiInput> {
@@ -14,6 +15,7 @@ pub fn to_ui_input(event: PlatformEvent) -> Option<UiInput> {
         PlatformEvent::Resize { width, height } => Some(UiInput::Resize { width, height }),
         PlatformEvent::CloseRequested => Some(UiInput::Close),
         PlatformEvent::MouseMove { .. } => None,
+        PlatformEvent::FileClicked { path, directory } => Some(if directory { UiInput::ClickDirectory(path) } else { UiInput::ClickFile(path) }),
     }
 }
 
