@@ -54,6 +54,31 @@ impl FileTreeModel {
         Ok(())
     }
 
+    pub fn expand<F: FileSystem>(&mut self, fs: &F, path: &Path) -> io::Result<bool> {
+        let Some(node) = self.nodes.iter().find(|node| node.path == path) else {
+            return Ok(false);
+        };
+        if node.kind != FileNodeKind::Directory {
+            return Ok(false);
+        }
+        if !node.expanded {
+            for (entry, is_dir) in fs.list(path)? {
+                self.add(
+                    entry,
+                    if is_dir {
+                        FileNodeKind::Directory
+                    } else {
+                        FileNodeKind::File
+                    },
+                );
+            }
+            if let Some(node) = self.nodes.iter_mut().find(|node| node.path == path) {
+                node.expanded = true;
+            }
+        }
+        Ok(true)
+    }
+
     pub fn toggle(&mut self, path: &PathBuf) -> bool {
         if let Some(node) = self.nodes.iter_mut().find(|node| &node.path == path) {
             node.expanded = !node.expanded;
