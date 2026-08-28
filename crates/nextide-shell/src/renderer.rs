@@ -11,6 +11,12 @@ pub struct TreeRenderRow {
     pub icon: &'static str,
 }
 
+impl TreeRenderRow {
+    pub fn hit(&self, point: crate::Point, width: u32) -> bool {
+        point.y >= self.y && point.y < self.y + 24 && point.x >= self.x && point.x < width
+    }
+}
+
 pub trait UiRenderer {
     fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()>;
     fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
