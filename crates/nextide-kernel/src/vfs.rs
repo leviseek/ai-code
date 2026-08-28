@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 pub trait FileSystem {
     fn read(&self, path: &Path) -> io::Result<String>;
     fn write(&self, path: &Path, text: &str) -> io::Result<()>;
+    fn atomic_write(&self, path: &Path, text: &str) -> io::Result<()> {
+        self.write(path, text)
+    }
     fn exists(&self, path: &Path) -> bool;
 }
 
@@ -69,6 +72,16 @@ impl FileSystem for LocalFileSystem {
             fs::create_dir_all(parent)?;
         }
         fs::write(resolved, text)
+    }
+
+    fn atomic_write(&self, path: &Path, text: &str) -> io::Result<()> {
+        let resolved = self.resolve(path)?;
+        if let Some(parent) = resolved.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = resolved.with_extension("nextide-tmp");
+        fs::write(&temp, text)?;
+        fs::rename(temp, resolved)
     }
 
     fn exists(&self, path: &Path) -> bool {

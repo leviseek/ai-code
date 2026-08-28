@@ -163,13 +163,13 @@ impl EditorKernel {
             .path
             .as_deref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "document has no path"))?;
-        fs.write(Path::new(path), self.document.text())?;
+        fs.atomic_write(Path::new(path), self.document.text())?;
         self.dirty = false;
         Ok(())
     }
 
     pub fn save_as<F: FileSystem>(&mut self, fs: &F, path: &Path) -> io::Result<()> {
-        fs.write(path, self.document.text())?;
+        fs.atomic_write(path, self.document.text())?;
         self.path = Some(path.to_string_lossy().into_owned());
         self.dirty = false;
         Ok(())
