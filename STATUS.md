@@ -14,7 +14,9 @@ Phase 0：技术基线与核心内核起步。
 - 增加 5 个内核单元测试。
 - 增加 CLI `smoke` 冒烟流程。
 - 通过 `cargo fmt --check`、`cargo test --workspace` 和 CLI 冒烟验证。
-- 当前工作区测试：14 passed，0 failed。
+- 当前工作区测试：17 passed，0 failed。
+- Editor Kernel 已支持 `document.changed` 与 `document.saved` 事件。
+- 原子保存成功后可通过 Event Bus 发布保存事件。
 - 增加 LocalRpcRouter/Typed RPC 基线。
 - 增加 PlatformServices、WindowsPlatform 和终端/进程抽象接口（Windows ConPTY/进程实现待接入）。
 - Editor Kernel 已支持通过 VFS 打开、编辑、保存和 save-as。
