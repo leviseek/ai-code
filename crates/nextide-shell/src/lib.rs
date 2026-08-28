@@ -63,6 +63,10 @@ impl DesktopShell {
         ));
     }
 
+    pub fn selected_command_id(&self) -> Option<&'static str> {
+        self.palette.selected().map(|command| command.id)
+    }
+
     pub fn scan_workspace<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
