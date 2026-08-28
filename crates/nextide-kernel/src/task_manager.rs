@@ -660,20 +660,26 @@ fn append_async_chunk(
 /// Appends decoded text to the handle's shared output and, best effort, to the
 /// manager's task record. A failed task-record append (e.g. the task was
 /// already cancelled) is not fatal: the handle remains the source of truth for
-/// async output.
+/// async output. Both locks are recovered from poisoning like the handle API
+/// does, so a panicking thread cannot make the worker silently drop output.
 fn append_async_text(shared: &AsyncTaskShared, text: &str) {
     if text.is_empty() {
         return;
     }
-    if let Ok(mut state) = shared.state.lock() {
-        state.output.push_str(text);
-        // Output events carry the decoded text, so concatenating them
-        // reconstructs the handle's output exactly.
-        state.publish(AsyncTaskEvent::Output(text.to_owned()));
-    }
-    if let Ok(mut task) = shared.task.lock() {
-        let _ = task.append_output(text);
-    }
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.output.push_str(text);
+    // Output events carry the decoded text, so concatenating them
+    // reconstructs the handle's output exactly.
+    state.publish(AsyncTaskEvent::Output(text.to_owned()));
+    drop(state);
+    let mut task = shared
+        .task
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = task.append_output(text);
 }
 
 /// Flushes any bytes the decoders still hold — a multi-byte character that was
@@ -711,7 +717,17 @@ fn finish_async(shared: &AsyncTaskShared, status: AsyncTaskStatus) {
     } else {
         status
     };
-    if let Ok(mut state) = shared.state.lock() {
+    // Recover from a poisoned lock exactly like the handle API does: a
+    // panicking thread must not strand the handle in `Running` while waiters
+    // are woken. The `Running` guard keeps the terminal transition
+    // exactly-once — `run_worker_safely` may invoke this a second time when
+    // the worker body (or this very function) panicked, and the second call
+    // must not republish the terminal events.
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.status == AsyncTaskStatus::Running {
         state.status = status.clone();
         // Mirror the synchronous event topics: success ends with a single
         // Finished; failure and timeout report their cause first and then
@@ -742,7 +758,12 @@ fn finish_async(shared: &AsyncTaskShared, status: AsyncTaskStatus) {
             AsyncTaskStatus::Running => {}
         }
     }
-    if let Ok(mut task) = shared.task.lock() {
+    drop(state);
+    let mut task = shared
+        .task
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    {
         match &status {
             AsyncTaskStatus::Succeeded { exit_code } | AsyncTaskStatus::Failed { exit_code } => {
                 // Retain the output: the sync run methods hand the drained
@@ -1818,6 +1839,108 @@ mod tests {
         assert_eq!(manager.state("boom"), Some(crate::TaskState::Failed));
         assert_eq!(manager.clear_finished(), 1);
         assert_eq!(manager.state("boom"), None);
+    }
+
+    #[test]
+    fn finish_async_publishes_terminal_events_exactly_once() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "once".into(),
+                program: "sh".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("once", &mut events).unwrap();
+        let task = manager.tasks.get("once").unwrap().clone();
+        let handle = AsyncTaskHandle::new("once");
+        assert_eq!(handle.drain_events(), vec![AsyncTaskEvent::Started]);
+        let shared = AsyncTaskShared {
+            task,
+            state: handle.state.clone(),
+            done: handle.done.clone(),
+            cancelled: handle.cancelled.clone(),
+        };
+        // A normal terminal transition ...
+        finish_async(&shared, AsyncTaskStatus::Failed { exit_code: 3 });
+        // ... followed by a re-entrant call: run_worker_safely invokes
+        // finish_async again when the worker body panics — including when the
+        // panic happens inside this function — so the second call must not
+        // republish the terminal events. The first terminal state wins.
+        finish_async(&shared, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        assert_eq!(
+            handle.drain_events(),
+            vec![
+                AsyncTaskEvent::Failed { exit_code: 3 },
+                AsyncTaskEvent::Finished { exit_code: Some(3) },
+            ]
+        );
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .expect("waiters must be woken by the first finish");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Failed { exit_code: 3 });
+        assert!(!handle.is_running());
+        assert_eq!(manager.state("once"), Some(crate::TaskState::Failed));
+    }
+
+    #[test]
+    fn finish_async_and_append_recover_from_poisoned_locks() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "poison".into(),
+                program: "sh".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("poison", &mut events).unwrap();
+        let task = manager.tasks.get("poison").unwrap().clone();
+        let handle = AsyncTaskHandle::new("poison");
+        assert_eq!(handle.drain_events(), vec![AsyncTaskEvent::Started]);
+        // Poison both shared locks, as if a thread panicked while holding its
+        // guard (the handle API recovers from poisoning, so the worker must
+        // too — otherwise it would silently drop output and the terminal
+        // transition while still waking waiters to a stuck Running snapshot).
+        let state = Arc::clone(&handle.state);
+        std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("simulated panic while holding the state lock");
+        })
+        .join()
+        .expect_err("the state-lock poison helper must panic");
+        let task_lock = Arc::clone(&task);
+        std::thread::spawn(move || {
+            let _guard = task_lock.lock().unwrap();
+            panic!("simulated panic while holding the task lock");
+        })
+        .join()
+        .expect_err("the task-lock poison helper must panic");
+
+        let shared = AsyncTaskShared {
+            task,
+            state: handle.state.clone(),
+            done: handle.done.clone(),
+            cancelled: handle.cancelled.clone(),
+        };
+        append_async_text(&shared, "hi");
+        finish_async(&shared, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        assert_eq!(handle.poll().output, "hi");
+        assert_eq!(
+            handle.drain_events(),
+            vec![
+                AsyncTaskEvent::Output("hi".to_owned()),
+                AsyncTaskEvent::Finished { exit_code: Some(0) },
+            ]
+        );
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .expect("waiter woke to a terminal snapshot");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        assert!(!handle.is_running());
+        // The manager record transitioned too, through the poisoned task lock.
+        assert_eq!(manager.state("poison"), Some(crate::TaskState::Succeeded));
     }
 
     #[test]

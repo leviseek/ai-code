@@ -285,8 +285,9 @@ impl AsyncTaskHandle {
     /// Returns only the output that arrived since this handle's previous
     /// `drain_output` call, and advances the read position. Never blocks.
     ///
-    /// Each clone of the handle tracks its own read position, so a cloned
-    /// handle starts from the beginning again.
+    /// Each clone of the handle tracks its own read position, starting at the
+    /// position the cloned handle had reached, so a clone never replays output
+    /// that was delivered before it existed.
     pub fn drain_output(&self) -> String {
         let guard = self
             .state
@@ -353,17 +354,25 @@ impl AsyncTaskHandle {
     /// Blocks until the task reaches a terminal status or `timeout` elapses.
     ///
     /// Returns `None` if the timeout elapsed first and the task is still
-    /// running.
+    /// running. The budget is measured from the call, not per wakeup: a
+    /// spurious condvar notification (or any notify without completion) cannot
+    /// restart the full timeout.
     pub fn wait_timeout(&self, timeout: Duration) -> Option<AsyncTaskSnapshot> {
         let (lock, cvar) = &*self.done;
         let mut finished = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = std::time::Instant::now() + timeout;
         while !*finished {
-            let (guard, result) = cvar
-                .wait_timeout(finished, timeout)
-                .unwrap_or_else(|poisoned| {
-                    let (guard, result) = poisoned.into_inner();
-                    (guard, result)
-                });
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (guard, result) =
+                cvar.wait_timeout(finished, remaining)
+                    .unwrap_or_else(|poisoned| {
+                        let (guard, result) = poisoned.into_inner();
+                        (guard, result)
+                    });
             finished = guard;
             if result.timed_out() && !*finished {
                 return None;
@@ -549,6 +558,127 @@ mod tests {
                 AsyncTaskEvent::Output("a".to_owned()),
                 AsyncTaskEvent::Output("b".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn clone_created_mid_stream_sees_only_future_events() {
+        let handle = AsyncTaskHandle::new("t");
+        assert_eq!(handle.drain_events(), vec![AsyncTaskEvent::Started]);
+        // Publish one event before the clone exists.
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.output.push_str("a");
+            state.publish(AsyncTaskEvent::Output("a".to_owned()));
+        }
+        let clone = handle.clone();
+        // The clone registered after "a" was published: it must not replay it.
+        assert!(clone.drain_events().is_empty());
+        // ... but it observes everything published from now on, exactly once,
+        // independently of the original handle's queue.
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.output.push_str("b");
+            state.publish(AsyncTaskEvent::Output("b".to_owned()));
+            state.publish(AsyncTaskEvent::Output("c".to_owned()));
+        }
+        assert_eq!(
+            handle.drain_events(),
+            vec![
+                AsyncTaskEvent::Output("a".to_owned()),
+                AsyncTaskEvent::Output("b".to_owned()),
+                AsyncTaskEvent::Output("c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            clone.drain_events(),
+            vec![
+                AsyncTaskEvent::Output("b".to_owned()),
+                AsyncTaskEvent::Output("c".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_clone_senders_are_cleaned_up() {
+        let handle = AsyncTaskHandle::new("t");
+        assert_eq!(handle.drain_events(), vec![AsyncTaskEvent::Started]);
+        let clone = handle.clone();
+        {
+            let state = handle.state.lock().unwrap();
+            assert_eq!(state.event_senders.len(), 2);
+        }
+        drop(clone);
+        // The next publish notices the dropped receiver and removes its sender,
+        // so a long-running task does not accumulate dead channels.
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.output.push_str("x");
+            state.publish(AsyncTaskEvent::Output("x".to_owned()));
+            assert_eq!(state.event_senders.len(), 1);
+        }
+        assert_eq!(
+            handle.drain_events(),
+            vec![AsyncTaskEvent::Output("x".to_owned())]
+        );
+    }
+
+    #[test]
+    fn clone_drain_output_starts_at_the_clone_point() {
+        let handle = AsyncTaskHandle::new("t");
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.output.push_str("hello");
+        }
+        assert_eq!(handle.drain_output(), "hello");
+        let clone = handle.clone();
+        // The clone inherits the parent's read position instead of starting
+        // from the beginning of the stream.
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.output.push_str(" world");
+        }
+        assert_eq!(clone.drain_output(), " world");
+        assert_eq!(handle.drain_output(), " world");
+        assert!(clone.drain_output().is_empty());
+    }
+
+    #[test]
+    fn handle_wait_timeout_respects_total_budget_under_spurious_wakeups() {
+        let handle = AsyncTaskHandle::new("t");
+        // A helper thread keeps notifying the condvar without ever finishing
+        // the task. Each wakeup would restart a full timeout if the remaining
+        // budget were not recomputed, so wait_timeout must still return None
+        // once the caller's total budget elapses.
+        let done = Arc::clone(&handle.done);
+        let stop = Arc::new(AtomicBool::new(false));
+        let notifier_stop = Arc::clone(&stop);
+        let notifier = std::thread::spawn(move || {
+            let (lock, cvar) = &*done;
+            let started = std::time::Instant::now();
+            while !notifier_stop.load(Ordering::Relaxed)
+                && started.elapsed() < Duration::from_millis(500)
+            {
+                {
+                    let _guard = lock.lock().unwrap();
+                    cvar.notify_all();
+                }
+                // Release the lock before sleeping: if the notifier kept
+                // holding it, the waiter could never reacquire it between
+                // wakeups and the test would measure lock starvation instead
+                // of the timeout budget.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = handle.wait_timeout(Duration::from_millis(100));
+        stop.store(true, Ordering::Relaxed);
+        notifier.join().unwrap();
+        assert!(result.is_none(), "a still-running task must time out");
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "wait_timeout overran its total budget: {:?}",
+            started.elapsed()
         );
     }
 }
