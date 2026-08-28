@@ -625,6 +625,9 @@ mod tests {
             shell.events.drain("workspace.tree.changed")[0].payload,
             "added=2,removed=0,updated=0"
         );
+        shell.render_ui(&mut renderer).unwrap();
+        assert!(shell.tree_changes().is_empty());
+        assert_eq!(shell.events.pending("workspace.tree.changed"), 0);
     }
 
     #[test]
