@@ -43,6 +43,15 @@ impl ApplicationContext {
         Ok(())
     }
 
+    pub fn scan_workspace<F: FileSystem>(&mut self, fs: &F, path: &Path) -> io::Result<()> {
+        self.file_tree.scan(fs, path)?;
+        self.events.publish(Event::new(
+            "workspace.tree.updated",
+            self.file_tree.nodes().len().to_string(),
+        ));
+        Ok(())
+    }
+
     pub fn save_file<F: FileSystem>(&mut self, fs: &F) -> io::Result<()> {
         self.editor.save_with_events(fs, &mut self.events)?;
         if let Some(path) = self.editor.path().map(PathBuf::from) {
@@ -114,6 +123,12 @@ mod tests {
         fn exists(&self, _: &Path) -> bool {
             true
         }
+        fn list(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+            Ok(vec![
+                (path.join("src"), true),
+                (path.join("README.md"), false),
+            ])
+        }
     }
 
     #[test]
@@ -129,6 +144,14 @@ mod tests {
         );
         assert_eq!(context.views.len(), 1);
         assert_eq!(context.events.pending("editor.opened"), 1);
+    }
+
+    #[test]
+    fn scan_workspace_updates_tree_and_emits_event() {
+        let mut context = ApplicationContext::new("");
+        context.scan_workspace(&MemoryFs, Path::new(".")).unwrap();
+        assert_eq!(context.file_tree.nodes().len(), 2);
+        assert_eq!(context.events.pending("workspace.tree.updated"), 1);
     }
 
     #[test]
