@@ -49,6 +49,14 @@ pub enum TreeRowChange {
 }
 
 impl TreeRowChange {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Added(_) => "added",
+            Self::Removed(_) => "removed",
+            Self::Updated(_) => "updated",
+        }
+    }
+
     pub fn path(&self) -> &std::path::Path {
         match self {
             Self::Added(row) | Self::Updated(row) => &row.path,
