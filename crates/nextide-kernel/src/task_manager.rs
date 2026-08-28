@@ -258,7 +258,11 @@ mod tests {
         assert_eq!(manager.state("build"), Some(crate::TaskState::Pending));
         assert_eq!(manager.state("missing"), None);
         assert_eq!(manager.ids().collect::<Vec<_>>(), vec!["build"]);
-        manager.remove("build").unwrap();
+        let mut removal_events = EventBus::default();
+        manager
+            .remove_with_events("build", &mut removal_events)
+            .unwrap();
+        assert_eq!(removal_events.drain("task.removed")[0].payload, "build");
         assert!(manager.ids().next().is_none());
         assert_eq!(manager.remove("missing"), Err(TaskError::InvalidTransition));
         assert_eq!(manager.clear_finished(), 0);
