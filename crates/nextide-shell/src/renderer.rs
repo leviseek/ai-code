@@ -41,6 +41,30 @@ pub fn tree_rows(snapshot: &ShellSnapshot) -> Vec<TreeRenderRow> {
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeRowChange {
+    Added(TreeRenderRow),
+    Removed(std::path::PathBuf),
+    Updated(TreeRenderRow),
+}
+
+pub fn diff_tree_rows(previous: &[TreeRenderRow], current: &[TreeRenderRow]) -> Vec<TreeRowChange> {
+    let mut changes = Vec::new();
+    for row in current {
+        match previous.iter().find(|old| old.path == row.path) {
+            None => changes.push(TreeRowChange::Added(row.clone())),
+            Some(old) if old != row => changes.push(TreeRowChange::Updated(row.clone())),
+            _ => {}
+        }
+    }
+    for row in previous {
+        if !current.iter().any(|new| new.path == row.path) {
+            changes.push(TreeRowChange::Removed(row.path.clone()));
+        }
+    }
+    changes
+}
+
 pub trait UiRenderer {
     fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()>;
     fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
