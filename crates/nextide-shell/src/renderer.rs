@@ -48,6 +48,17 @@ pub enum TreeRowChange {
     Updated(TreeRenderRow),
 }
 
+pub fn tree_change_counts(changes: &[TreeRowChange]) -> (usize, usize, usize) {
+    changes.iter().fold(
+        (0, 0, 0),
+        |(added, removed, updated), change| match change {
+            TreeRowChange::Added(_) => (added + 1, removed, updated),
+            TreeRowChange::Removed(_) => (added, removed + 1, updated),
+            TreeRowChange::Updated(_) => (added, removed, updated + 1),
+        },
+    )
+}
+
 pub fn diff_tree_rows(previous: &[TreeRenderRow], current: &[TreeRenderRow]) -> Vec<TreeRowChange> {
     let mut changes = Vec::new();
     for row in current {

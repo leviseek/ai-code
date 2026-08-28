@@ -22,7 +22,8 @@ pub use palette::CommandPalette;
 pub use platform_backend::{HeadlessBackend, PlatformBackend};
 pub use platform_events::{point as mouse_point, to_ui_input, PlatformEvent};
 pub use renderer::{
-    diff_tree_rows, tree_rows, HeadlessRenderer, TreeRenderRow, TreeRowChange, UiRenderer,
+    diff_tree_rows, tree_change_counts, tree_rows, HeadlessRenderer, TreeRenderRow, TreeRowChange,
+    UiRenderer,
 };
 pub use view_model::{ShellSnapshot, TreeItem};
 
