@@ -93,6 +93,25 @@ impl UiRenderer for HeadlessRenderer {
 mod tests {
     use super::*;
     #[test]
+    fn folder_toggle_hit_is_limited_to_arrow_region() {
+        let row = TreeRenderRow {
+            path: "src".into(),
+            label: "src".into(),
+            x: 16,
+            y: 24,
+            selected: false,
+            icon: "folder",
+        };
+        assert!(row.toggle_hit(crate::Point { x: 8, y: 30 }));
+        assert!(!row.toggle_hit(crate::Point { x: 20, y: 30 }));
+        let file = TreeRenderRow {
+            icon: "file",
+            ..row
+        };
+        assert!(!file.toggle_hit(crate::Point { x: 8, y: 30 }));
+    }
+
+    #[test]
     fn tree_render_row_hit_respects_indent_and_bounds() {
         let row = TreeRenderRow {
             path: "src/main.rs".into(),
