@@ -52,6 +52,17 @@ impl ApplicationContext {
         Ok(())
     }
 
+    pub fn expand_directory<F: FileSystem>(&mut self, fs: &F, path: &Path) -> io::Result<bool> {
+        let expanded = self.file_tree.expand(fs, path)?;
+        if expanded {
+            self.events.publish(Event::new(
+                "workspace.tree.expanded",
+                path.to_string_lossy(),
+            ));
+        }
+        Ok(expanded)
+    }
+
     pub fn save_file<F: FileSystem>(&mut self, fs: &F) -> io::Result<()> {
         self.editor.save_with_events(fs, &mut self.events)?;
         if let Some(path) = self.editor.path().map(PathBuf::from) {

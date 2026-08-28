@@ -314,7 +314,15 @@ impl DesktopShell {
                 CommandResult::Applied
             }
             ShellCommand::ToggleDirectory(path) => {
-                if self.app.file_tree.toggle(&path) {
+                let already_expanded = self
+                    .app
+                    .file_tree
+                    .nodes()
+                    .iter()
+                    .any(|node| node.path == path && node.expanded);
+                if (already_expanded && self.app.file_tree.toggle(&path))
+                    || (!already_expanded && self.app.expand_directory(fs, &path)?)
+                {
                     self.publish_state_changed();
                     CommandResult::Applied
                 } else {
