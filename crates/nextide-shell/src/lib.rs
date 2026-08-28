@@ -87,6 +87,18 @@ impl DesktopShell {
         self.layout.hit_test(point)
     }
 
+    pub fn tree_item_at(&self, point: Point) -> Option<std::path::PathBuf> {
+        if !self.layout.file_tree.contains(point) {
+            return None;
+        }
+        let row = point.y / 24;
+        self.app
+            .file_tree
+            .visible_nodes()
+            .get(row as usize)
+            .map(|node| node.path.clone())
+    }
+
     pub fn run_frame<E: EventLoop, F: nextide_kernel::FileSystem, R: UiRenderer>(
         &mut self,
         event_loop: &mut E,
