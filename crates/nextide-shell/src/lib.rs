@@ -1,3 +1,7 @@
+mod view_model;
+
+pub use view_model::ShellSnapshot;
+
 use nextide_kernel::{
     ApplicationContext, HeadlessSurface, HeadlessWindowService, RenderSurface, SurfaceSize,
     WindowHandle, WindowOptions, WindowService,
@@ -84,6 +88,10 @@ impl DesktopShell {
         Ok(())
     }
 
+    pub fn snapshot(&self) -> ShellSnapshot {
+        ShellSnapshot::from_context(self.title.clone(), &self.app)
+    }
+
     pub fn start(&self) -> String {
         format!(
             "{} ready ({} capabilities)",
@@ -110,6 +118,17 @@ mod tests {
         assert_eq!(shell.events.drain("window.created")[0].payload, "1");
         assert_eq!(shell.events.drain("window.resized")[0].payload, "1000x700");
         assert_eq!(shell.events.drain("window.closed")[0].payload, "1");
+    }
+
+    #[test]
+    fn shell_snapshot_exposes_ui_state_counts() {
+        let shell = DesktopShell::new("NextIDE");
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.title, "NextIDE");
+        assert_eq!(
+            (snapshot.open_files, snapshot.tabs, snapshot.editor_views),
+            (0, 0, 0)
+        );
     }
 
     #[test]
