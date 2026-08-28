@@ -35,14 +35,30 @@ impl PlatformServices for WindowsPlatform {
 
     fn spawn(
         &self,
-        _program: &str,
-        _args: &[String],
-        _working_directory: &Path,
+        program: &str,
+        args: &[String],
+        working_directory: &Path,
     ) -> io::Result<ProcessHandle> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows process adapter pending",
-        ))
+        let child = std::process::Command::new(program)
+            .args(args)
+            .current_dir(working_directory)
+            .spawn()?;
+        Ok(ProcessHandle { id: child.id() })
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawns_process_in_requested_directory() {
+        let platform = WindowsPlatform;
+        let handle = platform
+            .spawn("cmd.exe", &["/C".into(), "exit".into()], Path::new("."))
+            .unwrap();
+        assert!(handle.id > 0);
     }
 }
 
