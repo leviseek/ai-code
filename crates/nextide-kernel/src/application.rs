@@ -43,6 +43,31 @@ impl ApplicationContext {
         Ok(())
     }
 
+    pub fn close_file(&mut self, path: &Path, force: bool) -> io::Result<bool> {
+        let dirty = self
+            .views
+            .iter()
+            .any(|view| view.path == path && view.dirty);
+        if dirty && !force {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "document has unsaved changes",
+            ));
+        }
+        let path_buf = path.to_path_buf();
+        let removed = self
+            .workspace
+            .close_file_with_events(&path_buf, &mut self.events);
+        if !removed {
+            return Ok(false);
+        }
+        self.tabs.close(&path_buf);
+        self.views.retain(|view| view.path != path);
+        self.events
+            .publish(Event::new("editor.closed", path.to_string_lossy()));
+        Ok(true)
+    }
+
     pub fn bootstrap(initial_text: impl Into<String>) -> Self {
         let mut context = Self::new(initial_text);
         for (id, permission) in [
