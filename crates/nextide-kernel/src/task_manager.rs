@@ -159,6 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn manager_exposes_task_state_and_ids() {
+        let mut manager = TaskManager::default();
+        manager
+            .add(TaskSpec {
+                id: "build".into(),
+                program: "echo".into(),
+                args: vec![],
+            })
+            .unwrap();
+        assert_eq!(manager.state("build"), Some(crate::TaskState::Pending));
+        assert_eq!(manager.state("missing"), None);
+        assert_eq!(manager.ids().collect::<Vec<_>>(), vec!["build"]);
+    }
+
+    #[test]
     fn manager_emits_task_lifecycle_events() {
         let mut manager = TaskManager::default();
         let mut events = EventBus::default();
