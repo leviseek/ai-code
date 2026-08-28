@@ -9,6 +9,7 @@ pub struct TreeItem {
     pub indent: u32,
     pub directory: bool,
     pub expanded: bool,
+    pub selected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +58,7 @@ impl ShellSnapshot {
                 .iter()
                 .map(|node| node.path.clone())
                 .collect(),
-            selected_tree,
+            selected_tree: selected_tree.clone(),
             visible_tree: app
                 .file_tree
                 .visible_nodes()
@@ -69,6 +70,7 @@ impl ShellSnapshot {
                     indent: (node.depth as u32) * 16,
                     directory: node.kind == FileNodeKind::Directory,
                     expanded: node.expanded,
+                    selected: selected_tree.as_ref() == Some(&node.path),
                 })
                 .collect(),
             palette_open: palette.is_open(),
