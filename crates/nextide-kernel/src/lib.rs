@@ -8,6 +8,7 @@ use std::io;
 use std::path::Path;
 
 pub mod application;
+pub mod async_task;
 pub mod capability;
 pub mod editor_view;
 pub mod events;
@@ -25,6 +26,7 @@ pub mod window;
 pub mod workspace;
 
 pub use application::ApplicationContext;
+pub use async_task::{AsyncTaskHandle, AsyncTaskSnapshot, AsyncTaskStatus};
 pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
 pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};

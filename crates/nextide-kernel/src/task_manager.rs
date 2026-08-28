@@ -1,3 +1,4 @@
+use crate::async_task::{AsyncTaskHandle, AsyncTaskState, AsyncTaskStatus};
 use crate::process::{
     spawn_streaming, OutputChunk, RunningProcess, StreamKind, StreamWait, Utf8Decoder,
     POLL_INTERVAL,
@@ -7,6 +8,8 @@ use crate::{Event, EventBus, Task, TaskError, TaskResult, TaskSpec};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// A stable, UI-safe projection of a task's identity and lifecycle state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,7 +21,17 @@ pub struct TaskSummary {
 
 #[derive(Default, Debug)]
 pub struct TaskManager {
-    tasks: BTreeMap<String, Task>,
+    /// Each task lives behind a shared mutex so a background worker can keep
+    /// driving its record (output, terminal state) while the manager's
+    /// synchronous API keeps operating on it from the caller's thread. The
+    /// public API is unchanged; the lock is only ever held briefly.
+    tasks: BTreeMap<String, Arc<Mutex<Task>>>,
+}
+
+/// Locks a task's shared record, recovering from a poisoned mutex so a
+/// panicking worker thread cannot take down the manager's API surface.
+fn lock_task(task: &Arc<Mutex<Task>>) -> MutexGuard<'_, Task> {
+    task.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl TaskManager {
@@ -34,7 +47,7 @@ impl TaskManager {
         let before = self.tasks.len();
         self.tasks.retain(|_, task| {
             matches!(
-                task.state,
+                lock_task(task).state,
                 crate::TaskState::Pending | crate::TaskState::Running
             )
         });
@@ -48,7 +61,7 @@ impl TaskManager {
     }
 
     pub fn remove(&mut self, id: &str) -> Result<(), TaskError> {
-        match self.tasks.get(id).map(|task| task.state) {
+        match self.tasks.get(id).map(|task| lock_task(task).state) {
             Some(crate::TaskState::Pending) => {
                 self.tasks.remove(id);
                 Ok(())
@@ -59,20 +72,26 @@ impl TaskManager {
 
     /// Returns a snapshot for one task without exposing its mutable internals.
     pub fn summary(&self, id: &str) -> Option<TaskSummary> {
-        self.tasks.get(id).map(|task| TaskSummary {
-            id: id.to_owned(),
-            state: task.state,
-            program: task.spec.program.clone(),
+        self.tasks.get(id).map(|task| {
+            let task = lock_task(task);
+            TaskSummary {
+                id: id.to_owned(),
+                state: task.state,
+                program: task.spec.program.clone(),
+            }
         })
     }
 
     pub fn summaries(&self) -> Vec<TaskSummary> {
         self.tasks
             .iter()
-            .map(|(id, task)| TaskSummary {
-                id: id.clone(),
-                state: task.state,
-                program: task.spec.program.clone(),
+            .map(|(id, task)| {
+                let task = lock_task(task);
+                TaskSummary {
+                    id: id.clone(),
+                    state: task.state,
+                    program: task.spec.program.clone(),
+                }
             })
             .collect()
     }
@@ -90,7 +109,7 @@ impl TaskManager {
     }
 
     pub fn state(&self, id: &str) -> Option<crate::TaskState> {
-        self.tasks.get(id).map(|task| task.state)
+        self.tasks.get(id).map(|task| lock_task(task).state)
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &str> {
@@ -102,20 +121,19 @@ impl TaskManager {
         if self.tasks.contains_key(&id) {
             return Err(TaskError::DuplicateId);
         }
-        self.tasks.insert(id, Task::new(spec)?);
+        self.tasks
+            .insert(id, Arc::new(Mutex::new(Task::new(spec)?)));
         Ok(())
     }
     pub fn start(&mut self, id: &str, events: &mut EventBus) -> Result<(), TaskError> {
-        let task = self.tasks.get_mut(id).ok_or(TaskError::InvalidTransition)?;
-        task.start()?;
+        let task = self.tasks.get(id).ok_or(TaskError::InvalidTransition)?;
+        lock_task(task).start()?;
         events.publish(Event::new("task.started", id));
         Ok(())
     }
     pub fn append_output(&mut self, id: &str, chunk: &str) -> Result<(), TaskError> {
-        self.tasks
-            .get_mut(id)
-            .ok_or(TaskError::InvalidTransition)?
-            .append_output(chunk)
+        let task = self.tasks.get(id).ok_or(TaskError::InvalidTransition)?;
+        lock_task(task).append_output(chunk)
     }
     pub fn append_output_with_events(
         &mut self,
@@ -129,10 +147,8 @@ impl TaskManager {
     }
 
     pub fn cancel(&mut self, id: &str, events: &mut EventBus) -> Result<(), TaskError> {
-        self.tasks
-            .get_mut(id)
-            .ok_or(TaskError::InvalidTransition)?
-            .cancel()?;
+        let task = self.tasks.get(id).ok_or(TaskError::InvalidTransition)?;
+        lock_task(task).cancel()?;
         events.publish(Event::new("task.cancelled", id));
         Ok(())
     }
@@ -145,11 +161,11 @@ impl TaskManager {
     ) -> io::Result<TaskResult> {
         self.start(id, events)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let spec = &self
+        let task = self
             .tasks
             .get(id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
-            .spec;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?;
+        let spec = lock_task(task).spec.clone();
         let output = run_capture(&spec.program, &spec.args, working_directory)?;
         let combined = output.combined();
         self.append_output_with_events(id, &combined, events)
@@ -167,11 +183,11 @@ impl TaskManager {
     ) -> io::Result<TaskResult> {
         self.start(id, events)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let spec = &self
+        let task = self
             .tasks
             .get(id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
-            .spec;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?;
+        let spec = lock_task(task).spec.clone();
         let output = run_capture_timeout(&spec.program, &spec.args, working_directory, timeout)?;
         let combined = output.combined();
         self.append_output_with_events(id, &combined, events)
@@ -179,9 +195,10 @@ impl TaskManager {
         if output.exit_code.is_none() {
             let result = self
                 .tasks
-                .get_mut(id)
+                .get(id)
                 .ok_or(TaskError::InvalidTransition)
-                .and_then(|task| task.timeout())
+                .map(lock_task)
+                .and_then(|mut task| task.timeout())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             events.publish(Event::new("task.timeout", id));
             events.publish(Event::new("task.finished", format!("{id}:timeout")));
@@ -218,11 +235,11 @@ impl TaskManager {
     {
         self.start(id, events)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let spec = &self
+        let task = self
             .tasks
             .get(id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
-            .spec;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?;
+        let spec = lock_task(task).spec.clone();
         let mut proc = match spawn_streaming(&spec.program, &spec.args, working_directory) {
             Ok(process) => process,
             Err(error) => {
@@ -260,11 +277,11 @@ impl TaskManager {
     {
         self.start(id, events)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let spec = &self
+        let task = self
             .tasks
             .get(id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
-            .spec;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?;
+        let spec = lock_task(task).spec.clone();
         let mut proc = match spawn_streaming(&spec.program, &spec.args, working_directory) {
             Ok(process) => process,
             Err(error) => {
@@ -316,9 +333,10 @@ impl TaskManager {
             flush_decoders(self, id, &mut decoders)?;
             let result = self
                 .tasks
-                .get_mut(id)
+                .get(id)
                 .ok_or(TaskError::InvalidTransition)
-                .and_then(|task| task.timeout())
+                .map(lock_task)
+                .and_then(|mut task| task.timeout())
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
             events.publish(Event::new("task.timeout", id));
             events.publish(Event::new("task.finished", format!("{id}:timeout")));
@@ -337,17 +355,296 @@ impl TaskManager {
         code: i32,
         events: &mut EventBus,
     ) -> Result<TaskResult, TaskError> {
-        let result = self
-            .tasks
-            .get_mut(id)
-            .ok_or(TaskError::InvalidTransition)?
-            .finish(code)?;
+        let task = self.tasks.get(id).ok_or(TaskError::InvalidTransition)?;
+        let result = lock_task(task).finish(code)?;
         if code != 0 {
             events.publish(Event::new("task.failed", format!("{id}:{code}")));
         }
         events.publish(Event::new("task.finished", format!("{id}:{code}")));
         Ok(result)
     }
+
+    /// Starts a task in the background and returns a pollable handle.
+    ///
+    /// Unlike the synchronous [`TaskManager::run_streaming`], this method
+    /// returns as soon as the process has been spawned: the process is driven
+    /// by a dedicated worker thread that streams output into the handle and
+    /// the manager's task record while the caller keeps running. Poll the
+    /// handle with [`AsyncTaskHandle::poll`] /
+    /// [`AsyncTaskHandle::drain_output`] and block on completion with
+    /// [`AsyncTaskHandle::wait`] / [`AsyncTaskHandle::wait_timeout`], or
+    /// request termination with [`AsyncTaskHandle::cancel`].
+    ///
+    /// The task is started (and `task.started` is published) synchronously,
+    /// exactly like the sync run methods. Output is decoded incrementally per
+    /// stream, so a multi-byte character split across chunk boundaries is
+    /// reconstructed intact, and stdout/stderr are merged in arrival order —
+    /// the same semantics as [`TaskManager::run_streaming`]. Completion is
+    /// observed through the handle rather than `task.output`/`task.finished`
+    /// events, because the worker cannot publish into a caller-held
+    /// [`EventBus`].
+    ///
+    /// A spawn failure (e.g. the program does not exist) is reported
+    /// synchronously and the task is finished as failed, mirroring
+    /// [`TaskManager::run_streaming`]. If the worker thread cannot be created,
+    /// the spawned process is killed and the task is finished as failed.
+    pub fn spawn_async(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        events: &mut EventBus,
+    ) -> io::Result<AsyncTaskHandle> {
+        self.spawn_async_inner(id, working_directory, None, events)
+    }
+
+    /// Like [`TaskManager::spawn_async`], but capped by a hard deadline.
+    ///
+    /// If the process has not exited once `timeout` has elapsed since it was
+    /// spawned, the worker kills it (and its descendants), drains any
+    /// still-buffered output into the handle, and marks the task
+    /// [`AsyncTaskStatus::TimedOut`] / [`crate::TaskState::TimedOut`]. The
+    /// deadline applies even if the streams reached EOF early.
+    pub fn spawn_async_timeout(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        timeout: std::time::Duration,
+        events: &mut EventBus,
+    ) -> io::Result<AsyncTaskHandle> {
+        self.spawn_async_inner(id, working_directory, Some(timeout), events)
+    }
+
+    fn spawn_async_inner(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        timeout: Option<std::time::Duration>,
+        events: &mut EventBus,
+    ) -> io::Result<AsyncTaskHandle> {
+        self.start(id, events)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let task = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
+            .clone();
+        let spec = lock_task(&task).spec.clone();
+        let proc = match spawn_streaming(&spec.program, &spec.args, working_directory) {
+            Ok(process) => process,
+            Err(error) => {
+                // Mirrors run_streaming: a task whose process cannot be
+                // spawned is finished as failed.
+                let _ = self.finish(id, -1, events);
+                return Err(error);
+            }
+        };
+        let handle = AsyncTaskHandle::new(id);
+        let shared = AsyncTaskShared {
+            task,
+            state: handle.state.clone(),
+            done: handle.done.clone(),
+            cancelled: handle.cancelled.clone(),
+        };
+        match std::thread::Builder::new()
+            .name(format!("nextide-task-{id}"))
+            .spawn(move || run_async_worker(shared, proc, timeout))
+        {
+            Ok(_) => Ok(handle),
+            Err(error) => {
+                // Dropping the closure drops `proc`, which kills and reaps the
+                // child; finish the task as failed so the manager stays
+                // consistent.
+                let _ = self.finish(id, -1, events);
+                Err(io::Error::other(error))
+            }
+        }
+    }
+}
+
+/// Everything the background worker needs to drive one async task: a clone of
+/// the manager's task record (so the manager's synchronous views stay
+/// consistent), the handle's shared state (so pollers see live output and
+/// status), and the cancellation and completion signals.
+struct AsyncTaskShared {
+    task: Arc<Mutex<Task>>,
+    state: Arc<Mutex<AsyncTaskState>>,
+    done: Arc<(Mutex<bool>, Condvar)>,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Drives a spawned process in the background until it exits, times out, or is
+/// cancelled, feeding decoded output into both the handle's shared state and
+/// the manager's task record, then transitioning the task to its terminal
+/// state. The worker never blocks a poller: all shared access goes through the
+/// handle's mutexes, which are only ever held briefly.
+fn run_async_worker(
+    shared: AsyncTaskShared,
+    mut proc: RunningProcess,
+    timeout: Option<std::time::Duration>,
+) {
+    let started = std::time::Instant::now();
+    let mut decoders = StreamDecoders::default();
+    let mut streams_closed = false;
+    let mut timed_out = false;
+    loop {
+        if shared.cancelled.load(Ordering::SeqCst) {
+            let _ = proc.kill();
+            drain_async_output(&mut proc, &mut decoders, &shared);
+            let _ = proc.wait();
+            flush_async_decoders(&shared, &mut decoders);
+            finish_async(&shared, AsyncTaskStatus::Cancelled);
+            return;
+        }
+        let wait = match timeout {
+            Some(deadline) => {
+                let elapsed = started.elapsed();
+                if elapsed >= deadline {
+                    timed_out = true;
+                    break;
+                }
+                let remaining = deadline - elapsed;
+                if streams_closed {
+                    // Both streams reached EOF, but the child may still be
+                    // running: poll the child itself until the deadline, as
+                    // the synchronous timeout path does.
+                    match proc.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            std::thread::sleep(remaining.min(POLL_INTERVAL));
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                proc.next_chunk_timeout(remaining)
+            }
+            None => {
+                if streams_closed {
+                    match proc.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            std::thread::sleep(POLL_INTERVAL);
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Poll with a short slice so cancellation is observed
+                // promptly even when no output arrives.
+                proc.next_chunk_timeout(POLL_INTERVAL)
+            }
+        };
+        match wait {
+            Ok(StreamWait::Chunk(chunk)) => {
+                append_async_chunk(&chunk, &mut decoders, &shared);
+            }
+            Ok(StreamWait::Closed) => streams_closed = true,
+            Ok(StreamWait::Timeout) => {
+                if timeout.is_some() {
+                    timed_out = true;
+                    break;
+                }
+                // No deadline: nothing arrived; loop back to re-check
+                // cancellation.
+            }
+            Err(_) => break,
+        }
+    }
+    if timed_out {
+        let _ = proc.kill();
+        // Drain whatever the reader threads had buffered so the handle keeps
+        // every byte the process produced before it was killed.
+        drain_async_output(&mut proc, &mut decoders, &shared);
+        let _ = proc.wait();
+        flush_async_decoders(&shared, &mut decoders);
+        finish_async(&shared, AsyncTaskStatus::TimedOut);
+    } else {
+        let exit_code = proc
+            .wait()
+            .ok()
+            .and_then(|output| output.exit_code)
+            .unwrap_or(-1);
+        flush_async_decoders(&shared, &mut decoders);
+        let status = if exit_code == 0 {
+            AsyncTaskStatus::Succeeded { exit_code }
+        } else {
+            AsyncTaskStatus::Failed { exit_code }
+        };
+        finish_async(&shared, status);
+    }
+}
+
+/// Decodes one chunk through its stream's decoder and appends the text to the
+/// handle's shared output and the manager's task record, mirroring the
+/// synchronous streaming path (minus the event publication).
+fn append_async_chunk(
+    chunk: &OutputChunk,
+    decoders: &mut StreamDecoders,
+    shared: &AsyncTaskShared,
+) {
+    let text = decoders.for_kind(chunk.kind).feed(&chunk.data);
+    append_async_text(shared, &text);
+}
+
+/// Appends decoded text to the handle's shared output and, best effort, to the
+/// manager's task record. A failed task-record append (e.g. the task was
+/// already cancelled) is not fatal: the handle remains the source of truth for
+/// async output.
+fn append_async_text(shared: &AsyncTaskShared, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Ok(mut state) = shared.state.lock() {
+        state.output.push_str(text);
+    }
+    if let Ok(mut task) = shared.task.lock() {
+        let _ = task.append_output(text);
+    }
+}
+
+/// Flushes any bytes the decoders still hold — a multi-byte character that was
+/// genuinely truncated at end of stream — into the handle and the task,
+/// lossily.
+fn flush_async_decoders(shared: &AsyncTaskShared, decoders: &mut StreamDecoders) {
+    let tail = format!("{}{}", decoders.stdout.finish(), decoders.stderr.finish());
+    append_async_text(shared, &tail);
+}
+
+/// Drains whatever the reader threads buffered (e.g. after a kill) into the
+/// handle's shared output and the manager's task record.
+fn drain_async_output(
+    proc: &mut RunningProcess,
+    decoders: &mut StreamDecoders,
+    shared: &AsyncTaskShared,
+) {
+    while let Ok(Some(chunk)) = proc.next_chunk() {
+        append_async_chunk(&chunk, decoders, shared);
+    }
+}
+
+/// Records the terminal status in the handle's shared state, transitions the
+/// manager's task record to match, and wakes every waiter.
+fn finish_async(shared: &AsyncTaskShared, status: AsyncTaskStatus) {
+    if let Ok(mut state) = shared.state.lock() {
+        state.status = status.clone();
+    }
+    if let Ok(mut task) = shared.task.lock() {
+        match &status {
+            AsyncTaskStatus::Succeeded { exit_code } | AsyncTaskStatus::Failed { exit_code } => {
+                let _ = task.finish(*exit_code);
+            }
+            AsyncTaskStatus::TimedOut => {
+                let _ = task.timeout();
+            }
+            AsyncTaskStatus::Cancelled => {
+                let _ = task.cancel();
+            }
+            AsyncTaskStatus::Running => {}
+        }
+    }
+    let (lock, cvar) = &*shared.done;
+    *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    cvar.notify_all();
 }
 
 /// Per-stream incremental UTF-8 decoders used while merging stdout and stderr
@@ -870,6 +1167,217 @@ mod tests {
             !result.output.contains('\u{FFFD}'),
             "output was {:?}",
             result.output
+        );
+    }
+
+    /// A command that prints "a", pauses, then prints "b": long enough for a
+    /// poller to observe intermediate output while the task is still running.
+    fn async_staggered_command() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "echo a & ping -n 2 127.0.0.1 >nul & echo b".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "printf a; sleep 0.3; printf b".to_string(),
+                ],
+            )
+        }
+    }
+
+    #[test]
+    fn spawn_async_polls_intermediate_output_and_completion() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = async_staggered_command();
+        manager
+            .add(TaskSpec {
+                id: "async".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("async", Path::new("."), &mut events)
+            .unwrap();
+        // The task is started synchronously, exactly like the sync run methods.
+        assert_eq!(events.drain("task.started")[0].payload, "async");
+        // The handle is pollable immediately and never blocks the caller.
+        let snapshot = handle.poll();
+        assert_eq!(snapshot.id, "async");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Running);
+        // A second spawn while the task is still running must fail.
+        assert!(manager
+            .spawn_async("async", Path::new("."), &mut events)
+            .is_err());
+        // Poll until the first chunk of output arrives while still running.
+        let started = std::time::Instant::now();
+        let mut seen = String::new();
+        while handle.is_running() && started.elapsed() < std::time::Duration::from_secs(5) {
+            seen.push_str(&handle.drain_output());
+            if seen.contains('a') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            seen.contains('a'),
+            "intermediate output never arrived while running; saw {:?}",
+            seen
+        );
+        // Block until completion and read the final snapshot.
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("async task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        assert!(
+            snapshot.output.contains('a'),
+            "output was {:?}",
+            snapshot.output
+        );
+        assert!(
+            snapshot.output.contains('b'),
+            "output was {:?}",
+            snapshot.output
+        );
+        assert!(!handle.is_running());
+        assert_eq!(handle.state(), crate::TaskState::Succeeded);
+        assert_eq!(handle.exit_code(), Some(0));
+        // The manager's task record was driven to the same terminal state and
+        // can be cleaned up through the existing synchronous API.
+        assert_eq!(manager.state("async"), Some(crate::TaskState::Succeeded));
+        assert_eq!(manager.summaries()[0].state, crate::TaskState::Succeeded);
+        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.state("async"), None);
+    }
+
+    #[test]
+    fn spawn_async_timeout_kills_and_marks_timed_out() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            ("ping", vec!["127.0.0.1".into(), "-n".into(), "10".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 30".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "slow".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async_timeout(
+                "slow",
+                Path::new("."),
+                std::time::Duration::from_millis(150),
+                &mut events,
+            )
+            .unwrap();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("timed-out task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::TimedOut);
+        assert_eq!(handle.state(), crate::TaskState::TimedOut);
+        assert_eq!(manager.state("slow"), Some(crate::TaskState::TimedOut));
+        // The async path observes completion through the handle, not events.
+        assert!(events.drain("task.timeout").is_empty());
+    }
+
+    #[test]
+    fn spawn_async_spawn_failure_finishes_task_synchronously() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "missing".into(),
+                program: "nextide-program-that-does-not-exist".into(),
+                args: vec![],
+            })
+            .unwrap();
+        assert!(manager
+            .spawn_async("missing", Path::new("."), &mut events)
+            .is_err());
+        assert_eq!(manager.state("missing"), Some(crate::TaskState::Failed));
+    }
+
+    #[test]
+    fn async_handle_cancel_kills_and_marks_cancelled() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell.exe",
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Seconds 30".into(),
+                ],
+            )
+        } else {
+            ("sh", vec!["-c".into(), "exec sleep 30".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "run".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("run", Path::new("."), &mut events)
+            .unwrap();
+        handle.cancel();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("cancelled task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Cancelled);
+        assert_eq!(manager.state("run"), Some(crate::TaskState::Cancelled));
+    }
+
+    #[test]
+    fn async_output_merges_stdout_and_stderr() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/C".into(), "echo out && echo err 1>&2".into()],
+            )
+        } else {
+            ("sh", vec!["-c".into(), "printf out; printf err >&2".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "mixed".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("mixed", Path::new("."), &mut events)
+            .unwrap();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        assert!(
+            snapshot.output.contains("out"),
+            "output was {:?}",
+            snapshot.output
+        );
+        assert!(
+            snapshot.output.contains("err"),
+            "output was {:?}",
+            snapshot.output
         );
     }
 

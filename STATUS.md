@@ -21,6 +21,7 @@ Phase 0：技术基线与核心内核起步。
 - 增加 PlatformServices、WindowsPlatform 和终端/进程抽象接口（Windows ConPTY/进程实现待接入）。
 - Editor Kernel 已支持通过 VFS 打开、编辑、保存和 save-as。
 - 增加 `.gitignore`，排除 Rust target、日志、环境文件和 IDE 临时目录。
+- TaskManager 支持异步任务句柄：`spawn_async`/`spawn_async_timeout` 立即返回可轮询的 `AsyncTaskHandle`（线程 + `Arc<Mutex>` 共享输出/状态，`AtomicBool` 取消，`Condvar` 完成通知），现有同步 API 保持不变。
 
 ## 下一步
 
