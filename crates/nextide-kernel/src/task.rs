@@ -28,6 +28,7 @@ pub enum TaskError {
     EmptyId,
     EmptyProgram,
     InvalidTransition,
+    DuplicateId,
 }
 
 impl fmt::Display for TaskError {

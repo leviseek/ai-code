@@ -9,6 +9,9 @@ pub struct TaskManager {
 impl TaskManager {
     pub fn add(&mut self, spec: TaskSpec) -> Result<(), TaskError> {
         let id = spec.id.clone();
+        if self.tasks.contains_key(&id) {
+            return Err(TaskError::DuplicateId);
+        }
         self.tasks.insert(id, Task::new(spec)?);
         Ok(())
     }
@@ -24,6 +27,15 @@ impl TaskManager {
             .ok_or(TaskError::InvalidTransition)?
             .append_output(chunk)
     }
+    pub fn cancel(&mut self, id: &str, events: &mut EventBus) -> Result<(), TaskError> {
+        self.tasks
+            .get_mut(id)
+            .ok_or(TaskError::InvalidTransition)?
+            .cancel()?;
+        events.publish(Event::new("task.cancelled", id));
+        Ok(())
+    }
+
     pub fn finish(
         &mut self,
         id: &str,
