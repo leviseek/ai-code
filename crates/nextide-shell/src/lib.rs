@@ -621,6 +621,10 @@ mod tests {
         assert!(renderer.tree_rows()[1].selected);
         assert_eq!(renderer.tree_changes().len(), 2);
         assert_eq!(shell.tree_changes().len(), 2);
+        assert_eq!(
+            shell.events.drain("workspace.tree.changed")[0].payload,
+            "added=2,removed=0,updated=0"
+        );
     }
 
     #[test]
