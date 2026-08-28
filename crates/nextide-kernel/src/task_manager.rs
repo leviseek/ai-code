@@ -1,4 +1,6 @@
-use crate::process::{spawn_streaming, OutputChunk, RunningProcess, StreamWait};
+use crate::process::{
+    spawn_streaming, OutputChunk, RunningProcess, StreamKind, StreamWait, Utf8Decoder,
+};
 use crate::{run_capture, run_capture_timeout};
 use crate::{Event, EventBus, Task, TaskError, TaskResult, TaskSpec};
 use std::collections::BTreeMap;
@@ -192,11 +194,14 @@ impl TaskManager {
     /// Streams a task's process output chunk by chunk into the task.
     ///
     /// The task is started, the process is spawned through
-    /// [`crate::process::spawn_streaming`], and every chunk is appended via
-    /// [`TaskManager::append_output_with_events`] as it arrives, so `task.output`
-    /// events are published incrementally instead of once at the end. The
-    /// driver blocks until the process exits and then finishes the task with
-    /// its exit code.
+    /// [`crate::process::spawn_streaming`], and every chunk is decoded and
+    /// appended to the task as it arrives, so `task.output` events are
+    /// published incrementally instead of once at the end. The driver blocks
+    /// until the process exits and then finishes the task with its exit code.
+    ///
+    /// Chunks are decoded incrementally per stream, so a multi-byte character
+    /// split across chunk boundaries is reconstructed intact in the task's
+    /// final output; `task.output` events keep the lossy per-chunk view.
     ///
     /// `on_chunk` is invoked for every chunk right after it is appended, so
     /// callers can observe output incrementally without polling the event bus.
@@ -224,8 +229,10 @@ impl TaskManager {
                 return Err(error);
             }
         };
-        drain_all(self, id, &mut proc, events, &mut on_chunk)?;
+        let mut decoders = StreamDecoders::default();
+        drain_all(self, id, &mut proc, events, &mut on_chunk, &mut decoders)?;
         let output = proc.wait()?;
+        flush_decoders(self, id, &mut decoders)?;
         self.finish(id, output.exit_code.unwrap_or(-1), events)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
     }
@@ -265,6 +272,7 @@ impl TaskManager {
         };
         let started = std::time::Instant::now();
         let mut timed_out = false;
+        let mut decoders = StreamDecoders::default();
         loop {
             let elapsed = started.elapsed();
             if elapsed >= timeout {
@@ -273,7 +281,7 @@ impl TaskManager {
             }
             match proc.next_chunk_timeout(timeout - elapsed)? {
                 StreamWait::Chunk(chunk) => {
-                    append_chunk(self, id, &chunk, events)?;
+                    append_chunk(self, id, &chunk, &mut decoders, events)?;
                     on_chunk(&chunk);
                 }
                 StreamWait::Closed => break,
@@ -287,8 +295,9 @@ impl TaskManager {
             let _ = proc.kill();
             // Drain whatever the reader threads had buffered so the task keeps
             // every byte the process produced before it was killed.
-            drain_all(self, id, &mut proc, events, &mut on_chunk)?;
+            drain_all(self, id, &mut proc, events, &mut on_chunk, &mut decoders)?;
             let _ = proc.wait()?;
+            flush_decoders(self, id, &mut decoders)?;
             let result = self
                 .tasks
                 .get_mut(id)
@@ -300,6 +309,7 @@ impl TaskManager {
             Ok(result)
         } else {
             let output = proc.wait()?;
+            flush_decoders(self, id, &mut decoders)?;
             self.finish(id, output.exit_code.unwrap_or(-1), events)
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
         }
@@ -324,15 +334,61 @@ impl TaskManager {
     }
 }
 
+/// Per-stream incremental UTF-8 decoders used while merging stdout and stderr
+/// chunks into a task's single output buffer.
+///
+/// Each stream keeps its own decoder state so a multi-byte character split
+/// across chunks is reconstructed exactly once, and bytes from the two
+/// streams are never joined into one character.
+#[derive(Default, Debug)]
+struct StreamDecoders {
+    stdout: Utf8Decoder,
+    stderr: Utf8Decoder,
+}
+
+impl StreamDecoders {
+    fn for_kind(&mut self, kind: StreamKind) -> &mut Utf8Decoder {
+        match kind {
+            StreamKind::Stdout => &mut self.stdout,
+            StreamKind::Stderr => &mut self.stderr,
+        }
+    }
+}
+
 fn append_chunk(
     manager: &mut TaskManager,
     id: &str,
     chunk: &OutputChunk,
+    decoders: &mut StreamDecoders,
     events: &mut EventBus,
 ) -> io::Result<()> {
+    // Decode incrementally per stream so a multi-byte character split across
+    // chunk boundaries lands intact in the task's final output instead of as
+    // replacement characters.
+    let text = decoders.for_kind(chunk.kind).feed(&chunk.data);
     manager
-        .append_output_with_events(id, &chunk.text(), events)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+        .append_output(id, &text)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    // `task.output` events keep the lossy per-chunk view; `on_chunk` already
+    // hands callers the raw bytes to decode however they need.
+    events.publish(Event::new("task.output", format!("{id}:{}", chunk.text())));
+    Ok(())
+}
+
+/// Flushes any bytes the decoders still hold — a multi-byte character that
+/// was genuinely truncated at end of stream — into the task, lossily.
+fn flush_decoders(
+    manager: &mut TaskManager,
+    id: &str,
+    decoders: &mut StreamDecoders,
+) -> io::Result<()> {
+    let tail = format!("{}{}", decoders.stdout.finish(), decoders.stderr.finish());
+    if !tail.is_empty() {
+        manager
+            .append_output(id, &tail)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    }
+    Ok(())
 }
 
 fn drain_all<F>(
@@ -341,12 +397,13 @@ fn drain_all<F>(
     proc: &mut RunningProcess,
     events: &mut EventBus,
     on_chunk: &mut F,
+    decoders: &mut StreamDecoders,
 ) -> io::Result<()>
 where
     F: FnMut(&OutputChunk),
 {
     while let Some(chunk) = proc.next_chunk()? {
-        append_chunk(manager, id, &chunk, events)?;
+        append_chunk(manager, id, &chunk, decoders, events)?;
         on_chunk(&chunk);
     }
     Ok(())
@@ -591,5 +648,175 @@ mod tests {
             result.output
         );
         assert!(events.drain("task.timeout").is_empty());
+    }
+
+    #[test]
+    fn streaming_reconstructs_multibyte_characters_split_across_chunks() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "utf8".into(),
+                program: "sh".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("utf8", &mut events).unwrap();
+        let mut decoders = StreamDecoders::default();
+        // "héllo": "é" (U+00E9, bytes C3 A9) is split across the two chunks.
+        append_chunk(
+            &mut manager,
+            "utf8",
+            &OutputChunk {
+                kind: StreamKind::Stdout,
+                data: b"h\xc3".to_vec(),
+            },
+            &mut decoders,
+            &mut events,
+        )
+        .unwrap();
+        append_chunk(
+            &mut manager,
+            "utf8",
+            &OutputChunk {
+                kind: StreamKind::Stdout,
+                data: b"\xa9llo".to_vec(),
+            },
+            &mut decoders,
+            &mut events,
+        )
+        .unwrap();
+        flush_decoders(&mut manager, "utf8", &mut decoders).unwrap();
+        let result = manager.finish("utf8", 0, &mut events).unwrap();
+        assert_eq!(result.output, "héllo");
+        assert!(
+            !result.output.contains('\u{FFFD}'),
+            "split character leaked a replacement char into the final output"
+        );
+        // `task.output` events keep the lossy per-chunk view: the split
+        // character shows up as replacement characters in the event stream
+        // even though the task's final output is exact.
+        let events = events.drain("task.output");
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.payload.contains('\u{FFFD}')),
+            "events were expected to stay lossy per chunk"
+        );
+    }
+
+    #[test]
+    fn streaming_keeps_stdout_and_stderr_decoding_independent() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "split".into(),
+                program: "sh".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("split", &mut events).unwrap();
+        let mut decoders = StreamDecoders::default();
+        // "你" (bytes E4 BD A0) is split across two stdout chunks with a
+        // stderr chunk arriving in between; the two streams must never be
+        // joined into one character.
+        append_chunk(
+            &mut manager,
+            "split",
+            &OutputChunk {
+                kind: StreamKind::Stdout,
+                data: b"\xe4\xbd".to_vec(),
+            },
+            &mut decoders,
+            &mut events,
+        )
+        .unwrap();
+        append_chunk(
+            &mut manager,
+            "split",
+            &OutputChunk {
+                kind: StreamKind::Stderr,
+                data: b"err".to_vec(),
+            },
+            &mut decoders,
+            &mut events,
+        )
+        .unwrap();
+        append_chunk(
+            &mut manager,
+            "split",
+            &OutputChunk {
+                kind: StreamKind::Stdout,
+                data: b"\xa0".to_vec(),
+            },
+            &mut decoders,
+            &mut events,
+        )
+        .unwrap();
+        flush_decoders(&mut manager, "split", &mut decoders).unwrap();
+        let result = manager.finish("split", 0, &mut events).unwrap();
+        assert_eq!(result.output, "err你");
+        assert!(!result.output.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn streaming_flushes_genuinely_truncated_tail_lossily() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "cut".into(),
+                program: "sh".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("cut", &mut events).unwrap();
+        let mut decoders = StreamDecoders::default();
+        // The stream genuinely ends in the middle of "é": the tail must be
+        // flushed as a replacement character, not silently dropped.
+        append_chunk(
+            &mut manager,
+            "cut",
+            &OutputChunk {
+                kind: StreamKind::Stdout,
+                data: b"ab\xc3".to_vec(),
+            },
+            &mut decoders,
+            &mut events,
+        )
+        .unwrap();
+        flush_decoders(&mut manager, "cut", &mut decoders).unwrap();
+        let result = manager.finish("cut", 0, &mut events).unwrap();
+        assert_eq!(result.output, "ab\u{FFFD}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_recovers_characters_split_across_real_chunk_boundaries() {
+        // Emit 8191 ASCII bytes followed by a 2-byte character in one write
+        // so the 8192-byte reader buffer splits the character across two
+        // chunks. The task's final output must reconstruct it exactly.
+        let payload = format!("{}é", "a".repeat(8191));
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "wide".into(),
+                program: "sh".into(),
+                args: vec!["-c".into(), format!("printf '%s' '{}'", payload)],
+            })
+            .unwrap();
+        let result = manager
+            .run_streaming("wide", Path::new("."), &mut events, |_| {})
+            .unwrap();
+        assert_eq!(result.state, crate::TaskState::Succeeded);
+        assert_eq!(result.output, payload);
+        assert!(
+            !result.output.contains('\u{FFFD}'),
+            "output was {:?}",
+            result.output
+        );
     }
 }

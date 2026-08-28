@@ -109,8 +109,9 @@ pub enum StreamKind {
 /// One chunk of raw bytes streamed from a running process's stdout or stderr.
 ///
 /// Chunk boundaries are arbitrary read boundaries; a UTF-8 character may be
-/// split across chunks. Use [`OutputChunk::text`] only for display, or
-/// accumulate the raw bytes and decode once.
+/// split across chunks. Use [`OutputChunk::text`] only for lossy per-chunk
+/// display; to reconstruct the exact stream text, feed the raw bytes into a
+/// [`Utf8Decoder`] (or accumulate the raw bytes and decode once).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputChunk {
     pub kind: StreamKind,
@@ -121,6 +122,83 @@ impl OutputChunk {
     /// Lossily decodes this chunk for display purposes.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.data).into_owned()
+    }
+}
+
+/// Incrementally decodes UTF-8 text from arbitrarily chunked byte slices.
+///
+/// Chunk boundaries are read boundaries, not character boundaries, so a
+/// multi-byte character can be split across chunks. [`Utf8Decoder::feed`]
+/// buffers any incomplete trailing sequence and returns only the text that is
+/// complete so far; feeding every chunk of a byte stream in order and
+/// concatenating the results reproduces the stream's text exactly, with no
+/// replacement characters for characters that merely spanned a chunk
+/// boundary. [`Utf8Decoder::finish`] flushes the remaining buffer, lossily
+/// replacing a sequence that was genuinely truncated at end of stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Utf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8Decoder {
+    /// Creates an empty decoder with no buffered bytes.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds the next byte chunk and returns the decoded text so far.
+    ///
+    /// A trailing multi-byte sequence that is not yet complete is buffered
+    /// and its bytes are returned by a later [`Utf8Decoder::feed`] or
+    /// [`Utf8Decoder::finish`] call, so no replacement character is produced
+    /// for a character that merely spanned a chunk boundary. Bytes that are
+    /// genuinely not UTF-8 are replaced with U+FFFD as in
+    /// [`String::from_utf8_lossy`].
+    pub fn feed(&mut self, chunk: &[u8]) -> String {
+        self.pending.extend_from_slice(chunk);
+        let mut decoded = String::with_capacity(self.pending.len());
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    decoded.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    decoded.push_str(
+                        std::str::from_utf8(&self.pending[..valid])
+                            .expect("bytes before an invalid sequence are valid UTF-8"),
+                    );
+                    match error.error_len() {
+                        Some(len) => {
+                            // A genuinely invalid byte sequence: replace it
+                            // and keep decoding the remainder.
+                            decoded.push('\u{FFFD}');
+                            self.pending.drain(..valid + len);
+                        }
+                        None => {
+                            // The tail is an incomplete multi-byte sequence;
+                            // hold it until the next chunk completes it.
+                            self.pending.drain(..valid);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        decoded
+    }
+
+    /// Flushes any bytes still buffered, e.g. because the stream ended in the
+    /// middle of a multi-byte character.
+    ///
+    /// Returns the remaining text lossily decoded, so a genuinely truncated
+    /// final sequence becomes U+FFFD exactly as it would with
+    /// [`String::from_utf8_lossy`] over the whole stream.
+    pub fn finish(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&pending).into_owned()
     }
 }
 
@@ -476,6 +554,69 @@ fn already_waited() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_passes_through_complete_chunks() {
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"hello"), "hello");
+        assert_eq!(decoder.feed(b""), "");
+        assert_eq!(decoder.feed("héllo".as_bytes()), "héllo");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn decoder_reconstructs_characters_split_across_chunks() {
+        // 2-byte character split 1+1.
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"h\xc3"), "h");
+        assert_eq!(decoder.feed(b"\xa9llo"), "éllo");
+        assert_eq!(decoder.feed(b"!"), "!");
+        assert_eq!(decoder.finish(), "");
+
+        // 3-byte character split 1+2 and 2+1.
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"\xe4"), "");
+        assert_eq!(decoder.feed(b"\xbd\xa0"), "你");
+        assert_eq!(decoder.feed(b"ok"), "ok");
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"\xe4\xbd"), "");
+        assert_eq!(decoder.feed(b"\xa0"), "你");
+
+        // 4-byte character split 1+1+2.
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"\xf0"), "");
+        assert_eq!(decoder.feed(b"\x9d"), "");
+        assert_eq!(decoder.feed(b"\x84\x9e"), "𝄞");
+
+        // Multiple characters, only the last one split.
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed("héllo wörld ".as_bytes()), "héllo wörld ");
+        assert_eq!(decoder.feed(b"\xe4"), "");
+        assert_eq!(decoder.feed(b"\xbd"), "");
+        assert_eq!(decoder.feed(b"\xa0!"), "你!");
+    }
+
+    #[test]
+    fn decoder_replaces_genuinely_invalid_bytes() {
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"\xff"), "\u{FFFD}");
+        assert_eq!(decoder.feed(b"a\xff\xffb"), "a\u{FFFD}\u{FFFD}b");
+        assert_eq!(decoder.feed(b"ok"), "ok");
+        // A complete-looking but invalid sequence followed by more text keeps
+        // decoding instead of dropping the remainder.
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"\xc3\x28x"), "\u{FFFD}(x");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn decoder_flushes_truncated_tail_lossily() {
+        let mut decoder = Utf8Decoder::new();
+        assert_eq!(decoder.feed(b"tail \xc3"), "tail ");
+        assert_eq!(decoder.finish(), "\u{FFFD}");
+        assert_eq!(decoder.finish(), "");
+    }
+
     #[test]
     fn reports_timeout_without_hanging() {
         let result = if cfg!(windows) {
