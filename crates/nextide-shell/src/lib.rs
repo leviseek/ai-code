@@ -38,6 +38,22 @@ impl DesktopShell {
         Ok(window)
     }
 
+    pub fn scan_workspace<F: nextide_kernel::FileSystem>(
+        &mut self,
+        fs: &F,
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.app.scan_workspace(fs, path)
+    }
+
+    pub fn open_file<F: nextide_kernel::FileSystem>(
+        &mut self,
+        fs: &F,
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.app.open_file(fs, path)
+    }
+
     pub fn present_frame(&mut self) -> std::io::Result<()> {
         self.surface.present()
     }
