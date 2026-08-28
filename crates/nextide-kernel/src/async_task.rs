@@ -9,12 +9,17 @@
 //!
 //! The handle is backed by shared, lock-protected state that the background
 //! worker thread writes into as it streams the process: every poller observes
-//! the same output and status. `wait`/`wait_timeout` block on a condvar that
-//! the worker signals exactly once when the task reaches a terminal state, so
-//! a caller can either poll in its own frame loop or park a thread until the
-//! task finishes.
+//! the same output and status. Lifecycle and output events — started, output,
+//! finished, failed, cancelled, timed out — are additionally delivered through
+//! a per-handle `std::sync::mpsc` channel, so a caller can poll the event
+//! stream without ever moving the non-thread-safe [`crate::EventBus`] into the
+//! worker thread. `wait`/`wait_timeout` block on a condvar that the worker
+//! signals exactly once when the task reaches a terminal state, so a caller
+//! can either poll in its own frame loop or park a thread until the task
+//! finishes.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -37,6 +42,40 @@ pub enum AsyncTaskStatus {
     TimedOut,
     /// The worker killed the process because [`AsyncTaskHandle::cancel`] was
     /// called.
+    Cancelled,
+}
+
+/// One event in a background task's lifecycle, delivered through the handle's
+/// mpsc event channel.
+///
+/// The stream mirrors the synchronous `task.*` event topics so both views
+/// speak the same language: `Started` ↔ `task.started`, `Output` ↔
+/// `task.output`, `Finished` ↔ `task.finished`, `Failed` ↔ `task.failed`,
+/// `TimedOut` ↔ `task.timeout`, `Cancelled` ↔ `task.cancelled`. Like the sync
+/// bus, success ends with a single `Finished`, failure and timeout report
+/// their cause first and then `Finished` (a timeout has no exit code, matching
+/// the sync `task.finished` `{id}:timeout` payload), and cancellation emits
+/// `Cancelled` alone.
+///
+/// Unlike the synchronous `task.output` events — which keep the lossy
+/// per-chunk view of the raw bytes — `Output` carries the incrementally
+/// decoded text, so concatenating every `Output` event reconstructs
+/// [`AsyncTaskSnapshot::output`] exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AsyncTaskEvent {
+    /// The task was started (queued synchronously by
+    /// [`AsyncTaskHandle::new`], always the first event).
+    Started,
+    /// A chunk of decoded output arrived.
+    Output(String),
+    /// The task reached a terminal state. `exit_code` is `None` for a timeout,
+    /// mirroring the synchronous `task.finished` `{id}:timeout` payload.
+    Finished { exit_code: Option<i32> },
+    /// The process exited with a non-zero code (or the code is unknown).
+    Failed { exit_code: i32 },
+    /// The worker killed the process because the deadline elapsed.
+    TimedOut,
+    /// The worker killed the process because cancellation was requested.
     Cancelled,
 }
 
@@ -71,6 +110,27 @@ impl AsyncTaskSnapshot {
 pub(crate) struct AsyncTaskState {
     pub(crate) status: AsyncTaskStatus,
     pub(crate) output: String,
+    /// One mpsc sender per live [`AsyncTaskHandle`] clone. The background
+    /// worker delivers every event to each sender, so every handle clone
+    /// observes the same event stream independently of the others.
+    event_senders: Vec<mpsc::Sender<AsyncTaskEvent>>,
+}
+
+impl AsyncTaskState {
+    /// Delivers `event` to every live handle clone, in order. Senders whose
+    /// receiver was dropped (the handle was dropped) are removed lazily, so a
+    /// long-running task does not accumulate dead channels.
+    pub(crate) fn publish(&mut self, event: AsyncTaskEvent) {
+        let mut dead = Vec::new();
+        for (index, sender) in self.event_senders.iter().enumerate() {
+            if sender.send(event.clone()).is_err() {
+                dead.push(index);
+            }
+        }
+        for index in dead.into_iter().rev() {
+            self.event_senders.swap_remove(index);
+        }
+    }
 }
 
 /// Handle to a task running in the background.
@@ -78,9 +138,12 @@ pub(crate) struct AsyncTaskState {
 /// Clone the handle to share it: every clone observes the same underlying
 /// task. Poll with [`AsyncTaskHandle::poll`] for a full snapshot or
 /// [`AsyncTaskHandle::drain_output`] for only the output that arrived since
-/// the previous call (each handle tracks its own read position). Block with
-/// [`AsyncTaskHandle::wait`] / [`AsyncTaskHandle::wait_timeout`], and request
-/// termination with [`AsyncTaskHandle::cancel`].
+/// the previous call (each handle tracks its own read position). Lifecycle and
+/// output arrive as a stream of [`AsyncTaskEvent`]s through
+/// [`AsyncTaskHandle::poll_events`] / [`AsyncTaskHandle::drain_events`], each
+/// clone receiving its own copy. Block with [`AsyncTaskHandle::wait`] /
+/// [`AsyncTaskHandle::wait_timeout`], and request termination with
+/// [`AsyncTaskHandle::cancel`].
 ///
 /// All methods are non-blocking except `wait`/`wait_timeout`, which park the
 /// calling thread until the worker signals completion. Dropping the handle
@@ -97,33 +160,62 @@ pub struct AsyncTaskHandle {
     /// handle tracks its own position, so the method stays `&self` and the
     /// handle remains `Send + Sync`.
     delivered: AtomicUsize,
+    /// This clone's event queue, fed by the worker through the shared sender
+    /// registry in [`AsyncTaskState`]. `mpsc::Receiver` is not `Sync`, so it is
+    /// wrapped in an `Arc<Mutex<..>>` to keep the handle `Send + Sync`; the
+    /// lock is only ever held briefly inside the non-blocking poll methods.
+    events: Arc<Mutex<mpsc::Receiver<AsyncTaskEvent>>>,
 }
 
 impl Clone for AsyncTaskHandle {
     fn clone(&self) -> Self {
+        // Each clone gets its own event queue: register a fresh sender in the
+        // shared registry so the worker delivers the same stream to it too.
+        // Events published before the clone existed are not replayed, mirroring
+        // how `drain_output` starts a cloned handle at the current position.
+        let (sender, receiver) = mpsc::channel();
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .event_senders
+            .push(sender);
         Self {
             id: self.id.clone(),
             state: Arc::clone(&self.state),
             cancelled: Arc::clone(&self.cancelled),
             done: Arc::clone(&self.done),
             delivered: AtomicUsize::new(self.delivered.load(Ordering::Relaxed)),
+            events: Arc::new(Mutex::new(receiver)),
         }
     }
 }
 
 impl AsyncTaskHandle {
     /// Creates a handle for a task that is about to start running.
+    ///
+    /// The handle's event stream starts with [`AsyncTaskEvent::Started`],
+    /// queued before any worker can publish, so a poller can rely on it being
+    /// the first event.
     pub(crate) fn new(id: impl Into<String>) -> Self {
-        Self {
+        let (sender, receiver) = mpsc::channel();
+        let handle = Self {
             id: id.into(),
             state: Arc::new(Mutex::new(AsyncTaskState {
                 status: AsyncTaskStatus::Running,
                 output: String::new(),
+                event_senders: vec![sender],
             })),
             cancelled: Arc::new(AtomicBool::new(false)),
             done: Arc::new((Mutex::new(false), Condvar::new())),
             delivered: AtomicUsize::new(0),
-        }
+            events: Arc::new(Mutex::new(receiver)),
+        };
+        handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish(AsyncTaskEvent::Started);
+        handle
     }
 
     /// The task id this handle observes.
@@ -208,6 +300,39 @@ impl AsyncTaskHandle {
         } else {
             String::new()
         }
+    }
+
+    /// Returns the next pending event, if any. Never blocks.
+    ///
+    /// Each event is consumed exactly once by whichever clone polls its own
+    /// queue. For a per-frame loop that wants everything since the last frame,
+    /// prefer [`AsyncTaskHandle::drain_events`].
+    pub fn poll_events(&self) -> Option<AsyncTaskEvent> {
+        let receiver = self
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        receiver.try_recv().ok()
+    }
+
+    /// Returns every event queued since the previous call, in arrival order,
+    /// and empties the queue. Never blocks.
+    ///
+    /// The stream always starts with [`AsyncTaskEvent::Started`] (queued by
+    /// [`AsyncTaskHandle::new`]) and ends with a terminal event — except for
+    /// clones, which observe only events published after the clone was
+    /// created. Concatenating the [`AsyncTaskEvent::Output`] payloads
+    /// reconstructs [`AsyncTaskSnapshot::output`] exactly.
+    pub fn drain_events(&self) -> Vec<AsyncTaskEvent> {
+        let mut receiver = self
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
     }
 
     /// Blocks until the task reaches a terminal status, then returns a full
@@ -317,5 +442,113 @@ mod tests {
         assert_eq!(snapshot.status, AsyncTaskStatus::Failed { exit_code: 1 });
         assert_eq!(handle.exit_code(), Some(1));
         assert_eq!(handle.state(), TaskState::Failed);
+    }
+
+    #[test]
+    fn handle_event_channel_starts_with_started_then_streams_events() {
+        let handle = AsyncTaskHandle::new("t");
+        // `new` queues Started synchronously, before any worker can publish.
+        assert_eq!(handle.poll_events(), Some(AsyncTaskEvent::Started));
+        assert_eq!(handle.poll_events(), None);
+
+        // Simulate the worker streaming decoded output.
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.output.push_str("hello");
+            state.publish(AsyncTaskEvent::Output("hello".to_owned()));
+        }
+        assert_eq!(
+            handle.drain_events(),
+            vec![AsyncTaskEvent::Output("hello".to_owned())]
+        );
+        assert!(handle.drain_events().is_empty());
+
+        // Simulate the worker finishing successfully.
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.status = AsyncTaskStatus::Succeeded { exit_code: 0 };
+            state.publish(AsyncTaskEvent::Finished { exit_code: Some(0) });
+            let (lock, cvar) = &*handle.done;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert_eq!(
+            handle.drain_events(),
+            vec![AsyncTaskEvent::Finished { exit_code: Some(0) }]
+        );
+    }
+
+    #[test]
+    fn handle_event_channel_mirrors_failed_and_timeout_terminals() {
+        let handle = AsyncTaskHandle::new("t");
+        assert_eq!(handle.drain_events(), vec![AsyncTaskEvent::Started]);
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.status = AsyncTaskStatus::Failed { exit_code: 3 };
+            state.publish(AsyncTaskEvent::Failed { exit_code: 3 });
+            state.publish(AsyncTaskEvent::Finished { exit_code: Some(3) });
+            let (lock, cvar) = &*handle.done;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert_eq!(
+            handle.drain_events(),
+            vec![
+                AsyncTaskEvent::Failed { exit_code: 3 },
+                AsyncTaskEvent::Finished { exit_code: Some(3) },
+            ]
+        );
+
+        let timed_out = AsyncTaskHandle::new("t2");
+        assert_eq!(timed_out.drain_events(), vec![AsyncTaskEvent::Started]);
+        {
+            let mut state = timed_out.state.lock().unwrap();
+            state.status = AsyncTaskStatus::TimedOut;
+            state.publish(AsyncTaskEvent::TimedOut);
+            state.publish(AsyncTaskEvent::Finished { exit_code: None });
+            let (lock, cvar) = &*timed_out.done;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert_eq!(
+            timed_out.drain_events(),
+            vec![
+                AsyncTaskEvent::TimedOut,
+                AsyncTaskEvent::Finished { exit_code: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn handle_clones_each_receive_the_whole_event_stream() {
+        let handle = AsyncTaskHandle::new("t");
+        let clone = handle.clone();
+        // The clone registered its sender after Started was published, so it
+        // observes only events that arrive from now on.
+        assert_eq!(handle.drain_events(), vec![AsyncTaskEvent::Started]);
+        assert!(clone.drain_events().is_empty());
+
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.output.push_str("a");
+            state.publish(AsyncTaskEvent::Output("a".to_owned()));
+            state.output.push_str("b");
+            state.publish(AsyncTaskEvent::Output("b".to_owned()));
+        }
+        // Both clones receive every event, independently and in order.
+        assert_eq!(
+            handle.drain_events(),
+            vec![
+                AsyncTaskEvent::Output("a".to_owned()),
+                AsyncTaskEvent::Output("b".to_owned()),
+            ]
+        );
+        assert_eq!(
+            clone.drain_events(),
+            vec![
+                AsyncTaskEvent::Output("a".to_owned()),
+                AsyncTaskEvent::Output("b".to_owned()),
+            ]
+        );
     }
 }

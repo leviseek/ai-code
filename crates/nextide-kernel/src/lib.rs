@@ -26,7 +26,7 @@ pub mod window;
 pub mod workspace;
 
 pub use application::ApplicationContext;
-pub use async_task::{AsyncTaskHandle, AsyncTaskSnapshot, AsyncTaskStatus};
+pub use async_task::{AsyncTaskEvent, AsyncTaskHandle, AsyncTaskSnapshot, AsyncTaskStatus};
 pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
 pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};

@@ -1,4 +1,4 @@
-use crate::async_task::{AsyncTaskHandle, AsyncTaskState, AsyncTaskStatus};
+use crate::async_task::{AsyncTaskEvent, AsyncTaskHandle, AsyncTaskState, AsyncTaskStatus};
 use crate::process::{
     spawn_streaming, OutputChunk, RunningProcess, StreamKind, StreamWait, Utf8Decoder,
     POLL_INTERVAL,
@@ -412,10 +412,14 @@ impl TaskManager {
     /// exactly like the sync run methods. Output is decoded incrementally per
     /// stream, so a multi-byte character split across chunk boundaries is
     /// reconstructed intact, and stdout/stderr are merged in arrival order —
-    /// the same semantics as [`TaskManager::run_streaming`]. Completion is
-    /// observed through the handle rather than `task.output`/`task.finished`
-    /// events, because the worker cannot publish into a caller-held
-    /// [`EventBus`].
+    /// the same semantics as [`TaskManager::run_streaming`]. Completion and
+    /// output are additionally observable as a stream of
+    /// [`crate::async_task::AsyncTaskEvent`]s through
+    /// [`AsyncTaskHandle::poll_events`] / [`AsyncTaskHandle::drain_events`],
+    /// mirroring the `task.output`/`task.finished`/`task.failed`/
+    /// `task.timeout`/`task.cancelled` topics — the worker cannot publish into
+    /// a caller-held [`EventBus`], so it delivers the same events through the
+    /// handle's own mpsc channel instead.
     ///
     /// A spawn failure (e.g. the program does not exist) is reported
     /// synchronously and the task is finished as failed, mirroring
@@ -663,6 +667,9 @@ fn append_async_text(shared: &AsyncTaskShared, text: &str) {
     }
     if let Ok(mut state) = shared.state.lock() {
         state.output.push_str(text);
+        // Output events carry the decoded text, so concatenating them
+        // reconstructs the handle's output exactly.
+        state.publish(AsyncTaskEvent::Output(text.to_owned()));
     }
     if let Ok(mut task) = shared.task.lock() {
         let _ = task.append_output(text);
@@ -706,6 +713,34 @@ fn finish_async(shared: &AsyncTaskShared, status: AsyncTaskStatus) {
     };
     if let Ok(mut state) = shared.state.lock() {
         state.status = status.clone();
+        // Mirror the synchronous event topics: success ends with a single
+        // Finished; failure and timeout report their cause first and then
+        // Finished (no exit code for a timeout, matching the `task.finished`
+        // `{id}:timeout` payload); cancellation emits Cancelled alone, exactly
+        // like `task.cancelled`.
+        match &status {
+            AsyncTaskStatus::Succeeded { exit_code } => {
+                state.publish(AsyncTaskEvent::Finished {
+                    exit_code: Some(*exit_code),
+                });
+            }
+            AsyncTaskStatus::Failed { exit_code } => {
+                state.publish(AsyncTaskEvent::Failed {
+                    exit_code: *exit_code,
+                });
+                state.publish(AsyncTaskEvent::Finished {
+                    exit_code: Some(*exit_code),
+                });
+            }
+            AsyncTaskStatus::TimedOut => {
+                state.publish(AsyncTaskEvent::TimedOut);
+                state.publish(AsyncTaskEvent::Finished { exit_code: None });
+            }
+            AsyncTaskStatus::Cancelled => {
+                state.publish(AsyncTaskEvent::Cancelled);
+            }
+            AsyncTaskStatus::Running => {}
+        }
     }
     if let Ok(mut task) = shared.task.lock() {
         match &status {
@@ -1339,6 +1374,125 @@ mod tests {
         assert_eq!(manager.summaries()[0].state, crate::TaskState::Succeeded);
         assert_eq!(manager.clear_finished(), 1);
         assert_eq!(manager.state("async"), None);
+    }
+
+    #[test]
+    fn spawn_async_emits_lifecycle_events_through_the_handle() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = async_staggered_command();
+        manager
+            .add(TaskSpec {
+                id: "ev".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("ev", Path::new("."), &mut events)
+            .unwrap();
+        // Started is queued synchronously, before the worker even runs.
+        assert_eq!(handle.poll_events(), Some(AsyncTaskEvent::Started));
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Succeeded { exit_code: 0 });
+        // Every Output event carries decoded text; concatenated they match the
+        // snapshot's output exactly, and the stream ends with Finished.
+        let drained = handle.drain_events();
+        let streamed: String = drained
+            .iter()
+            .filter_map(|event| match event {
+                AsyncTaskEvent::Output(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, snapshot.output, "events were {:?}", drained);
+        assert_eq!(
+            drained.last(),
+            Some(&AsyncTaskEvent::Finished { exit_code: Some(0) })
+        );
+        // The worker publishes into the handle's channel, never into the
+        // caller's EventBus: the sync bus keeps only the synchronous
+        // task.started event, exactly as before.
+        assert_eq!(events.drain("task.started")[0].payload, "ev");
+        assert!(events.drain("task.output").is_empty());
+        assert!(events.drain("task.finished").is_empty());
+    }
+
+    #[test]
+    fn spawn_async_timeout_emits_timed_out_then_finished_events() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            ("ping", vec!["127.0.0.1".into(), "-n".into(), "10".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 30".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "slow".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async_timeout(
+                "slow",
+                Path::new("."),
+                std::time::Duration::from_millis(150),
+                &mut events,
+            )
+            .unwrap();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("timed-out task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::TimedOut);
+        let drained = handle.drain_events();
+        assert_eq!(drained.first(), Some(&AsyncTaskEvent::Started));
+        assert!(
+            drained.contains(&AsyncTaskEvent::TimedOut),
+            "events were {:?}",
+            drained
+        );
+        assert_eq!(
+            drained.last(),
+            Some(&AsyncTaskEvent::Finished { exit_code: None })
+        );
+        // The async worker still never publishes into the sync bus.
+        assert!(events.drain("task.timeout").is_empty());
+    }
+
+    #[test]
+    fn async_cancel_emits_cancelled_event_through_the_handle() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = long_running_command();
+        manager
+            .add(TaskSpec {
+                id: "run".into(),
+                program,
+                args,
+            })
+            .unwrap();
+        let handle = manager
+            .spawn_async("run", Path::new("."), &mut events)
+            .unwrap();
+        handle.cancel();
+        let snapshot = handle
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .expect("cancelled task never completed");
+        assert_eq!(snapshot.status, AsyncTaskStatus::Cancelled);
+        let drained = handle.drain_events();
+        assert_eq!(drained.first(), Some(&AsyncTaskEvent::Started));
+        assert!(
+            drained.contains(&AsyncTaskEvent::Cancelled),
+            "events were {:?}",
+            drained
+        );
+        // Cancellation ends the stream with Cancelled alone, mirroring the
+        // synchronous task.cancelled topic (which has no task.finished).
+        assert_eq!(drained.last(), Some(&AsyncTaskEvent::Cancelled));
     }
 
     #[test]
