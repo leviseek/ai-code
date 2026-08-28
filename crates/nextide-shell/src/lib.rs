@@ -465,7 +465,7 @@ mod tests {
         let mut events = HeadlessEventLoop::default();
         events.push(PlatformEvent::MouseClick { x: 10, y: 0 });
         assert_eq!(
-            shell.pump_once(&mut events, &NoopFs).unwrap(),
+            shell.pump_once(&mut events, &TreeFs).unwrap(),
             Some(CommandResult::Applied)
         );
         assert!(
@@ -599,6 +599,22 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(shell.events.pending("shell.command.failed"), 1);
+    }
+
+    struct TreeFs;
+    impl nextide_kernel::FileSystem for TreeFs {
+        fn read(&self, _: &std::path::Path) -> std::io::Result<String> {
+            Ok(String::new())
+        }
+        fn write(&self, _: &std::path::Path, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn exists(&self, _: &std::path::Path) -> bool {
+            true
+        }
+        fn list(&self, _: &std::path::Path) -> std::io::Result<Vec<(std::path::PathBuf, bool)>> {
+            Ok(vec![("src/main.rs".into(), false)])
+        }
     }
 
     struct NoopFs;
