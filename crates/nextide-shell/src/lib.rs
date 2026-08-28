@@ -429,6 +429,29 @@ mod tests {
     }
 
     #[test]
+    fn tree_input_at_selects_and_classifies_visible_nodes() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("src", nextide_kernel::FileNodeKind::Directory);
+        shell
+            .app
+            .file_tree
+            .add("README.md", nextide_kernel::FileNodeKind::File);
+        assert_eq!(
+            shell.tree_input_at(Point { x: 20, y: 0 }),
+            Some(UiInput::ClickFile("README.md".into()))
+        );
+        assert_eq!(shell.selected_tree, Some("README.md".into()));
+        assert_eq!(shell.events.pending("workspace.tree.selected"), 1);
+        assert_eq!(
+            shell.tree_input_at(Point { x: 20, y: 24 }),
+            Some(UiInput::ClickDirectory("src".into()))
+        );
+    }
+
+    #[test]
     fn pump_once_translates_platform_events_to_shell_actions() {
         let mut shell = DesktopShell::new("NextIDE");
         let mut events = HeadlessEventLoop::default();
