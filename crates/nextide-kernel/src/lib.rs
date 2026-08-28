@@ -14,6 +14,7 @@ pub mod platform;
 pub mod process;
 pub mod render;
 pub mod rpc;
+pub mod tabs;
 pub mod task;
 pub mod task_manager;
 pub mod terminal;
@@ -28,6 +29,7 @@ pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlat
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};
 pub use render::{HeadlessSurface, RenderSurface, SurfaceSize};
 pub use rpc::{LocalRpcRouter, RpcError, RpcHandler, RpcRequest, RpcResponse};
+pub use tabs::{Tab, TabModel};
 pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
 pub use task_manager::TaskManager;
 pub use terminal::TerminalProfile;
