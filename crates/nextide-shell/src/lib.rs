@@ -77,6 +77,13 @@ impl DesktopShell {
         input: UiInput,
     ) -> std::io::Result<CommandResult> {
         match input {
+            UiInput::Key(chord) if self.palette.is_open() && chord.key == '\n' => {
+                self.execute_selected(fs, std::path::PathBuf::new())
+            }
+            UiInput::Key(chord) if self.palette.is_open() && chord.key == '\u{1b}' => {
+                self.close_palette();
+                Ok(CommandResult::Applied)
+            }
             UiInput::Key(chord) if chord.ctrl && chord.key.eq_ignore_ascii_case(&'p') => {
                 self.open_palette();
                 Ok(CommandResult::Applied)
@@ -120,6 +127,10 @@ impl DesktopShell {
         let Some(id) = self.selected_command_id() else {
             return Ok(CommandResult::Noop);
         };
+        let path = path.into();
+        if path.as_os_str().is_empty() && id != "file.save" {
+            return Ok(CommandResult::Noop);
+        }
         let Some(command) = command_from_id(id, path) else {
             return Ok(CommandResult::Noop);
         };
