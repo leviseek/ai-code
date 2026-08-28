@@ -11,7 +11,10 @@ mod platform_events;
 mod renderer;
 mod view_model;
 
-pub use command_registry::{command_id, search as search_commands, CommandDescriptor, COMMANDS};
+pub use command_registry::{
+    command_id, command_ids, command_summaries, command_summary, get_command,
+    search as search_commands, CommandDescriptor, CommandSummary, COMMANDS,
+};
 pub use commands::{from_id as command_from_id, CommandResult, ShellCommand};
 pub use event_loop::{EventLoop, HeadlessEventLoop};
 pub use input::{command_for_input, UiInput};

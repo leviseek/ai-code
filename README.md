@@ -19,6 +19,8 @@ Task state and summary APIs are available through `TaskManager::state`, `summary
 
 Capability metadata is observable through `CapabilityRegistry::ids`, `iter`, `summary`, and `summaries`: iteration and projections are returned in stable, sorted id order, and `CapabilitySummary` is a cloneable, UI-safe snapshot of a capability's id, version, and declared permissions. `is_empty`/`len`/`contains` remain available for cheap registry checks.
 
+Shell command metadata is observable through `command_ids`, `get_command`, `command_summary`, and `command_summaries`: ids enumerate in stable declaration order, and `CommandSummary` is a cloneable, UI-safe snapshot of a command's id, title, and search keywords, decoupled from the static `COMMANDS` descriptor table so the command palette, UI, and plugins can observe commands without borrowing. `search_commands`/`command_id`/`COMMANDS` remain unchanged.
+
 ## Development
 
 ```powershell
