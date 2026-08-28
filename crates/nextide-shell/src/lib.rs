@@ -22,6 +22,7 @@ pub struct DesktopShell {
     pub windows: HeadlessWindowService,
     pub surface: HeadlessSurface,
     pub events: nextide_kernel::EventBus,
+    pub palette: CommandPalette,
 }
 
 impl DesktopShell {
@@ -35,6 +36,7 @@ impl DesktopShell {
                 height: 800,
             }),
             events: nextide_kernel::EventBus::default(),
+            palette: CommandPalette::default(),
         }
     }
 
@@ -117,6 +119,18 @@ impl DesktopShell {
         Ok(())
     }
 
+    pub fn open_palette(&mut self) {
+        self.palette.open();
+        self.events
+            .publish(nextide_kernel::Event::new("palette.opened", "command"));
+    }
+
+    pub fn close_palette(&mut self) {
+        self.palette.close();
+        self.events
+            .publish(nextide_kernel::Event::new("palette.closed", "command"));
+    }
+
     pub fn execute<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
@@ -159,7 +173,7 @@ impl DesktopShell {
     }
 
     pub fn snapshot(&self) -> ShellSnapshot {
-        ShellSnapshot::from_context(self.title.clone(), &self.app)
+        ShellSnapshot::from_context(self.title.clone(), &self.app, &self.palette)
     }
 
     pub fn start(&self) -> String {

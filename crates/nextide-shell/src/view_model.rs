@@ -1,3 +1,4 @@
+use crate::CommandPalette;
 use nextide_kernel::ApplicationContext;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,10 +11,16 @@ pub struct ShellSnapshot {
     pub tab_paths: Vec<std::path::PathBuf>,
     pub active_tab: Option<std::path::PathBuf>,
     pub tree_paths: Vec<std::path::PathBuf>,
+    pub palette_open: bool,
+    pub palette_query: String,
 }
 
 impl ShellSnapshot {
-    pub fn from_context(title: impl Into<String>, app: &ApplicationContext) -> Self {
+    pub fn from_context(
+        title: impl Into<String>,
+        app: &ApplicationContext,
+        palette: &CommandPalette,
+    ) -> Self {
         Self {
             title: title.into(),
             open_files: app.workspace.open_files().count(),
@@ -28,6 +35,8 @@ impl ShellSnapshot {
                 .iter()
                 .map(|node| node.path.clone())
                 .collect(),
+            palette_open: palette.is_open(),
+            palette_query: palette.query().to_string(),
         }
     }
 }
