@@ -1,4 +1,4 @@
-use crate::run_capture;
+use crate::{run_capture, run_capture_timeout};
 use crate::{Event, EventBus, Task, TaskError, TaskResult, TaskSpec};
 use std::collections::BTreeMap;
 use std::io;
@@ -69,6 +69,40 @@ impl TaskManager {
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
         self.finish(id, output.exit_code.unwrap_or(-1), events)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+    }
+
+    pub fn run_capture_timeout(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        timeout: std::time::Duration,
+        events: &mut EventBus,
+    ) -> io::Result<TaskResult> {
+        self.start(id, events)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let spec = &self
+            .tasks
+            .get(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
+            .spec;
+        let output = run_capture_timeout(&spec.program, &spec.args, working_directory, timeout)?;
+        let combined = format!("{}{}", output.stdout, output.stderr);
+        self.append_output_with_events(id, &combined, events)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if output.exit_code.is_none() {
+            let result = self
+                .tasks
+                .get_mut(id)
+                .ok_or(TaskError::InvalidTransition)
+                .and_then(|task| task.timeout())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            events.publish(Event::new("task.timeout", id));
+            events.publish(Event::new("task.finished", format!("{id}:timeout")));
+            Ok(result)
+        } else {
+            self.finish(id, output.exit_code.unwrap(), events)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        }
     }
 
     pub fn finish(

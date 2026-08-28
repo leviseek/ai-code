@@ -7,6 +7,7 @@ pub enum TaskState {
     Succeeded,
     Failed,
     Cancelled,
+    TimedOut,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +89,18 @@ impl Task {
         Ok(TaskResult {
             state: self.state,
             exit_code: Some(exit_code),
+            output: std::mem::take(&mut self.output),
+        })
+    }
+
+    pub fn timeout(&mut self) -> Result<TaskResult, TaskError> {
+        if self.state != TaskState::Running {
+            return Err(TaskError::InvalidTransition);
+        }
+        self.state = TaskState::TimedOut;
+        Ok(TaskResult {
+            state: self.state,
+            exit_code: None,
             output: std::mem::take(&mut self.output),
         })
     }
