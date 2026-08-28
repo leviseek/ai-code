@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
     CapabilityRegistry, EditorKernel, EditorViewState, Event, EventBus, FileSystem, FileTreeModel,
@@ -40,6 +40,17 @@ impl ApplicationContext {
         }
         self.events
             .publish(Event::new("editor.opened", path.to_string_lossy()));
+        Ok(())
+    }
+
+    pub fn save_file<F: FileSystem>(&mut self, fs: &F) -> io::Result<()> {
+        self.editor.save_with_events(fs, &mut self.events)?;
+        if let Some(path) = self.editor.path().map(PathBuf::from) {
+            self.tabs.set_dirty(&path, false);
+            if let Some(view) = self.views.iter_mut().find(|view| view.path == path) {
+                view.mark_dirty(false);
+            }
+        }
         Ok(())
     }
 
