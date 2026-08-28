@@ -103,6 +103,17 @@ impl OutputChunk {
     }
 }
 
+/// Outcome of a deadline-bounded wait for the next [`OutputChunk`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamWait {
+    /// A chunk arrived before the deadline.
+    Chunk(OutputChunk),
+    /// Both streams reached EOF; no further chunk will ever arrive.
+    Closed,
+    /// No chunk arrived before the deadline; the process may still be running.
+    Timeout,
+}
+
 /// A spawned process whose stdout and stderr are streamed as chunks.
 ///
 /// Each stream is drained by its own dedicated reader thread into a shared
@@ -146,6 +157,21 @@ impl RunningProcess {
         match chunks.recv() {
             Ok(chunk) => Ok(Some(chunk)),
             Err(mpsc::RecvError) => Ok(None),
+        }
+    }
+
+    /// Blocks until the next chunk arrives, both streams reach EOF, or
+    /// `timeout` elapses, distinguishing all three outcomes.
+    ///
+    /// Use this to enforce a deadline while streaming: [`StreamWait::Timeout`]
+    /// means no output arrived in time and the process may still be running
+    /// (kill it explicitly if it must not outlive the wait).
+    pub fn next_chunk_timeout(&mut self, timeout: std::time::Duration) -> io::Result<StreamWait> {
+        let chunks = self.chunks.as_ref().ok_or_else(already_waited)?;
+        match chunks.recv_timeout(timeout) {
+            Ok(chunk) => Ok(StreamWait::Chunk(chunk)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(StreamWait::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(StreamWait::Closed),
         }
     }
 

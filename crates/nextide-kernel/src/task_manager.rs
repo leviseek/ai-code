@@ -1,3 +1,4 @@
+use crate::process::{spawn_streaming, OutputChunk, RunningProcess, StreamWait};
 use crate::{run_capture, run_capture_timeout};
 use crate::{Event, EventBus, Task, TaskError, TaskResult, TaskSpec};
 use std::collections::BTreeMap;
@@ -188,6 +189,110 @@ impl TaskManager {
         }
     }
 
+    /// Streams a task's process output chunk by chunk into the task.
+    ///
+    /// The task is started, the process is spawned through
+    /// [`crate::process::spawn_streaming`], and every chunk is appended via
+    /// [`TaskManager::append_output_with_events`] as it arrives, so `task.output`
+    /// events are published incrementally instead of once at the end. The
+    /// driver blocks until the process exits and then finishes the task with
+    /// its exit code.
+    ///
+    /// `on_chunk` is invoked for every chunk right after it is appended, so
+    /// callers can observe output incrementally without polling the event bus.
+    pub fn run_streaming<F>(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        events: &mut EventBus,
+        mut on_chunk: F,
+    ) -> io::Result<TaskResult>
+    where
+        F: FnMut(&OutputChunk),
+    {
+        self.start(id, events)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let spec = &self
+            .tasks
+            .get(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
+            .spec;
+        let mut proc = spawn_streaming(&spec.program, &spec.args, working_directory)?;
+        drain_all(self, id, &mut proc, events, &mut on_chunk)?;
+        let output = proc.wait()?;
+        self.finish(id, output.exit_code.unwrap_or(-1), events)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+    }
+
+    /// Like [`TaskManager::run_streaming`], but capped by a hard deadline.
+    ///
+    /// If no further chunk arrives (and the streams are not yet closed) once
+    /// `timeout` has elapsed since the process was spawned, the process is
+    /// killed, any still-buffered output is drained into the task, and the task
+    /// is marked [`crate::TaskState::TimedOut`], publishing `task.timeout` and
+    /// `task.finished` (`{id}:timeout`) events. Otherwise the task finishes
+    /// normally with the process's exit code.
+    pub fn run_streaming_timeout<F>(
+        &mut self,
+        id: &str,
+        working_directory: &Path,
+        timeout: std::time::Duration,
+        events: &mut EventBus,
+        mut on_chunk: F,
+    ) -> io::Result<TaskResult>
+    where
+        F: FnMut(&OutputChunk),
+    {
+        self.start(id, events)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let spec = &self
+            .tasks
+            .get(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
+            .spec;
+        let mut proc = spawn_streaming(&spec.program, &spec.args, working_directory)?;
+        let started = std::time::Instant::now();
+        let mut timed_out = false;
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                timed_out = true;
+                break;
+            }
+            match proc.next_chunk_timeout(timeout - elapsed)? {
+                StreamWait::Chunk(chunk) => {
+                    append_chunk(self, id, &chunk, events)?;
+                    on_chunk(&chunk);
+                }
+                StreamWait::Closed => break,
+                StreamWait::Timeout => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+        if timed_out {
+            proc.kill()?;
+            // Drain whatever the reader threads had buffered so the task keeps
+            // every byte the process produced before it was killed.
+            drain_all(self, id, &mut proc, events, &mut on_chunk)?;
+            let _ = proc.wait()?;
+            let result = self
+                .tasks
+                .get_mut(id)
+                .ok_or(TaskError::InvalidTransition)
+                .and_then(|task| task.timeout())
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+            events.publish(Event::new("task.timeout", id));
+            events.publish(Event::new("task.finished", format!("{id}:timeout")));
+            Ok(result)
+        } else {
+            let output = proc.wait()?;
+            self.finish(id, output.exit_code.unwrap_or(-1), events)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+        }
+    }
+
     pub fn finish(
         &mut self,
         id: &str,
@@ -205,6 +310,34 @@ impl TaskManager {
         events.publish(Event::new("task.finished", format!("{id}:{code}")));
         Ok(result)
     }
+}
+
+fn append_chunk(
+    manager: &mut TaskManager,
+    id: &str,
+    chunk: &OutputChunk,
+    events: &mut EventBus,
+) -> io::Result<()> {
+    manager
+        .append_output_with_events(id, &chunk.text(), events)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+}
+
+fn drain_all<F>(
+    manager: &mut TaskManager,
+    id: &str,
+    proc: &mut RunningProcess,
+    events: &mut EventBus,
+    on_chunk: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(&OutputChunk),
+{
+    while let Some(chunk) = proc.next_chunk()? {
+        append_chunk(manager, id, &chunk, events)?;
+        on_chunk(&chunk);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -317,5 +450,117 @@ mod tests {
         assert_eq!(result.output, "ok");
         assert_eq!(events.drain("task.started")[0].payload, "build");
         assert_eq!(events.drain("task.finished")[0].payload, "build:0");
+    }
+
+    #[test]
+    fn manager_streams_process_output_chunk_by_chunk() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/C".into(), "echo out && echo err 1>&2".into()],
+            )
+        } else {
+            ("sh", vec!["-c".into(), "printf out; printf err >&2".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "stream".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let mut seen = Vec::new();
+        let result = manager
+            .run_streaming("stream", Path::new("."), &mut events, |chunk| {
+                seen.push(chunk.kind);
+            })
+            .unwrap();
+        assert_eq!(result.state, crate::TaskState::Succeeded);
+        assert!(
+            result.output.contains("out"),
+            "output was {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("err"),
+            "output was {:?}",
+            result.output
+        );
+        assert!(seen.contains(&crate::process::StreamKind::Stdout));
+        assert!(seen.contains(&crate::process::StreamKind::Stderr));
+        // Chunks were appended incrementally: at least one task.output event
+        // fired and the task finished with the real exit code.
+        assert!(!events.drain("task.output").is_empty());
+        assert_eq!(events.drain("task.finished")[0].payload, "stream:0");
+        assert_eq!(manager.state("stream"), Some(crate::TaskState::Succeeded));
+    }
+
+    #[test]
+    fn manager_streaming_timeout_kills_and_marks_timed_out() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            ("ping", vec!["127.0.0.1".into(), "-n".into(), "5".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 30".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "slow".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let result = manager
+            .run_streaming_timeout(
+                "slow",
+                Path::new("."),
+                std::time::Duration::from_millis(100),
+                &mut events,
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(result.state, crate::TaskState::TimedOut);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(events.drain("task.timeout")[0].payload, "slow");
+        assert_eq!(events.drain("task.finished")[0].payload, "slow:timeout");
+        // The killed process was reaped, so the task is still addressable.
+        assert_eq!(manager.state("slow"), Some(crate::TaskState::TimedOut));
+    }
+
+    #[test]
+    fn manager_streaming_finishes_within_timeout() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        let (program, args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/C".into(), "echo done".into()])
+        } else {
+            ("sh", vec!["-c".into(), "printf done".into()])
+        };
+        manager
+            .add(TaskSpec {
+                id: "quick".into(),
+                program: program.into(),
+                args,
+            })
+            .unwrap();
+        let result = manager
+            .run_streaming_timeout(
+                "quick",
+                Path::new("."),
+                std::time::Duration::from_secs(30),
+                &mut events,
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(result.state, crate::TaskState::Succeeded);
+        assert!(
+            result.output.contains("done"),
+            "output was {:?}",
+            result.output
+        );
+        assert!(events.drain("task.timeout").is_empty());
     }
 }
