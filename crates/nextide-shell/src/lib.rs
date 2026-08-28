@@ -21,7 +21,7 @@ pub use notifications::{Notification, NotificationCenter, NotificationLevel};
 pub use palette::CommandPalette;
 pub use platform_backend::{HeadlessBackend, PlatformBackend};
 pub use platform_events::{point as mouse_point, to_ui_input, PlatformEvent};
-pub use renderer::{HeadlessRenderer, TreeRenderRow, UiRenderer};
+pub use renderer::{tree_rows, HeadlessRenderer, TreeRenderRow, UiRenderer};
 pub use view_model::{ShellSnapshot, TreeItem};
 
 use nextide_kernel::{

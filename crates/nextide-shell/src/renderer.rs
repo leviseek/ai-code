@@ -25,6 +25,22 @@ impl TreeRenderRow {
     }
 }
 
+pub fn tree_rows(snapshot: &ShellSnapshot) -> Vec<TreeRenderRow> {
+    snapshot
+        .visible_tree
+        .iter()
+        .enumerate()
+        .map(|(index, item)| TreeRenderRow {
+            path: item.path.clone(),
+            label: item.name.clone(),
+            x: item.indent,
+            y: index as u32 * 24,
+            selected: item.selected,
+            icon: if item.directory { "folder" } else { "file" },
+        })
+        .collect()
+}
+
 pub trait UiRenderer {
     fn render(&mut self, snapshot: &ShellSnapshot) -> io::Result<()>;
     fn render_tree(&mut self, snapshot: &ShellSnapshot) -> io::Result<Vec<TreeRenderRow>> {
