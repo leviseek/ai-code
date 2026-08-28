@@ -39,6 +39,7 @@ pub struct DesktopShell {
     pub palette: CommandPalette,
     pub notifications: NotificationCenter,
     pub layout: ShellLayout,
+    pub running: bool,
 }
 
 impl DesktopShell {
@@ -55,6 +56,7 @@ impl DesktopShell {
             palette: CommandPalette::default(),
             notifications: NotificationCenter::default(),
             layout: ShellLayout::default_1280x800(),
+            running: true,
         }
     }
 
@@ -104,7 +106,7 @@ impl DesktopShell {
         fs: &F,
     ) -> std::io::Result<usize> {
         let mut processed = 0;
-        while self.pump_once(event_loop, fs)?.is_some() {
+        while self.running && self.pump_once(event_loop, fs)?.is_some() {
             processed += 1;
         }
         Ok(processed)
@@ -145,7 +147,12 @@ impl DesktopShell {
                 self.resize_surface(SurfaceSize { width, height })?;
                 Ok(CommandResult::Applied)
             }
-            UiInput::Close => Ok(CommandResult::Noop),
+            UiInput::Close => {
+                self.running = false;
+                self.events
+                    .publish(nextide_kernel::Event::new("shell.closed", "requested"));
+                Ok(CommandResult::Applied)
+            }
             other => match command_for_input(other) {
                 Some(command) => self.execute_checked(fs, command),
                 None => Ok(CommandResult::Noop),
