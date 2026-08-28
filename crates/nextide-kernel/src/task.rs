@@ -41,6 +41,7 @@ impl std::error::Error for TaskError {}
 pub struct Task {
     pub spec: TaskSpec,
     pub state: TaskState,
+    output: String,
 }
 
 impl Task {
@@ -54,6 +55,7 @@ impl Task {
         Ok(Self {
             spec,
             state: TaskState::Pending,
+            output: String::new(),
         })
     }
 
@@ -62,6 +64,14 @@ impl Task {
             return Err(TaskError::InvalidTransition);
         }
         self.state = TaskState::Running;
+        Ok(())
+    }
+
+    pub fn append_output(&mut self, chunk: &str) -> Result<(), TaskError> {
+        if self.state != TaskState::Running {
+            return Err(TaskError::InvalidTransition);
+        }
+        self.output.push_str(chunk);
         Ok(())
     }
 
@@ -77,7 +87,7 @@ impl Task {
         Ok(TaskResult {
             state: self.state,
             exit_code: Some(exit_code),
-            output: String::new(),
+            output: std::mem::take(&mut self.output),
         })
     }
 
@@ -102,7 +112,10 @@ mod tests {
         };
         let mut task = Task::new(spec).unwrap();
         task.start().unwrap();
-        assert_eq!(task.finish(0).unwrap().state, TaskState::Succeeded);
+        task.append_output("compiled\n").unwrap();
+        let result = task.finish(0).unwrap();
+        assert_eq!(result.state, TaskState::Succeeded);
+        assert_eq!(result.output, "compiled\n");
         assert_eq!(task.cancel(), Err(TaskError::InvalidTransition));
     }
 }
