@@ -63,6 +63,23 @@ impl DesktopShell {
         ));
     }
 
+    pub fn execute_checked<F: nextide_kernel::FileSystem>(
+        &mut self,
+        fs: &F,
+        command: ShellCommand,
+    ) -> std::io::Result<CommandResult> {
+        match self.execute(fs, command) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.events.publish(nextide_kernel::Event::new(
+                    "shell.command.failed",
+                    error.to_string(),
+                ));
+                Err(error)
+            }
+        }
+    }
+
     pub fn execute_selected<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
