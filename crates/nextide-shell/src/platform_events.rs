@@ -6,6 +6,10 @@ pub enum PlatformEvent {
         x: u32,
         y: u32,
     },
+    MouseClick {
+        x: u32,
+        y: u32,
+    },
     KeyDown(KeyChord),
     Resize {
         width: u32,

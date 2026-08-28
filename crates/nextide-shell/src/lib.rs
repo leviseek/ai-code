@@ -152,7 +152,11 @@ impl DesktopShell {
         let Some(event) = event_loop.next() else {
             return Ok(None);
         };
-        let Some(input) = to_ui_input(event) else {
+        let input = match event {
+            PlatformEvent::MouseClick { x, y } => self.tree_input_at(Point { x, y }),
+            event => to_ui_input(event),
+        };
+        let Some(input) = input else {
             return Ok(Some(CommandResult::Noop));
         };
         Ok(Some(self.handle_input(fs, input)?))
