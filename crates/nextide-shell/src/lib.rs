@@ -85,6 +85,19 @@ impl DesktopShell {
         self.layout.hit_test(point)
     }
 
+    pub fn run_frame<E: EventLoop, F: nextide_kernel::FileSystem, R: UiRenderer>(
+        &mut self,
+        event_loop: &mut E,
+        fs: &F,
+        renderer: &mut R,
+    ) -> std::io::Result<Option<CommandResult>> {
+        let result = self.pump_once(event_loop, fs)?;
+        if result.is_some() {
+            self.render_ui(renderer)?;
+        }
+        Ok(result)
+    }
+
     pub fn run_until_idle<E: EventLoop, F: nextide_kernel::FileSystem>(
         &mut self,
         event_loop: &mut E,
@@ -326,6 +339,25 @@ impl DesktopShell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn run_frame_processes_input_and_renders() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let mut event_loop = HeadlessEventLoop::default();
+        event_loop.push(PlatformEvent::Resize {
+            width: 900,
+            height: 600,
+        });
+        let mut renderer = HeadlessRenderer::default();
+        assert_eq!(
+            shell
+                .run_frame(&mut event_loop, &NoopFs, &mut renderer)
+                .unwrap(),
+            Some(CommandResult::Applied)
+        );
+        assert_eq!(renderer.frames(), 1);
+        assert_eq!(shell.surface.frames_presented(), 1);
+    }
+
     #[test]
     fn run_until_idle_processes_all_queued_events() {
         let mut shell = DesktopShell::new("NextIDE");
