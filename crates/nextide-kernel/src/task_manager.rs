@@ -37,6 +37,12 @@ impl TaskManager {
         before - self.tasks.len()
     }
 
+    pub fn remove_with_events(&mut self, id: &str, events: &mut EventBus) -> Result<(), TaskError> {
+        self.remove(id)?;
+        events.publish(Event::new("task.removed", id));
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<(), TaskError> {
         match self.tasks.get(id).map(|task| task.state) {
             Some(crate::TaskState::Pending) => {
