@@ -27,7 +27,7 @@ pub fn to_ui_input(event: PlatformEvent) -> Option<UiInput> {
         PlatformEvent::KeyDown(chord) => Some(UiInput::Key(chord)),
         PlatformEvent::Resize { width, height } => Some(UiInput::Resize { width, height }),
         PlatformEvent::CloseRequested => Some(UiInput::Close),
-        PlatformEvent::MouseMove { .. } => None,
+        PlatformEvent::MouseMove { .. } | PlatformEvent::MouseClick { .. } => None,
         PlatformEvent::FileClicked { path, directory } => Some(if directory {
             UiInput::ClickDirectory(path)
         } else {
