@@ -5,6 +5,7 @@ mod keymap;
 mod layout;
 mod notifications;
 mod palette;
+mod platform_events;
 mod renderer;
 mod view_model;
 
@@ -15,6 +16,7 @@ pub use keymap::{command_for, KeyChord};
 pub use layout::{Point, Rect, ShellLayout, UiRegion};
 pub use notifications::{Notification, NotificationCenter, NotificationLevel};
 pub use palette::CommandPalette;
+pub use platform_events::{point as mouse_point, to_ui_input, PlatformEvent};
 pub use renderer::{HeadlessRenderer, UiRenderer};
 pub use view_model::ShellSnapshot;
 
