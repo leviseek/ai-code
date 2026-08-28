@@ -130,6 +130,18 @@ impl FileTreeModel {
 mod tests {
     use super::*;
     #[test]
+    fn visible_nodes_hide_children_of_collapsed_directories() {
+        let mut tree = FileTreeModel::default();
+        tree.add("src", FileNodeKind::Directory);
+        tree.add("src/main.rs", FileNodeKind::File);
+        assert_eq!(tree.visible_nodes().len(), 1);
+        assert!(tree.toggle(&PathBuf::from("src")));
+        assert_eq!(tree.visible_nodes().len(), 2);
+        assert!(tree.collapse(Path::new("src")));
+        assert_eq!(tree.visible_nodes().len(), 1);
+    }
+
+    #[test]
     fn tree_deduplicates_sorts_and_toggles_directories() {
         let mut tree = FileTreeModel::default();
         tree.add("src/lib.rs", FileNodeKind::File);
