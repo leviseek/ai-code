@@ -46,6 +46,14 @@ impl TaskManager {
         }
     }
 
+    pub fn summary(&self, id: &str) -> Option<TaskSummary> {
+        self.tasks.get(id).map(|task| TaskSummary {
+            id: id.to_owned(),
+            state: task.state,
+            program: task.spec.program.clone(),
+        })
+    }
+
     pub fn summaries(&self) -> Vec<TaskSummary> {
         self.tasks
             .iter()
