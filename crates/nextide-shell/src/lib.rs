@@ -644,9 +644,20 @@ mod tests {
         );
         let changes = shell.events.drain("workspace.tree.change");
         assert_eq!(changes.len(), 4);
-        assert!(changes
-            .iter()
-            .all(|event| event.payload.starts_with("updated:")));
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|event| event.payload.starts_with("added:"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|event| event.payload.starts_with("updated:"))
+                .count(),
+            2
+        );
     }
 
     #[test]
