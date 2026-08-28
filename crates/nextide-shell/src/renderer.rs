@@ -48,6 +48,15 @@ pub enum TreeRowChange {
     Updated(TreeRenderRow),
 }
 
+impl TreeRowChange {
+    pub fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Added(row) | Self::Updated(row) => &row.path,
+            Self::Removed(path) => path,
+        }
+    }
+}
+
 pub fn tree_change_counts(changes: &[TreeRowChange]) -> (usize, usize, usize) {
     changes.iter().fold(
         (0, 0, 0),
