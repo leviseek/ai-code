@@ -65,6 +65,18 @@ impl TreeRowChange {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeChangeBatch {
+    pub frame: u64,
+    pub changes: Vec<TreeRowChange>,
+}
+
+impl TreeChangeBatch {
+    pub fn counts(&self) -> (usize, usize, usize) {
+        tree_change_counts(&self.changes)
+    }
+}
+
 pub fn tree_change_counts(changes: &[TreeRowChange]) -> (usize, usize, usize) {
     changes.iter().fold(
         (0, 0, 0),

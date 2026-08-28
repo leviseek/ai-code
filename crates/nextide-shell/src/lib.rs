@@ -22,8 +22,8 @@ pub use palette::CommandPalette;
 pub use platform_backend::{HeadlessBackend, PlatformBackend};
 pub use platform_events::{point as mouse_point, to_ui_input, PlatformEvent};
 pub use renderer::{
-    diff_tree_rows, tree_change_counts, tree_rows, HeadlessRenderer, TreeRenderRow, TreeRowChange,
-    UiRenderer,
+    diff_tree_rows, tree_change_counts, tree_rows, HeadlessRenderer, TreeChangeBatch,
+    TreeRenderRow, TreeRowChange, UiRenderer,
 };
 pub use view_model::{ShellSnapshot, TreeItem};
 
@@ -420,6 +420,13 @@ impl DesktopShell {
 
     pub fn tree_change_frame(&self) -> u64 {
         self.tree_change_frame
+    }
+
+    pub fn tree_change_batch(&self) -> TreeChangeBatch {
+        TreeChangeBatch {
+            frame: self.tree_change_frame,
+            changes: self.last_tree_changes.clone(),
+        }
     }
 
     pub fn is_running(&self) -> bool {
