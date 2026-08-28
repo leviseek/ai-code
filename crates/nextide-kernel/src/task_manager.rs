@@ -39,6 +39,10 @@ impl TaskManager {
         }
     }
 
+    pub fn contains(&self, id: &str) -> bool {
+        self.tasks.contains_key(id)
+    }
+
     pub fn state(&self, id: &str) -> Option<crate::TaskState> {
         self.tasks.get(id).map(|task| task.state)
     }
@@ -197,6 +201,8 @@ mod tests {
                 args: vec![],
             })
             .unwrap();
+        assert!(manager.contains("build"));
+        assert!(!manager.contains("missing"));
         assert_eq!(manager.state("build"), Some(crate::TaskState::Pending));
         assert_eq!(manager.state("missing"), None);
         assert_eq!(manager.ids().collect::<Vec<_>>(), vec!["build"]);
