@@ -1,4 +1,7 @@
-use crate::{CapabilityRegistry, EditorKernel, EventBus, WorkspaceState};
+use crate::{
+    CapabilityRegistry, EditorKernel, EditorViewState, EventBus, FileTreeModel, TabModel,
+    WorkspaceState,
+};
 
 /// Platform-independent application state shared by desktop shells.
 #[derive(Debug)]
@@ -7,6 +10,9 @@ pub struct ApplicationContext {
     pub capabilities: CapabilityRegistry,
     pub events: EventBus,
     pub workspace: WorkspaceState,
+    pub file_tree: FileTreeModel,
+    pub tabs: TabModel,
+    pub views: Vec<EditorViewState>,
 }
 
 impl ApplicationContext {
@@ -16,6 +22,9 @@ impl ApplicationContext {
             capabilities: CapabilityRegistry::default(),
             events: EventBus::default(),
             workspace: WorkspaceState::new("."),
+            file_tree: FileTreeModel::default(),
+            tabs: TabModel::default(),
+            views: Vec::new(),
         }
     }
 
