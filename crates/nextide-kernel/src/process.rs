@@ -56,7 +56,7 @@ pub fn run_capture_timeout(
             break;
         }
         if started.elapsed() >= timeout {
-            child.kill()?;
+            let _ = child.kill();
             let output = child.wait_with_output()?;
             return Ok(ProcessOutput {
                 exit_code: None,

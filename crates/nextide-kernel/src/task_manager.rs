@@ -284,7 +284,7 @@ impl TaskManager {
             }
         }
         if timed_out {
-            proc.kill()?;
+            let _ = proc.kill();
             // Drain whatever the reader threads had buffered so the task keeps
             // every byte the process produced before it was killed.
             drain_all(self, id, &mut proc, events, &mut on_chunk)?;
