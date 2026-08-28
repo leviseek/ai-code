@@ -1,4 +1,4 @@
-use crate::{CapabilityRegistry, EditorKernel, EventBus};
+use crate::{CapabilityRegistry, EditorKernel, EventBus, WorkspaceState};
 
 /// Platform-independent application state shared by desktop shells.
 #[derive(Debug)]
@@ -6,6 +6,7 @@ pub struct ApplicationContext {
     pub editor: EditorKernel,
     pub capabilities: CapabilityRegistry,
     pub events: EventBus,
+    pub workspace: WorkspaceState,
 }
 
 impl ApplicationContext {
@@ -14,6 +15,7 @@ impl ApplicationContext {
             editor: EditorKernel::new(initial_text),
             capabilities: CapabilityRegistry::default(),
             events: EventBus::default(),
+            workspace: WorkspaceState::new("."),
         }
     }
 
