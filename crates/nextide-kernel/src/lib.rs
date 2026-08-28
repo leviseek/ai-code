@@ -29,7 +29,9 @@ pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
 pub use task_manager::TaskManager;
 pub use terminal::TerminalProfile;
 pub use vfs::{FileSystem, LocalFileSystem};
-pub use window::{HeadlessWindowService, WindowHandle, WindowOptions, WindowService, WindowSize};
+pub use window::{
+    HeadlessWindowService, WindowEvent, WindowHandle, WindowOptions, WindowService, WindowSize,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {

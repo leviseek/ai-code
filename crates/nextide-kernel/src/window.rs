@@ -26,9 +26,22 @@ impl Default for WindowOptions {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowEvent {
+    Resized(WindowSize),
+    Focused(bool),
+    Closed,
+}
+
 pub trait WindowService {
     fn create(&mut self, options: WindowOptions) -> io::Result<WindowHandle>;
     fn close(&mut self, window: &WindowHandle) -> io::Result<()>;
+    fn resize(&mut self, _window: &WindowHandle, _size: WindowSize) -> io::Result<()> {
+        Ok(())
+    }
+    fn focus(&mut self, _window: &WindowHandle) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
