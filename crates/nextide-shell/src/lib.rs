@@ -580,11 +580,25 @@ mod tests {
     #[test]
     fn render_ui_renders_snapshot_and_presents_frame() {
         let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("src", nextide_kernel::FileNodeKind::Directory);
+        shell
+            .app
+            .file_tree
+            .add("src/main.rs", nextide_kernel::FileNodeKind::File);
+        shell.app.file_tree.toggle(&"src".into());
+        let _ = shell.tree_input_at(Point { x: 10, y: 24 });
         let mut renderer = HeadlessRenderer::default();
         shell.render_ui(&mut renderer).unwrap();
         assert_eq!(renderer.frames(), 1);
         assert_eq!(shell.surface.frames_presented(), 1);
         assert_eq!(shell.events.pending("ui.frame.presented"), 1);
+        assert_eq!(renderer.tree_rows().len(), 2);
+        assert_eq!(renderer.tree_rows()[1].x, 16);
+        assert_eq!(renderer.tree_rows()[1].icon, "file");
+        assert!(renderer.tree_rows()[1].selected);
     }
 
     #[test]
