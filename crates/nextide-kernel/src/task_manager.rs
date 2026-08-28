@@ -10,6 +10,14 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    pub fn clear_finished_with_events(&mut self, events: &mut EventBus) -> usize {
+        let cleared = self.clear_finished();
+        if cleared > 0 {
+            events.publish(Event::new("task.cleaned", cleared.to_string()));
+        }
+        cleared
+    }
+
     pub fn clear_finished(&mut self) -> usize {
         let before = self.tasks.len();
         self.tasks.retain(|_, task| {
@@ -206,8 +214,9 @@ mod tests {
             .unwrap();
         manager.start("done", &mut events).unwrap();
         manager.finish("done", 0, &mut events).unwrap();
-        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.clear_finished_with_events(&mut events), 1);
         assert_eq!(manager.state("done"), None);
+        assert_eq!(events.drain("task.cleaned")[0].payload, "1");
     }
 
     #[test]
