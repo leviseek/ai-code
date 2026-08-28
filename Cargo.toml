@@ -3,4 +3,6 @@ resolver = "2"
 members = [
     "crates/nextide-kernel",
     "crates/nextide-cli",
+    "crates/nextide-shell",
 ]
+
