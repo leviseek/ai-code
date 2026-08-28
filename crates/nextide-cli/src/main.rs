@@ -1,13 +1,23 @@
-use nextide_kernel::{EditTransaction, EditorKernel, TextEdit};
+use nextide_kernel::{ApplicationContext, EditTransaction, EditorKernel, TextEdit};
 
 fn main() {
     let command = std::env::args().nth(1).unwrap_or_else(|| "help".into());
     match command.as_str() {
         "smoke" => smoke(),
+        "bootstrap" => bootstrap(),
         _ => {
-            println!("NextIDE CLI\n\nCommands:\n  smoke    run the editor-kernel smoke flow");
+            println!("NextIDE CLI\n\nCommands:\n  smoke      run the editor-kernel smoke flow\n  bootstrap  initialize core capabilities");
         }
     }
+}
+
+fn bootstrap() {
+    let context = ApplicationContext::bootstrap("");
+    assert!(context.capabilities.contains("workspace.read"));
+    assert!(context.capabilities.contains("workspace.write"));
+    assert!(context.capabilities.contains("terminal.execute"));
+    println!("capabilities: {}", context.capabilities.len());
+    println!("status: ready");
 }
 
 fn smoke() {
