@@ -282,6 +282,25 @@ mod tests {
     }
 
     #[test]
+    fn running_tasks_cannot_be_removed() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "running".into(),
+                program: "echo".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("running", &mut events).unwrap();
+        assert_eq!(
+            manager.remove_with_events("running", &mut events),
+            Err(TaskError::InvalidTransition)
+        );
+        assert!(events.drain("task.removed").is_empty());
+    }
+
+    #[test]
     fn manager_emits_task_lifecycle_events() {
         let mut manager = TaskManager::default();
         let mut events = EventBus::default();
