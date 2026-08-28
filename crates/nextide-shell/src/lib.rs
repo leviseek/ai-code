@@ -642,6 +642,11 @@ mod tests {
             shell.events.drain("workspace.tree.changed")[0].payload,
             "added=0,removed=0,updated=2"
         );
+        let changes = shell.events.drain("workspace.tree.change");
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .all(|event| event.payload.starts_with("updated:")));
     }
 
     #[test]
