@@ -1,12 +1,14 @@
 mod command_registry;
 mod commands;
 mod keymap;
+mod notifications;
 mod palette;
 mod view_model;
 
 pub use command_registry::{command_id, search as search_commands, CommandDescriptor, COMMANDS};
 pub use commands::{from_id as command_from_id, CommandResult, ShellCommand};
 pub use keymap::{command_for, KeyChord};
+pub use notifications::{Notification, NotificationCenter, NotificationLevel};
 pub use palette::CommandPalette;
 pub use view_model::ShellSnapshot;
 
@@ -23,6 +25,7 @@ pub struct DesktopShell {
     pub surface: HeadlessSurface,
     pub events: nextide_kernel::EventBus,
     pub palette: CommandPalette,
+    pub notifications: NotificationCenter,
 }
 
 impl DesktopShell {
@@ -37,6 +40,7 @@ impl DesktopShell {
             }),
             events: nextide_kernel::EventBus::default(),
             palette: CommandPalette::default(),
+            notifications: NotificationCenter::default(),
         }
     }
 
@@ -71,10 +75,12 @@ impl DesktopShell {
         match self.execute(fs, command) {
             Ok(result) => Ok(result),
             Err(error) => {
+                let message = error.to_string();
                 self.events.publish(nextide_kernel::Event::new(
                     "shell.command.failed",
-                    error.to_string(),
+                    message.clone(),
                 ));
+                self.notifications.push(NotificationLevel::Error, message);
                 Err(error)
             }
         }
