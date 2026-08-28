@@ -83,6 +83,18 @@ impl DesktopShell {
         self.layout.hit_test(point)
     }
 
+    pub fn run_until_idle<E: EventLoop, F: nextide_kernel::FileSystem>(
+        &mut self,
+        event_loop: &mut E,
+        fs: &F,
+    ) -> std::io::Result<usize> {
+        let mut processed = 0;
+        while self.pump_once(event_loop, fs)?.is_some() {
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
     pub fn pump_once<E: EventLoop, F: nextide_kernel::FileSystem>(
         &mut self,
         event_loop: &mut E,
@@ -312,6 +324,24 @@ impl DesktopShell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn run_until_idle_processes_all_queued_events() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let mut events = HeadlessEventLoop::default();
+        events.push(PlatformEvent::Resize {
+            width: 900,
+            height: 600,
+        });
+        events.push(PlatformEvent::KeyDown(KeyChord {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            key: 'p',
+        }));
+        assert_eq!(shell.run_until_idle(&mut events, &NoopFs).unwrap(), 2);
+        assert!(shell.palette.is_open());
+    }
+
     #[test]
     fn pump_once_translates_platform_events_to_shell_actions() {
         let mut shell = DesktopShell::new("NextIDE");
