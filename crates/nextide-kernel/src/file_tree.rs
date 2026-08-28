@@ -14,6 +14,7 @@ pub struct FileNode {
     pub name: String,
     pub kind: FileNodeKind,
     pub expanded: bool,
+    pub depth: usize,
 }
 
 #[derive(Default, Debug)]
@@ -36,6 +37,7 @@ impl FileTreeModel {
             name,
             kind,
             expanded: false,
+            depth: path.components().count().saturating_sub(1),
         });
         self.nodes.sort_by(|a, b| a.path.cmp(&b.path));
     }
