@@ -79,6 +79,18 @@ impl FileTreeModel {
         Ok(true)
     }
 
+    pub fn collapse(&mut self, path: &Path) -> bool {
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.path == path && node.kind == FileNodeKind::Directory)
+        {
+            node.expanded = false;
+            return true;
+        }
+        false
+    }
+
     pub fn toggle(&mut self, path: &PathBuf) -> bool {
         if let Some(node) = self.nodes.iter_mut().find(|node| &node.path == path) {
             node.expanded = !node.expanded;
