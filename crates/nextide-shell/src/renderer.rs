@@ -219,6 +219,32 @@ mod tests {
     }
 
     #[test]
+    fn tree_change_batch_reports_frame_and_counts() {
+        let changes = vec![
+            TreeRowChange::Added(TreeRenderRow {
+                path: "src".into(),
+                label: "src".into(),
+                x: 0,
+                y: 0,
+                selected: false,
+                icon: "folder",
+            }),
+            TreeRowChange::Updated(TreeRenderRow {
+                path: "src/main.rs".into(),
+                label: "main.rs".into(),
+                x: 16,
+                y: 24,
+                selected: true,
+                icon: "file",
+            }),
+            TreeRowChange::Removed("old.rs".into()),
+        ];
+        let batch = TreeChangeBatch { frame: 7, changes };
+        assert_eq!(batch.frame, 7);
+        assert_eq!(batch.counts(), (1, 1, 1));
+    }
+
+    #[test]
     fn tree_rows_projects_layout_and_metadata() {
         let snapshot = ShellSnapshot {
             title: "NextIDE".into(),
