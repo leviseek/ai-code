@@ -9,6 +9,7 @@ pub struct DesktopShell {
     pub title: String,
     pub windows: HeadlessWindowService,
     pub surface: HeadlessSurface,
+    pub events: nextide_kernel::EventBus,
 }
 
 impl DesktopShell {
@@ -21,14 +22,20 @@ impl DesktopShell {
                 width: 1280,
                 height: 800,
             }),
+            events: nextide_kernel::EventBus::default(),
         }
     }
 
     pub fn create_main_window(&mut self) -> std::io::Result<WindowHandle> {
-        self.windows.create(WindowOptions {
+        let window = self.windows.create(WindowOptions {
             title: self.title.clone(),
             ..WindowOptions::default()
-        })
+        })?;
+        self.events.publish(nextide_kernel::Event::new(
+            "window.created",
+            window.id.to_string(),
+        ));
+        Ok(window)
     }
 
     pub fn present_frame(&mut self) -> std::io::Result<()> {
