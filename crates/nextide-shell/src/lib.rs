@@ -275,6 +275,40 @@ impl DesktopShell {
 mod tests {
     use super::*;
     #[test]
+    fn handle_input_dispatches_palette_and_resize() {
+        let mut shell = DesktopShell::new("NextIDE");
+        assert_eq!(
+            shell
+                .handle_input(
+                    &NoopFs,
+                    UiInput::Key(KeyChord {
+                        ctrl: true,
+                        shift: false,
+                        alt: false,
+                        key: 'p'
+                    })
+                )
+                .unwrap(),
+            CommandResult::Applied
+        );
+        assert!(shell.palette.is_open());
+        assert_eq!(
+            shell
+                .handle_input(
+                    &NoopFs,
+                    UiInput::Resize {
+                        width: 900,
+                        height: 600
+                    }
+                )
+                .unwrap(),
+            CommandResult::Applied
+        );
+        assert_eq!(shell.surface.size.width, 900);
+        assert_eq!(shell.events.pending("window.resized"), 1);
+    }
+
+    #[test]
     fn shell_publishes_window_lifecycle_events() {
         let mut shell = DesktopShell::new("NextIDE");
         let window = shell.create_main_window().unwrap();
