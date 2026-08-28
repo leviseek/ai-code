@@ -92,6 +92,10 @@ impl DesktopShell {
     pub fn tree_input_at(&mut self, point: Point) -> Option<UiInput> {
         let path = self.tree_item_at(point)?;
         self.selected_tree = Some(path.clone());
+        self.events.publish(nextide_kernel::Event::new(
+            "workspace.tree.selected",
+            path.to_string_lossy(),
+        ));
         let directory =
             self.app.file_tree.nodes().iter().any(|node| {
                 node.path == path && node.kind == nextide_kernel::FileNodeKind::Directory
