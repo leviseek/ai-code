@@ -612,6 +612,7 @@ mod tests {
         assert_eq!(renderer.tree_rows()[1].icon, "file");
         assert!(renderer.tree_rows()[1].selected);
         assert_eq!(renderer.tree_changes().len(), 2);
+        assert_eq!(shell.tree_changes().len(), 2);
     }
 
     #[test]
