@@ -196,6 +196,18 @@ mod tests {
         assert!(manager.ids().next().is_none());
         assert_eq!(manager.remove("missing"), Err(TaskError::InvalidTransition));
         assert_eq!(manager.clear_finished(), 0);
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "done".into(),
+                program: "echo".into(),
+                args: vec![],
+            })
+            .unwrap();
+        manager.start("done", &mut events).unwrap();
+        manager.finish("done", 0, &mut events).unwrap();
+        assert_eq!(manager.clear_finished(), 1);
+        assert_eq!(manager.state("done"), None);
     }
 
     #[test]
