@@ -14,6 +14,7 @@ The repository currently contains the first Phase 0 vertical slice:
 - headless Desktop Shell with window, input, command-palette, notification, and file-tree pipelines
 - incremental file-tree rendering with structured change batches and events
 - task runtime with lifecycle events, summaries, cancellation, timeout, cleanup, and task queries
+- VFS read-only, typed file metadata queries (`exists`/`is_file`/`is_dir`/`metadata` returning `FileKind` + `FileMetadata` with kind/len/readonly); rooted filesystems reject path escapes with `PermissionDenied` while missing entries report `Ok(false)` from `is_file`/`is_dir` and `NotFound` from `metadata`
 
 Task state and summary APIs are available through `TaskManager::state`, `summary`, `summaries`, and `ids`; pending tasks can be removed and terminal tasks can be cleaned with lifecycle events.
 

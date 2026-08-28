@@ -14,7 +14,7 @@ Phase 0：技术基线与核心内核起步。
 - 增加 5 个内核单元测试。
 - 增加 CLI `smoke` 冒烟流程。
 - 通过 `cargo fmt --check`、`cargo test --workspace` 和 CLI 冒烟验证。
-- 当前工作区测试：142 passed，0 failed。
+- 当前工作区测试：161 passed，0 failed。
 - Editor Kernel 已支持 `document.changed` 与 `document.saved` 事件。
 - 原子保存成功后可通过 Event Bus 发布保存事件。
 - 增加 LocalRpcRouter/Typed RPC 基线。
@@ -29,6 +29,7 @@ Phase 0：技术基线与核心内核起步。
 - CapabilityRegistry 增加最小可观测查询 API：`ids`/`iter` 以稳定（字典序）顺序遍历已注册 capability，`summary`/`summaries` 返回 `CapabilitySummary`（id/version/permissions 的值类型投影，可跨 RPC/UI 边界），空注册表查询返回空；新增测试覆盖乱序注册后的稳定排序、元数据投影与空注册表。现有 `register`/`authorize`/`invoke`/`get`/`contains`/`len`/`is_empty` 等 API 与行为不变，向后兼容。
 - nextide-shell 命令注册表增加稳定只读查询 API：`command_ids` 以稳定（声明）顺序枚举命令 id，`get_command` 按 id 解析静态描述符，`command_summary`/`command_summaries` 返回 `CommandSummary`（id/title/keywords 的值类型投影，可跨 command palette/UI/插件边界）；新增测试覆盖稳定排序、唯一性、元数据投影与 `command_from_id` 往返。现有 `search`/`COMMANDS`/`command_id`/`command_from_id` 行为与签名不变。
 - nextide-shell 命令执行增加最小类型化观测模型：`CommandExecutionResult`（稳定 command id + `CommandOutcome` 三态 applied/noop/failed + 结构化 `CommandError`），新增 `DesktopShell::execute_observed` 返回该模型并发布 `shell.command.executed` 事件（稳定载荷 `id=...,outcome=...[,error=<kind>,message=...]`），失败仍发布 `shell.command.failed` 与错误通知；`CommandErrorKind` 提供 io/not-found/invalid-state/unknown 分类与消息，可经 `std::io::Error` 无损往返（`Io` 保留原始 kind）。`execute`/`execute_checked`/`execute_selected`/`CommandResult` 签名不变，checked/selected 路径改经观测路径（每次执行均发出 `shell.command.executed`）；注册表新增 `command_title`/`is_registered`/`describe_execution` 查询，将执行结果映射回已注册命令元数据。
+- VFS 增加只读、类型化的文件元数据查询：`FileSystem::metadata` 返回 `FileMetadata`（`kind`/`len`/`readonly`，`FileKind` 区分 File/Directory/Other，附 `is_file`/`is_dir` 便捷方法），`is_file`/`is_dir` 对缺失路径返回 `Ok(false)`、对访问失败返回 `Err`；rooted 文件系统保持 workspace root 安全约束，`..` 组件、绝对路径越界与嵌套父目录逃逸一律返回 `PermissionDenied`，缺失条目 `metadata` 返回 `NotFound`。新增测试覆盖文件/目录判定、缺失路径与三类路径逃逸；新方法带默认实现，现有 `FileSystem` 实现（LocalFileSystem/MemoryFs/TreeFs/NoopFs）无需改动，API 向后兼容，未引入新依赖。
 
 ## 下一步
 
