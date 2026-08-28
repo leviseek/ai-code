@@ -7,6 +7,9 @@ pub struct ShellSnapshot {
     pub tabs: usize,
     pub editor_views: usize,
     pub tree_nodes: usize,
+    pub tab_paths: Vec<std::path::PathBuf>,
+    pub active_tab: Option<std::path::PathBuf>,
+    pub tree_paths: Vec<std::path::PathBuf>,
 }
 
 impl ShellSnapshot {
@@ -17,6 +20,14 @@ impl ShellSnapshot {
             tabs: app.tabs.tabs().len(),
             editor_views: app.views.len(),
             tree_nodes: app.file_tree.nodes().len(),
+            tab_paths: app.tabs.tabs().iter().map(|tab| tab.path.clone()).collect(),
+            active_tab: app.tabs.active().map(|tab| tab.path.clone()),
+            tree_paths: app
+                .file_tree
+                .nodes()
+                .iter()
+                .map(|node| node.path.clone())
+                .collect(),
         }
     }
 }
