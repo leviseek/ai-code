@@ -71,6 +71,28 @@ impl DesktopShell {
         ));
     }
 
+    pub fn handle_input<F: nextide_kernel::FileSystem>(
+        &mut self,
+        fs: &F,
+        input: UiInput,
+    ) -> std::io::Result<CommandResult> {
+        match input {
+            UiInput::Key(chord) if chord.ctrl && chord.key.eq_ignore_ascii_case(&'p') => {
+                self.open_palette();
+                Ok(CommandResult::Applied)
+            }
+            UiInput::Resize { width, height } => {
+                self.resize_surface(SurfaceSize { width, height })?;
+                Ok(CommandResult::Applied)
+            }
+            UiInput::Close => Ok(CommandResult::Noop),
+            other => match command_for_input(other) {
+                Some(command) => self.execute_checked(fs, command),
+                None => Ok(CommandResult::Noop),
+            },
+        }
+    }
+
     pub fn execute_checked<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
