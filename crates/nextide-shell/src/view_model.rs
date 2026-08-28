@@ -11,6 +11,7 @@ pub struct ShellSnapshot {
     pub tab_paths: Vec<std::path::PathBuf>,
     pub active_tab: Option<std::path::PathBuf>,
     pub tree_paths: Vec<std::path::PathBuf>,
+    pub visible_tree_paths: Vec<std::path::PathBuf>,
     pub palette_open: bool,
     pub palette_query: String,
     pub notifications: usize,
@@ -34,6 +35,12 @@ impl ShellSnapshot {
             tree_paths: app
                 .file_tree
                 .nodes()
+                .iter()
+                .map(|node| node.path.clone())
+                .collect(),
+            visible_tree_paths: app
+                .file_tree
+                .visible_nodes()
                 .iter()
                 .map(|node| node.path.clone())
                 .collect(),
