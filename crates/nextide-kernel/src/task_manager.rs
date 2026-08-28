@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
+/// A stable, UI-safe projection of a task's identity and lifecycle state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskSummary {
     pub id: String,
@@ -46,6 +47,7 @@ impl TaskManager {
         }
     }
 
+    /// Returns a snapshot for one task without exposing its mutable internals.
     pub fn summary(&self, id: &str) -> Option<TaskSummary> {
         self.tasks.get(id).map(|task| TaskSummary {
             id: id.to_owned(),
