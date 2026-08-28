@@ -217,7 +217,13 @@ impl TaskManager {
             .get(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
             .spec;
-        let mut proc = spawn_streaming(&spec.program, &spec.args, working_directory)?;
+        let mut proc = match spawn_streaming(&spec.program, &spec.args, working_directory) {
+            Ok(process) => process,
+            Err(error) => {
+                let _ = self.finish(id, -1, events);
+                return Err(error);
+            }
+        };
         drain_all(self, id, &mut proc, events, &mut on_chunk)?;
         let output = proc.wait()?;
         self.finish(id, output.exit_code.unwrap_or(-1), events)
@@ -250,7 +256,13 @@ impl TaskManager {
             .get(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
             .spec;
-        let mut proc = spawn_streaming(&spec.program, &spec.args, working_directory)?;
+        let mut proc = match spawn_streaming(&spec.program, &spec.args, working_directory) {
+            Ok(process) => process,
+            Err(error) => {
+                let _ = self.finish(id, -1, events);
+                return Err(error);
+            }
+        };
         let started = std::time::Instant::now();
         let mut timed_out = false;
         loop {
@@ -450,6 +462,23 @@ mod tests {
         assert_eq!(result.output, "ok");
         assert_eq!(events.drain("task.started")[0].payload, "build");
         assert_eq!(events.drain("task.finished")[0].payload, "build:0");
+    }
+
+    #[test]
+    fn streaming_spawn_failure_finishes_task() {
+        let mut manager = TaskManager::default();
+        let mut events = EventBus::default();
+        manager
+            .add(TaskSpec {
+                id: "missing".into(),
+                program: "nextide-program-that-does-not-exist".into(),
+                args: vec![],
+            })
+            .unwrap();
+        assert!(manager
+            .run_streaming("missing", Path::new("."), &mut events, |_| {})
+            .is_err());
+        assert_eq!(manager.state("missing"), Some(crate::TaskState::Failed));
     }
 
     #[test]
