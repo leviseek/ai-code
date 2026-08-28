@@ -45,6 +45,7 @@ mod tests {
             tree_paths: vec![],
             visible_tree_paths: vec![],
             visible_tree: vec![],
+            selected_tree: None,
             palette_open: false,
             palette_query: String::new(),
             notifications: 0,

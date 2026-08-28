@@ -40,6 +40,7 @@ pub struct DesktopShell {
     pub notifications: NotificationCenter,
     pub layout: ShellLayout,
     pub running: bool,
+    pub selected_tree: Option<std::path::PathBuf>,
 }
 
 impl DesktopShell {
@@ -57,6 +58,7 @@ impl DesktopShell {
             notifications: NotificationCenter::default(),
             layout: ShellLayout::default_1280x800(),
             running: true,
+            selected_tree: None,
         }
     }
 
@@ -87,8 +89,9 @@ impl DesktopShell {
         self.layout.hit_test(point)
     }
 
-    pub fn tree_input_at(&self, point: Point) -> Option<UiInput> {
+    pub fn tree_input_at(&mut self, point: Point) -> Option<UiInput> {
         let path = self.tree_item_at(point)?;
+        self.selected_tree = Some(path.clone());
         let directory =
             self.app.file_tree.nodes().iter().any(|node| {
                 node.path == path && node.kind == nextide_kernel::FileNodeKind::Directory
@@ -364,6 +367,7 @@ impl DesktopShell {
             &self.app,
             &self.palette,
             &self.notifications,
+            self.selected_tree.clone(),
         )
     }
 

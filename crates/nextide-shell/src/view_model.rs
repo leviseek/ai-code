@@ -22,6 +22,7 @@ pub struct ShellSnapshot {
     pub tree_paths: Vec<std::path::PathBuf>,
     pub visible_tree_paths: Vec<std::path::PathBuf>,
     pub visible_tree: Vec<TreeItem>,
+    pub selected_tree: Option<std::path::PathBuf>,
     pub palette_open: bool,
     pub palette_query: String,
     pub notifications: usize,
@@ -33,6 +34,7 @@ impl ShellSnapshot {
         app: &ApplicationContext,
         palette: &CommandPalette,
         notifications: &NotificationCenter,
+        selected_tree: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             title: title.into(),
@@ -54,6 +56,7 @@ impl ShellSnapshot {
                 .iter()
                 .map(|node| node.path.clone())
                 .collect(),
+            selected_tree,
             visible_tree: app
                 .file_tree
                 .visible_nodes()
