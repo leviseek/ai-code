@@ -299,6 +299,13 @@ impl DesktopShell {
                 "workspace.tree.changed",
                 format!("added={added},removed={removed},updated={updated}"),
             ));
+            self.events.publish(nextide_kernel::Event::new(
+                "workspace.tree.change.batch",
+                format!(
+                    "frame={},added={added},removed={removed},updated={updated}",
+                    self.tree_change_frame
+                ),
+            ));
             for change in &self.last_tree_changes {
                 self.events.publish(nextide_kernel::Event::new(
                     "workspace.tree.change",
