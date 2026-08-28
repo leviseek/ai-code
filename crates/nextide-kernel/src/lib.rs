@@ -12,6 +12,7 @@ pub mod capability;
 pub mod events;
 pub mod platform;
 pub mod rpc;
+pub mod task;
 pub mod vfs;
 
 pub use application::ApplicationContext;
@@ -19,6 +20,7 @@ pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
 pub use events::{Event, EventBus};
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use rpc::{LocalRpcRouter, RpcError, RpcHandler, RpcRequest, RpcResponse};
+pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
 pub use vfs::{FileSystem, LocalFileSystem};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
