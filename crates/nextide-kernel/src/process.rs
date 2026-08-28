@@ -10,6 +10,10 @@ pub struct ProcessOutput {
 }
 
 impl ProcessOutput {
+    pub fn is_success(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+
     pub fn combined(&self) -> String {
         format!("{}{}", self.stdout, self.stderr)
     }
@@ -109,6 +113,8 @@ mod tests {
         }
         .unwrap();
         assert_eq!(result.exit_code, Some(0));
+        assert!(result.is_success());
+        assert_eq!(result.combined(), result.stdout.clone() + &result.stderr);
         assert!(result.stdout.contains("hello"));
     }
 }
