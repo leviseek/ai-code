@@ -98,6 +98,26 @@ impl FileTreeModel {
         }
         false
     }
+    pub fn visible_nodes(&self) -> Vec<&FileNode> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                let mut parent = node.path.parent();
+                while let Some(path) = parent {
+                    if let Some(directory) = self.nodes.iter().find(|candidate| {
+                        candidate.path == path && candidate.kind == FileNodeKind::Directory
+                    }) {
+                        if !directory.expanded {
+                            return false;
+                        }
+                    }
+                    parent = path.parent();
+                }
+                true
+            })
+            .collect()
+    }
+
     pub fn nodes(&self) -> &[FileNode] {
         &self.nodes
     }
