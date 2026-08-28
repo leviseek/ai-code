@@ -13,6 +13,7 @@ pub mod events;
 pub mod platform;
 pub mod rpc;
 pub mod task;
+pub mod task_manager;
 pub mod vfs;
 
 pub use application::ApplicationContext;
@@ -21,6 +22,7 @@ pub use events::{Event, EventBus};
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use rpc::{LocalRpcRouter, RpcError, RpcHandler, RpcRequest, RpcResponse};
 pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
+pub use task_manager::TaskManager;
 pub use vfs::{FileSystem, LocalFileSystem};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
