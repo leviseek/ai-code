@@ -324,7 +324,7 @@ impl AsyncTaskHandle {
     /// created. Concatenating the [`AsyncTaskEvent::Output`] payloads
     /// reconstructs [`AsyncTaskSnapshot::output`] exactly.
     pub fn drain_events(&self) -> Vec<AsyncTaskEvent> {
-        let mut receiver = self
+        let receiver = self
             .events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
