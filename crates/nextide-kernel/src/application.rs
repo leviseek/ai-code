@@ -1,6 +1,9 @@
+use std::io;
+use std::path::Path;
+
 use crate::{
-    CapabilityRegistry, EditorKernel, EditorViewState, EventBus, FileTreeModel, TabModel,
-    WorkspaceState,
+    CapabilityRegistry, EditorKernel, EditorViewState, Event, EventBus, FileSystem, FileTreeModel,
+    TabModel, WorkspaceState,
 };
 
 /// Platform-independent application state shared by desktop shells.
@@ -28,6 +31,18 @@ impl ApplicationContext {
         }
     }
 
+    pub fn open_file<F: FileSystem>(&mut self, fs: &F, path: &Path) -> io::Result<()> {
+        self.editor = EditorKernel::open(fs, path)?;
+        self.workspace.open_file_with_events(path, &mut self.events);
+        self.tabs.open(path);
+        if !self.views.iter().any(|view| view.path == path) {
+            self.views.push(EditorViewState::new(path));
+        }
+        self.events
+            .publish(Event::new("editor.opened", path.to_string_lossy()));
+        Ok(())
+    }
+
     pub fn bootstrap(initial_text: impl Into<String>) -> Self {
         let mut context = Self::new(initial_text);
         for (id, permission) in [
@@ -51,6 +66,34 @@ impl ApplicationContext {
 mod tests {
     use super::*;
     use crate::{CapabilityDescriptor, EditTransaction, TextEdit};
+
+    struct MemoryFs;
+    impl FileSystem for MemoryFs {
+        fn read(&self, _: &Path) -> io::Result<String> {
+            Ok("hello".into())
+        }
+        fn write(&self, _: &Path, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn exists(&self, _: &Path) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn open_file_synchronizes_workspace_tabs_and_views() {
+        let mut context = ApplicationContext::new("");
+        context
+            .open_file(&MemoryFs, Path::new("src/main.rs"))
+            .unwrap();
+        assert_eq!(context.editor.document().text(), "hello");
+        assert_eq!(
+            context.tabs.active().unwrap().path,
+            Path::new("src/main.rs")
+        );
+        assert_eq!(context.views.len(), 1);
+        assert_eq!(context.events.pending("editor.opened"), 1);
+    }
 
     #[test]
     fn bootstrap_registers_core_capabilities() {
