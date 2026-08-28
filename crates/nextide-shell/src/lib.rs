@@ -2,6 +2,7 @@ mod command_registry;
 mod commands;
 mod input;
 mod keymap;
+mod layout;
 mod notifications;
 mod palette;
 mod renderer;
@@ -11,6 +12,7 @@ pub use command_registry::{command_id, search as search_commands, CommandDescrip
 pub use commands::{from_id as command_from_id, CommandResult, ShellCommand};
 pub use input::{command_for_input, UiInput};
 pub use keymap::{command_for, KeyChord};
+pub use layout::{Point, Rect, ShellLayout, UiRegion};
 pub use notifications::{Notification, NotificationCenter, NotificationLevel};
 pub use palette::CommandPalette;
 pub use renderer::{HeadlessRenderer, UiRenderer};
