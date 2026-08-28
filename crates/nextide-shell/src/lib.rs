@@ -5,7 +5,7 @@ mod palette;
 mod view_model;
 
 pub use command_registry::{command_id, search as search_commands, CommandDescriptor, COMMANDS};
-pub use commands::{CommandResult, ShellCommand};
+pub use commands::{from_id as command_from_id, CommandResult, ShellCommand};
 pub use keymap::{command_for, KeyChord};
 pub use palette::CommandPalette;
 pub use view_model::ShellSnapshot;
@@ -61,6 +61,26 @@ impl DesktopShell {
                 snapshot.tabs, snapshot.editor_views, snapshot.tree_nodes
             ),
         ));
+    }
+
+    pub fn execute_selected<F: nextide_kernel::FileSystem>(
+        &mut self,
+        fs: &F,
+        path: impl Into<std::path::PathBuf>,
+    ) -> std::io::Result<CommandResult> {
+        let Some(id) = self.selected_command_id() else {
+            return Ok(CommandResult::Noop);
+        };
+        let Some(command) = command_from_id(id, path) else {
+            return Ok(CommandResult::Noop);
+        };
+        let result = self.execute(fs, command)?;
+        if result == CommandResult::Applied {
+            self.events
+                .publish(nextide_kernel::Event::new("palette.command.executed", id));
+            self.palette.close();
+        }
+        Ok(result)
     }
 
     pub fn selected_command_id(&self) -> Option<&'static str> {
