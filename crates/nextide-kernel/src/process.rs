@@ -69,6 +69,28 @@ pub fn run_capture_timeout(
 mod tests {
     use super::*;
     #[test]
+    fn reports_timeout_without_hanging() {
+        let result = if cfg!(windows) {
+            run_capture_timeout(
+                "ping",
+                &["127.0.0.1".into(), "-n".into(), "5".into()],
+                Path::new("."),
+                std::time::Duration::from_millis(20),
+            )
+        } else {
+            run_capture_timeout(
+                "sh",
+                &["-c".into(), "sleep 1".into()],
+                Path::new("."),
+                std::time::Duration::from_millis(20),
+            )
+        }
+        .unwrap();
+        assert_eq!(result.exit_code, None);
+        assert!(result.stderr.contains("timed out"));
+    }
+
+    #[test]
     fn captures_successful_process_output() {
         let result = if cfg!(windows) {
             run_capture(
