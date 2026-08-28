@@ -9,6 +9,12 @@ pub struct ProcessOutput {
     pub stderr: String,
 }
 
+impl ProcessOutput {
+    pub fn combined(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr)
+    }
+}
+
 pub fn run_capture(
     program: &str,
     args: &[String],

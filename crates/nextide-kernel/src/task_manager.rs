@@ -133,7 +133,7 @@ impl TaskManager {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
             .spec;
         let output = run_capture(&spec.program, &spec.args, working_directory)?;
-        let combined = format!("{}{}", output.stdout, output.stderr);
+        let combined = output.combined();
         self.append_output_with_events(id, &combined, events)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
         self.finish(id, output.exit_code.unwrap_or(-1), events)
@@ -155,7 +155,7 @@ impl TaskManager {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?
             .spec;
         let output = run_capture_timeout(&spec.program, &spec.args, working_directory, timeout)?;
-        let combined = format!("{}{}", output.stdout, output.stderr);
+        let combined = output.combined();
         self.append_output_with_events(id, &combined, events)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         if output.exit_code.is_none() {
