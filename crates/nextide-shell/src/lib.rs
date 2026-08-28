@@ -642,6 +642,11 @@ mod tests {
         assert!(renderer.tree_rows()[1].selected);
         assert_eq!(renderer.tree_changes().len(), 2);
         assert_eq!(shell.tree_changes().len(), 2);
+        assert_eq!(shell.tree_change_frame(), 1);
+        assert_eq!(
+            shell.events.drain("workspace.tree.change.batch")[0].payload,
+            "frame=1,added=2,removed=0,updated=0"
+        );
         assert_eq!(
             shell.events.drain("workspace.tree.changed")[0].payload,
             "added=2,removed=0,updated=0"
@@ -655,6 +660,11 @@ mod tests {
         assert_eq!(
             shell.events.drain("workspace.tree.changed")[0].payload,
             "added=0,removed=0,updated=2"
+        );
+        assert_eq!(shell.tree_change_frame(), 2);
+        assert_eq!(
+            shell.events.drain("workspace.tree.change.batch")[0].payload,
+            "frame=2,added=0,removed=0,updated=2"
         );
         let changes = shell.events.drain("workspace.tree.change");
         assert_eq!(changes.len(), 4);
