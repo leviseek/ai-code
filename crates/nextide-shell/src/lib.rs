@@ -46,6 +46,7 @@ pub struct DesktopShell {
     pub selected_tree: Option<std::path::PathBuf>,
     pub previous_tree_rows: Vec<TreeRenderRow>,
     pub last_tree_changes: Vec<TreeRowChange>,
+    pub tree_change_frame: u64,
 }
 
 impl DesktopShell {
@@ -66,6 +67,7 @@ impl DesktopShell {
             selected_tree: None,
             previous_tree_rows: Vec::new(),
             last_tree_changes: Vec::new(),
+            tree_change_frame: 0,
         }
     }
 
@@ -291,6 +293,7 @@ impl DesktopShell {
         self.previous_tree_rows = rows;
         renderer.render_tree_changes(&self.last_tree_changes)?;
         if !self.last_tree_changes.is_empty() {
+            self.tree_change_frame += 1;
             let (added, removed, updated) = tree_change_counts(&self.last_tree_changes);
             self.events.publish(nextide_kernel::Event::new(
                 "workspace.tree.changed",
@@ -406,6 +409,10 @@ impl DesktopShell {
 
     pub fn tree_changes(&self) -> &[TreeRowChange] {
         &self.last_tree_changes
+    }
+
+    pub fn tree_change_frame(&self) -> u64 {
+        self.tree_change_frame
     }
 
     pub fn is_running(&self) -> bool {
