@@ -42,7 +42,22 @@ pub trait FileSystem {
     fn atomic_write(&self, path: &Path, text: &str) -> io::Result<()> {
         self.write(path, text)
     }
-    fn exists(&self, path: &Path) -> bool;
+
+    /// Whether `path` exists inside the workspace.
+    ///
+    /// This is a typed, read-only query built on [`FileSystem::metadata`]:
+    /// existing entries report `Ok(true)`, missing entries report `Ok(false)`,
+    /// and access failures such as workspace-root escapes report `Err`.
+    /// Implementations must keep workspace-root safety constraints: paths that
+    /// escape the workspace root must fail with
+    /// [`io::ErrorKind::PermissionDenied`].
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        match self.metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 
     /// Reads typed, read-only metadata for `path`.
     ///
@@ -120,7 +135,13 @@ impl LocalFileSystem {
         }
         let resolved = match &self.root {
             Some(root) if path.is_absolute() => path.to_path_buf(),
-            Some(root) => root.join(path),
+            Some(root) => {
+                // Join against the canonical root so that missing children
+                // (which cannot be canonicalized themselves) still compare
+                // against the same prefix as existing entries.
+                let root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                root.join(path)
+            }
             None => path.to_path_buf(),
         };
         if let Some(root) = &self.root {
@@ -164,12 +185,6 @@ impl FileSystem for LocalFileSystem {
         fs::rename(temp, resolved)
     }
 
-    fn exists(&self, path: &Path) -> bool {
-        self.resolve(path)
-            .map(|path| path.exists())
-            .unwrap_or(false)
-    }
-
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
         let resolved = self.resolve(path)?;
         let metadata = fs::metadata(resolved)?;
@@ -211,7 +226,7 @@ mod tests {
         let file = Path::new("src/main.rs");
         fs.write(file, "fn main() {}\n").unwrap();
         assert_eq!(fs.read(file).unwrap(), "fn main() {}\n");
-        assert!(fs.exists(file));
+        assert!(fs.exists(file).unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -236,8 +251,8 @@ mod tests {
         assert!(!fs.is_dir(file).unwrap());
         assert!(fs.is_dir(directory).unwrap());
         assert!(!fs.is_file(directory).unwrap());
-        assert!(fs.exists(file));
-        assert!(fs.exists(directory));
+        assert!(fs.exists(file).unwrap());
+        assert!(fs.exists(directory).unwrap());
 
         let metadata = fs.metadata(file).unwrap();
         assert_eq!(metadata.kind, FileKind::File);
@@ -259,7 +274,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("nextide-vfs-missing-{}", std::process::id()));
         let fs = LocalFileSystem::rooted(&root);
         let missing = Path::new("does-not-exist.txt");
-        assert!(!fs.exists(missing));
+        assert!(!fs.exists(missing).unwrap());
         assert!(!fs.is_file(missing).unwrap());
         assert!(!fs.is_dir(missing).unwrap());
         assert_eq!(
@@ -287,7 +302,10 @@ mod tests {
             fs.metadata(&escape).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        assert!(!fs.exists(&escape));
+        assert_eq!(
+            fs.exists(&escape).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -311,6 +329,42 @@ mod tests {
             fs.is_dir(&nested).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+        assert_eq!(
+            fs.exists(&nested).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn rooted_filesystem_exists_is_typed_and_root_safe() {
+        let root = std::env::temp_dir().join(format!("nextide-vfs-exists-{}", std::process::id()));
+        let fs = LocalFileSystem::rooted(&root);
+        let file = Path::new("src/main.rs");
+        let directory = Path::new("src");
+        fs.write(file, "fn main() {}\n").unwrap();
+
+        // Existing entries inside the root report Ok(true).
+        assert!(fs.exists(file).unwrap());
+        assert!(fs.exists(directory).unwrap());
+
+        // Missing entries inside the root report Ok(false), not Err.
+        assert!(!fs.exists(Path::new("missing.txt")).unwrap());
+
+        // Escapes and out-of-root absolute paths are Err, not a silent false.
+        let escape = Path::new("..").join("outside.txt");
+        assert_eq!(
+            fs.exists(&escape).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let outside = std::env::temp_dir().join(format!("nextide-outside-{}", std::process::id()));
+        std::fs::write(&outside, "x").unwrap();
+        assert_eq!(
+            fs.exists(&outside).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_file(outside);
     }

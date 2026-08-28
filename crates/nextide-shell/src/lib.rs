@@ -801,8 +801,8 @@ mod tests {
         fn write(&self, _: &std::path::Path, _: &str) -> std::io::Result<()> {
             Ok(())
         }
-        fn exists(&self, _: &std::path::Path) -> bool {
-            true
+        fn exists(&self, _: &std::path::Path) -> std::io::Result<bool> {
+            Ok(true)
         }
         fn list(&self, _: &std::path::Path) -> std::io::Result<Vec<(std::path::PathBuf, bool)>> {
             Ok(vec![("src/main.rs".into(), false)])
@@ -817,8 +817,8 @@ mod tests {
         fn write(&self, _: &std::path::Path, _: &str) -> std::io::Result<()> {
             Ok(())
         }
-        fn exists(&self, _: &std::path::Path) -> bool {
-            true
+        fn exists(&self, _: &std::path::Path) -> std::io::Result<bool> {
+            Ok(true)
         }
     }
 

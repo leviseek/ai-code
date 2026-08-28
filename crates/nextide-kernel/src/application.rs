@@ -131,8 +131,8 @@ mod tests {
         fn write(&self, _: &Path, _: &str) -> io::Result<()> {
             Ok(())
         }
-        fn exists(&self, _: &Path) -> bool {
-            true
+        fn exists(&self, _: &Path) -> io::Result<bool> {
+            Ok(true)
         }
         fn list(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
             Ok(vec![
