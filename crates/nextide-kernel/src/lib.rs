@@ -19,6 +19,7 @@ pub mod task_manager;
 pub mod terminal;
 pub mod vfs;
 pub mod window;
+pub mod workspace;
 
 pub use application::ApplicationContext;
 pub use capability::{CapabilityDescriptor, CapabilityRegistry, RegistryError};
@@ -34,6 +35,7 @@ pub use vfs::{FileSystem, LocalFileSystem};
 pub use window::{
     HeadlessWindowService, WindowEvent, WindowHandle, WindowOptions, WindowService, WindowSize,
 };
+pub use workspace::WorkspaceState;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
