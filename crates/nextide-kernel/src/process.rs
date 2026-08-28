@@ -5,6 +5,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
+/// How often [`RunningProcess::wait`] polls the child while draining the
+/// stream channel, so a descendant holding the pipes open is detected and
+/// reaped shortly after the direct child exits.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessOutput {
     pub exit_code: Option<i32>,
@@ -44,38 +49,54 @@ pub fn run_capture_timeout(
     working_directory: &Path,
     timeout: std::time::Duration,
 ) -> io::Result<ProcessOutput> {
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(working_directory)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    // Built on the streaming primitive so both the timeout and the completion
+    // path inherit its process-tree reaping: a descendant that keeps the
+    // stdout/stderr pipes open after the direct child exits cannot stall the
+    // wait forever.
+    let mut proc = spawn_streaming(program, args, working_directory)?;
     let started = std::time::Instant::now();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut timed_out = false;
     loop {
-        if child.try_wait()?.is_some() {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            timed_out = true;
             break;
         }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            return Ok(ProcessOutput {
-                exit_code: None,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: format!(
-                    "{}process timed out after {:?}",
-                    String::from_utf8_lossy(&output.stderr),
-                    timeout
-                ),
-            });
+        match proc.next_chunk_timeout(timeout - elapsed)? {
+            StreamWait::Chunk(chunk) => match chunk.kind {
+                StreamKind::Stdout => stdout.extend_from_slice(&chunk.data),
+                StreamKind::Stderr => stderr.extend_from_slice(&chunk.data),
+            },
+            StreamWait::Closed => break,
+            StreamWait::Timeout => {
+                timed_out = true;
+                break;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let output = child.wait_with_output()?;
-    Ok(ProcessOutput {
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    if timed_out {
+        // Reap the whole tree so the pipes close, then collect whatever the
+        // reader threads had buffered before they hit EOF.
+        let _ = proc.kill();
+        while let Some(chunk) = proc.next_chunk()? {
+            match chunk.kind {
+                StreamKind::Stdout => stdout.extend_from_slice(&chunk.data),
+                StreamKind::Stderr => stderr.extend_from_slice(&chunk.data),
+            }
+        }
+        let _ = proc.wait()?;
+        let mut message = String::from_utf8_lossy(&stderr).into_owned();
+        message.push_str(&format!("process timed out after {:?}", timeout));
+        Ok(ProcessOutput {
+            exit_code: None,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: message,
+        })
+    } else {
+        Ok(proc.wait()?)
+    }
 }
 
 /// Identifies the standard stream an [`OutputChunk`] was read from.
@@ -120,6 +141,12 @@ pub enum StreamWait {
 /// channel, so both streams keep making progress even while the other is
 /// idle, and the child can never block on a full pipe.
 ///
+/// Waiting on or dropping the handle reaps the *whole process tree*: the
+/// child is spawned in its own process group on Unix (killed wholesale via
+/// `kill -KILL -<pgid>`), and Windows reaps descendants with
+/// `taskkill /PID <pid> /T /F` (falling back to a descendant walk when the
+/// direct child already exited). A grandchild that inherits the stdout/stderr
+/// pipes can therefore not stall the wait or the reader-thread joins forever.
 /// Dropping the handle kills the child if it is still running, reaps it and
 /// joins the reader threads, so no process, zombie or thread outlives the
 /// handle.
@@ -175,13 +202,21 @@ impl RunningProcess {
         }
     }
 
-    /// Terminates the child if it is still running.
+    /// Terminates the child and, as far as possible, its descendants.
     ///
-    /// This is a no-op if the process has already been waited on or exited on
-    /// its own; it does not drain the stream channel.
+    /// Windows reaps the whole tree with `taskkill /PID <pid> /T /F` (or a
+    /// descendant walk when the direct child already exited); Unix kills the
+    /// child's process group. Descendants that escaped the tree (e.g.
+    /// daemonized processes) cannot be reached. This is a no-op if the process
+    /// has already been waited on; it does not drain the stream channel.
     pub fn kill(&mut self) -> io::Result<()> {
+        self.kill_tree()
+    }
+
+    /// Kills the child and its descendants (best effort).
+    fn kill_tree(&mut self) -> io::Result<()> {
         match self.child.as_mut() {
-            Some(child) => child.kill(),
+            Some(child) => kill_child_tree(child),
             None => Ok(()),
         }
     }
@@ -190,22 +225,53 @@ impl RunningProcess {
     ///
     /// The channel is drained to exhaustion *before* waiting on the child, so
     /// the reader threads never block on a full channel and the child can
-    /// always flush its pipes; only then is the child waited on. May only be
-    /// called once; later calls return an error.
+    /// always flush its pipes; only then is the child waited on. While
+    /// draining, the direct child is polled: once it has exited but its
+    /// streams are still open, a descendant must be holding the pipes, so the
+    /// whole process tree is killed (best effort) to unblock the readers
+    /// instead of hanging forever. May only be called once; later calls return
+    /// an error.
     pub fn wait(&mut self) -> io::Result<ProcessOutput> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let chunks = self.chunks.as_ref().ok_or_else(already_waited)?;
-        while let Ok(chunk) = chunks.recv() {
-            match chunk.kind {
-                StreamKind::Stdout => stdout.extend_from_slice(&chunk.data),
-                StreamKind::Stderr => stderr.extend_from_slice(&chunk.data),
+        if self.chunks.is_none() {
+            return Err(already_waited());
+        }
+        let mut reaped: Option<std::process::ExitStatus> = None;
+        let mut tree_killed = false;
+        loop {
+            let chunks = self.chunks.as_ref().expect("checked above");
+            match chunks.recv_timeout(POLL_INTERVAL) {
+                Ok(chunk) => match chunk.kind {
+                    StreamKind::Stdout => stdout.extend_from_slice(&chunk.data),
+                    StreamKind::Stderr => stderr.extend_from_slice(&chunk.data),
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if reaped.is_none() {
+                        reaped = self
+                            .child
+                            .as_mut()
+                            .map(|child| child.try_wait())
+                            .transpose()?
+                            .flatten();
+                    }
+                    if !tree_killed && reaped.is_some() {
+                        // The direct child exited but its streams are still
+                        // open: a descendant is holding the pipes. Reap the
+                        // tree so the reader threads hit EOF instead of
+                        // blocking forever.
+                        let _ = self.kill_tree();
+                        tree_killed = true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        // The channel is closed, so both readers hit EOF and the child closed
-        // its pipes; it is safe to wait on it now.
         let mut child = self.child.take().ok_or_else(already_waited)?;
-        let status = child.wait()?;
+        let status = match reaped {
+            Some(status) => status,
+            None => child.wait()?,
+        };
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
@@ -219,10 +285,12 @@ impl RunningProcess {
 
 impl Drop for RunningProcess {
     fn drop(&mut self) {
-        // Best-effort kill + reap so no child process or zombie survives the
-        // handle being dropped.
+        // Best-effort tree kill + reap so no descendant can keep the pipes
+        // open and stall the reader-thread joins below.
+        if self.child.is_some() {
+            let _ = self.kill_tree();
+        }
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
             let _ = child.wait();
         }
         // Dropping the receiver unblocks any reader thread stuck sending into
@@ -237,18 +305,28 @@ impl Drop for RunningProcess {
 /// Spawns `program` with piped stdout/stderr and starts streaming both.
 ///
 /// Each stream is read by an independent dedicated thread; chunks arrive on
-/// the [`RunningProcess`] handle in whatever order they were read.
+/// the [`RunningProcess`] handle in whatever order they were read. The child
+/// is spawned in its own process group on Unix so the whole tree can be
+/// reaped on demand; Windows reaps trees with `taskkill /T`.
 pub fn spawn_streaming(
     program: &str,
     args: &[String],
     working_directory: &Path,
 ) -> io::Result<RunningProcess> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(working_directory)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group (pgid == child pid) so `kill -KILL -<pid>` can
+        // reap the whole tree, not just the direct child.
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -270,8 +348,9 @@ pub fn spawn_streaming(
         }
     }
     if let Some(err) = failed {
-        // Reader thread creation failed; tear the child down so nothing leaks.
-        let _ = child.kill();
+        // Reader thread creation failed; tear the whole tree down so nothing
+        // leaks and a descendant holding the pipes cannot stall the joins.
+        let _ = kill_child_tree(&mut child);
         let _ = child.wait();
         for handle in threads {
             let _ = handle.join();
@@ -314,6 +393,77 @@ fn spawn_reader<R: Read + Send + 'static>(
                 }
             }
         })
+}
+
+/// Kills `child` and its descendants so no descendant can keep the
+/// stdout/stderr pipes open and stall a subsequent wait.
+///
+/// Windows: `taskkill /PID <pid> /T /F` (the same approach as
+/// [`crate::platform::PlatformServices::terminate`]); if the direct child has
+/// already exited — taskkill cannot walk a dead root's tree — a PowerShell
+/// CIM walk kills every live descendant by `ParentProcessId`. Unix: the child
+/// was spawned in its own process group, so `kill -KILL -<pgid>` reaps the
+/// group; `setpgid` runs in the child around exec, so the kill is retried
+/// briefly to close the race window. Both fall back to a plain `Child::kill`.
+#[cfg(windows)]
+fn kill_child_tree(child: &mut Child) -> io::Result<()> {
+    let pid = child.id();
+    let taskkill = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+    if matches!(taskkill, Ok(status) if status.success()) {
+        return Ok(());
+    }
+    // The direct child may have already exited, in which case taskkill cannot
+    // reconstruct its tree; descendants still record the dead parent's PID,
+    // so walk the process snapshot and kill each of them.
+    let script = format!(
+        "$root = {pid}; $targets = New-Object System.Collections.ArrayList; \
+         $q = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; \
+         function Walk($p) {{ foreach ($c in $q) {{ \
+         if ($c.ParentProcessId -eq $p) {{ [void]$targets.Add([int]$c.ProcessId); Walk $c.ProcessId }} }} }}; \
+         Walk $root; foreach ($t in $targets) {{ Stop-Process -Id $t -Force -ErrorAction SilentlyContinue }}"
+    );
+    let walked = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", script.as_str()])
+        .status();
+    if matches!(walked, Ok(status) if status.success()) {
+        return Ok(());
+    }
+    child.kill()
+}
+
+#[cfg(not(windows))]
+fn kill_child_tree(child: &mut Child) -> io::Result<()> {
+    let pid = child.id();
+    // The child was spawned in its own process group (pgid == pid), so a
+    // negative pid signal reaches every descendant that stayed in the group.
+    // `setpgid` runs in the child around exec, so retry briefly to close the
+    // window where the group does not exist yet.
+    let group = format!("-{pid}");
+    let mut last_err: Option<io::Error> = None;
+    for _ in 0..3 {
+        match std::process::Command::new("kill")
+            .args(["-KILL", &group])
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("kill -KILL {group} did not succeed"),
+                ));
+            }
+            Err(err) => last_err = Some(err),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // Fallback: kill just the direct child (covers the setpgid race and hosts
+    // without a `kill` binary in PATH).
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(err) => Err(last_err.unwrap_or(err)),
+    }
 }
 
 fn already_waited() -> io::Error {
@@ -500,6 +650,163 @@ mod tests {
             !pid_is_running(pid),
             "process {pid} should have been killed by dropping the handle"
         );
+    }
+
+    /// Runs `f` on a helper thread and returns `None` if it does not finish
+    /// within `deadline`, so a regression that blocks forever fails the test
+    /// instead of hanging the whole suite.
+    fn with_deadline<T: Send + 'static>(
+        deadline: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(f());
+        });
+        receiver.recv_timeout(deadline).ok()
+    }
+
+    /// A unique temp-file path used to record a grandchild's pid.
+    fn pid_marker_path(tag: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "nextide-pid-{tag}-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    /// Blocks until `path` contains a parseable pid, up to `deadline`.
+    fn read_pid_marker(path: &std::path::Path, deadline: std::time::Duration) -> Option<u32> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Some(pid) = text.trim().parse::<u32>().ok() {
+                    return Some(pid);
+                }
+            }
+            if started.elapsed() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Bounded poll until `pid` no longer reports as running.
+    fn wait_until_gone(pid: u32, deadline: std::time::Duration) {
+        let started = std::time::Instant::now();
+        while pid_is_running(pid) && started.elapsed() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn wait_returns_when_descendant_holds_streams() {
+        // The direct child exits immediately, but a grandchild inherits the
+        // stdout/stderr pipes and stays alive for 30s. wait() must reap the
+        // tree instead of blocking until the grandchild closes the pipes.
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "start /b powershell -NoProfile -Command Start-Sleep 30".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "sleep 30 &".to_string()],
+            )
+        };
+        let mut proc = spawn_streaming(&program, &args, Path::new(".")).unwrap();
+        let output = with_deadline(std::time::Duration::from_secs(15), move || proc.wait())
+            .expect("wait() hung: a descendant kept the stdout/stderr pipes open")
+            .expect("wait() failed");
+        assert_eq!(output.exit_code, Some(0));
+        assert!(
+            output.stdout.is_empty(),
+            "unexpected stdout: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "unexpected stderr: {:?}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn kill_and_drop_reap_the_process_tree() {
+        // Spawns a command whose direct child stays alive for 30s while a
+        // grandchild holding the pipes runs in the background; on Unix the
+        // grandchild's pid is recorded in `marker`.
+        let tree_args = |marker: &std::path::Path| -> (String, Vec<String>) {
+            if cfg!(windows) {
+                (
+                    "cmd.exe".to_string(),
+                    vec![
+                        "/C".to_string(),
+                        "start /b powershell -NoProfile -Command Start-Sleep 30 & ping -n 30 127.0.0.1 > nul".to_string(),
+                    ],
+                )
+            } else {
+                (
+                    "sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        format!("sleep 30 & echo $! > '{}'; sleep 30", marker.display()),
+                    ],
+                )
+            }
+        };
+
+        // kill() must terminate the direct child and every descendant.
+        let marker = pid_marker_path("kill");
+        let (program, args) = tree_args(&marker);
+        let mut proc = spawn_streaming(&program, &args, Path::new(".")).unwrap();
+        let direct_pid = proc.id().unwrap();
+        #[cfg(not(windows))]
+        let grandchild = read_pid_marker(&marker, std::time::Duration::from_secs(10))
+            .expect("grandchild pid marker was never written");
+        proc.kill().unwrap();
+        let output = with_deadline(std::time::Duration::from_secs(15), move || proc.wait())
+            .expect("wait() hung after kill(): the process tree was not reaped")
+            .expect("wait() failed");
+        assert_ne!(output.exit_code, Some(0));
+        wait_until_gone(direct_pid, std::time::Duration::from_secs(10));
+        assert!(!pid_is_running(direct_pid));
+        #[cfg(not(windows))]
+        {
+            wait_until_gone(grandchild, std::time::Duration::from_secs(10));
+            assert!(!pid_is_running(grandchild));
+        }
+        let _ = std::fs::remove_file(&marker);
+
+        // Dropping the handle must reap the tree the same way.
+        let marker = pid_marker_path("drop");
+        let (program, args) = tree_args(&marker);
+        let proc = spawn_streaming(&program, &args, Path::new(".")).unwrap();
+        let direct_pid = proc.id().unwrap();
+        #[cfg(not(windows))]
+        let grandchild = read_pid_marker(&marker, std::time::Duration::from_secs(10))
+            .expect("grandchild pid marker was never written");
+        let dropped = with_deadline(std::time::Duration::from_secs(15), move || drop(proc));
+        assert!(
+            dropped.is_some(),
+            "drop() hung: the process tree was not reaped"
+        );
+        wait_until_gone(direct_pid, std::time::Duration::from_secs(10));
+        assert!(!pid_is_running(direct_pid));
+        #[cfg(not(windows))]
+        {
+            wait_until_gone(grandchild, std::time::Duration::from_secs(10));
+            assert!(!pid_is_running(grandchild));
+        }
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[cfg(windows)]
