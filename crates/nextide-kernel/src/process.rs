@@ -276,6 +276,10 @@ impl RunningProcess {
     /// so later calls and [`RunningProcess::wait`] return it again. Returns
     /// `Ok(None)` while the child is still running (or after it has been
     /// waited on).
+    pub fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.exit_status
+    }
+
     pub fn is_running(&mut self) -> io::Result<bool> {
         Ok(self.try_wait()?.is_none() && self.child.is_some())
     }
