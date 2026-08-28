@@ -219,6 +219,14 @@ mod tests {
                 args: vec![],
             })
             .unwrap();
+        assert_eq!(
+            manager.summaries()[0],
+            TaskSummary {
+                id: "build".into(),
+                state: crate::TaskState::Pending,
+                program: "echo".into()
+            }
+        );
         assert!(manager.contains("build"));
         assert!(!manager.contains("missing"));
         assert_eq!(manager.state("build"), Some(crate::TaskState::Pending));
