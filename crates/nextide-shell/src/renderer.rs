@@ -121,6 +121,47 @@ impl UiRenderer for HeadlessRenderer {
 mod tests {
     use super::*;
     #[test]
+    fn diff_tree_rows_reports_add_remove_and_update() {
+        let old = vec![TreeRenderRow {
+            path: "old.rs".into(),
+            label: "old.rs".into(),
+            x: 0,
+            y: 0,
+            selected: false,
+            icon: "file",
+        }];
+        let current = vec![
+            TreeRenderRow {
+                path: "old.rs".into(),
+                label: "old.rs".into(),
+                x: 0,
+                y: 0,
+                selected: true,
+                icon: "file",
+            },
+            TreeRenderRow {
+                path: "new.rs".into(),
+                label: "new.rs".into(),
+                x: 0,
+                y: 24,
+                selected: false,
+                icon: "file",
+            },
+        ];
+        let changes = diff_tree_rows(&old, &current);
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change, TreeRowChange::Updated(row) if row.selected)));
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change, TreeRowChange::Added(row) if row.path == "new.rs")));
+        let removed = diff_tree_rows(&current, &old);
+        assert!(removed
+            .iter()
+            .any(|change| matches!(change, TreeRowChange::Removed(path) if path == "new.rs")));
+    }
+
+    #[test]
     fn tree_rows_projects_layout_and_metadata() {
         let snapshot = ShellSnapshot {
             title: "NextIDE".into(),
