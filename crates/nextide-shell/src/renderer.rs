@@ -82,6 +82,14 @@ pub trait UiRenderer {
             })
             .collect())
     }
+    fn render_tree_diff(
+        &mut self,
+        previous: &[TreeRenderRow],
+        snapshot: &ShellSnapshot,
+    ) -> io::Result<Vec<TreeRowChange>> {
+        let current = self.render_tree(snapshot)?;
+        Ok(diff_tree_rows(previous, &current))
+    }
 }
 
 #[derive(Default, Debug)]
