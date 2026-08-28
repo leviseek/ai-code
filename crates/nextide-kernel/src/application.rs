@@ -166,6 +166,17 @@ mod tests {
     }
 
     #[test]
+    fn expand_directory_updates_tree_and_emits_event() {
+        let mut context = ApplicationContext::new("");
+        context.file_tree.add("src", crate::FileNodeKind::Directory);
+        assert!(context
+            .expand_directory(&MemoryFs, Path::new("src"))
+            .unwrap());
+        assert_eq!(context.file_tree.nodes().len(), 3);
+        assert_eq!(context.events.pending("workspace.tree.expanded"), 1);
+    }
+
+    #[test]
     fn save_file_clears_view_and_tab_dirty_state() {
         let mut context = ApplicationContext::new("");
         let path = Path::new("src/main.rs");
