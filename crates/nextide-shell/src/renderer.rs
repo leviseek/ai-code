@@ -15,6 +15,14 @@ impl TreeRenderRow {
     pub fn hit(&self, point: crate::Point, width: u32) -> bool {
         point.y >= self.y && point.y < self.y + 24 && point.x >= self.x && point.x < width
     }
+
+    pub fn toggle_hit(&self, point: crate::Point) -> bool {
+        self.icon == "folder"
+            && point.y >= self.y
+            && point.y < self.y + 24
+            && point.x >= self.x.saturating_sub(16)
+            && point.x < self.x
+    }
 }
 
 pub trait UiRenderer {
