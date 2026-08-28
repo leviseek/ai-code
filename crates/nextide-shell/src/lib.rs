@@ -296,6 +296,12 @@ impl DesktopShell {
                 "workspace.tree.changed",
                 format!("added={added},removed={removed},updated={updated}"),
             ));
+            for change in &self.last_tree_changes {
+                self.events.publish(nextide_kernel::Event::new(
+                    "workspace.tree.change",
+                    format!("{}:{}", change.kind(), change.path().to_string_lossy()),
+                ));
+            }
         }
         renderer.render(&snapshot)?;
         self.surface.present()?;
