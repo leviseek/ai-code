@@ -11,12 +11,16 @@ The repository currently contains the first Phase 0 vertical slice:
 - undo/redo
 - snapshot/recovery primitives
 - minimal CLI smoke path
+- headless Desktop Shell with window, input, command-palette, notification, and file-tree pipelines
+- incremental file-tree rendering with structured change batches and events
+- task runtime with lifecycle events, summaries, cancellation, timeout, and cleanup
 
 ## Development
 
 ```powershell
 cargo test --workspace
 cargo run -p nextide-cli -- smoke
+cargo run -p nextide-cli -- bootstrap
 ```
 
 The editor kernel is the single source of truth for document mutations. UI, AI, collaboration, and extensions must eventually submit changes through the same transaction API.
