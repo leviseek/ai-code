@@ -83,6 +83,20 @@ impl DesktopShell {
         self.layout.hit_test(point)
     }
 
+    pub fn pump_once<E: EventLoop, F: nextide_kernel::FileSystem>(
+        &mut self,
+        event_loop: &mut E,
+        fs: &F,
+    ) -> std::io::Result<Option<CommandResult>> {
+        let Some(event) = event_loop.next() else {
+            return Ok(None);
+        };
+        let Some(input) = to_ui_input(event) else {
+            return Ok(Some(CommandResult::Noop));
+        };
+        Ok(Some(self.handle_input(fs, input)?))
+    }
+
     pub fn handle_input<F: nextide_kernel::FileSystem>(
         &mut self,
         fs: &F,
@@ -298,6 +312,22 @@ impl DesktopShell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pump_once_translates_platform_events_to_shell_actions() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let mut events = HeadlessEventLoop::default();
+        events.push(PlatformEvent::Resize {
+            width: 900,
+            height: 600,
+        });
+        assert_eq!(
+            shell.pump_once(&mut events, &NoopFs).unwrap(),
+            Some(CommandResult::Applied)
+        );
+        assert_eq!(shell.surface.size.width, 900);
+        assert!(shell.pump_once(&mut events, &NoopFs).unwrap().is_none());
+    }
+
     #[test]
     fn handle_input_dispatches_palette_and_resize() {
         let mut shell = DesktopShell::new("NextIDE");
