@@ -1,9 +1,12 @@
-use nextide_kernel::ApplicationContext;
+use nextide_kernel::{
+    ApplicationContext, HeadlessWindowService, WindowHandle, WindowOptions, WindowService,
+};
 
 #[derive(Debug)]
 pub struct DesktopShell {
     pub app: ApplicationContext,
     pub title: String,
+    pub windows: HeadlessWindowService,
 }
 
 impl DesktopShell {
@@ -11,7 +14,15 @@ impl DesktopShell {
         Self {
             app: ApplicationContext::bootstrap(""),
             title: title.into(),
+            windows: HeadlessWindowService::default(),
         }
+    }
+
+    pub fn create_main_window(&mut self) -> std::io::Result<WindowHandle> {
+        self.windows.create(WindowOptions {
+            title: self.title.clone(),
+            ..WindowOptions::default()
+        })
     }
 
     pub fn start(&self) -> String {
