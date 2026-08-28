@@ -680,6 +680,7 @@ mod tests {
     }
 
     /// Blocks until `path` contains a parseable pid, up to `deadline`.
+    #[allow(dead_code)]
     fn read_pid_marker(path: &std::path::Path, deadline: std::time::Duration) -> Option<u32> {
         let started = std::time::Instant::now();
         loop {
