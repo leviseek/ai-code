@@ -334,6 +334,10 @@ impl DesktopShell {
         )
     }
 
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
     pub fn start(&self) -> String {
         format!(
             "{} ready ({} capabilities)",
@@ -499,6 +503,18 @@ mod tests {
         fn exists(&self, _: &std::path::Path) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn close_input_stops_shell_lifecycle() {
+        let mut shell = DesktopShell::new("NextIDE");
+        assert!(shell.is_running());
+        assert_eq!(
+            shell.handle_input(&NoopFs, UiInput::Close).unwrap(),
+            CommandResult::Applied
+        );
+        assert!(!shell.is_running());
+        assert_eq!(shell.events.pending("shell.closed"), 1);
     }
 
     #[test]
