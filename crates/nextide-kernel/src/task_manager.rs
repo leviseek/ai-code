@@ -10,6 +10,16 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    pub fn remove(&mut self, id: &str) -> Result<(), TaskError> {
+        match self.tasks.get(id).map(|task| task.state) {
+            Some(crate::TaskState::Pending) => {
+                self.tasks.remove(id);
+                Ok(())
+            }
+            Some(_) | None => Err(TaskError::InvalidTransition),
+        }
+    }
+
     pub fn state(&self, id: &str) -> Option<crate::TaskState> {
         self.tasks.get(id).map(|task| task.state)
     }
@@ -171,6 +181,9 @@ mod tests {
         assert_eq!(manager.state("build"), Some(crate::TaskState::Pending));
         assert_eq!(manager.state("missing"), None);
         assert_eq!(manager.ids().collect::<Vec<_>>(), vec!["build"]);
+        manager.remove("build").unwrap();
+        assert!(manager.ids().next().is_none());
+        assert_eq!(manager.remove("missing"), Err(TaskError::InvalidTransition));
     }
 
     #[test]
