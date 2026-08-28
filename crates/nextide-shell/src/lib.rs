@@ -146,6 +146,14 @@ impl DesktopShell {
         Ok(closed)
     }
 
+    pub fn render_ui<R: UiRenderer>(&mut self, renderer: &mut R) -> std::io::Result<()> {
+        renderer.render(&self.snapshot())?;
+        self.surface.present()?;
+        self.events
+            .publish(nextide_kernel::Event::new("ui.frame.presented", "shell"));
+        Ok(())
+    }
+
     pub fn present_frame(&mut self) -> std::io::Result<()> {
         self.surface.present()
     }
