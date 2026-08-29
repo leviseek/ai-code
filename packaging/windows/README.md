@@ -375,7 +375,7 @@ suite implements them as plain functions and proves them:
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-release-sim.ps1
 ```
 
-Covered scenarios (24 tests):
+Covered scenarios (26 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -402,6 +402,8 @@ Covered scenarios (24 tests):
 | Release file manifest: metadata manifest not byte-identical to the committed one (SHA-256 compare) | fail |
 | Release file manifest: zero-byte CLI binary (smoke-gate simulation: the checksum contract still holds, the non-empty assertion closes the gap) | fail |
 | Release file manifest: renamed `stage.checksum_file` (`CHECKSUMS.txt`) honored by the checklist — attachment list, consumer verifier and entry-set cross-check all resolve the declared name; only the byte-identity contract rejects the modified metadata manifest | fail (byte-identity only) |
+| Publish attachment naming: the attachment list is built from the resolved `stage.checksum_file` — `dist/windows/<checksum file>` for the checksum entry, never a hardcoded default; a renamed declaration changes the list accordingly | pass |
+| Publish attachment naming: a renamed `stage.checksum_file` in the committed-style manifest flows through resolve → verify → checklist → attachment list coherently (the legitimate-rename happy path; the metadata manifest stays byte-identical and every gate passes) | pass |
 | Self-audit: no network or release-creation commands in the script source | pass |
 
 The four files the publish step attaches (`nextide-cli.exe`,
@@ -518,8 +520,9 @@ A third `release` job completes the chain on version-tag pushes (`refs/tags/v*`)
 only (it never runs for branches or pull requests, and it runs only after
 `packaging-windows`, via `needs:`). Right after checkout it first runs the
 sandboxed release-job simulation gate (`packaging/windows/test-release-sim.ps1`,
-24 cases — see [Testing](#testing)), which proves the tag/version rejection
-rules and the four-file release manifest against throwaway `%TEMP%` sandboxes
+26 cases — see [Testing](#testing)), which proves the tag/version rejection
+rules, the four-file release manifest and the publish step's attachment
+naming against throwaway `%TEMP%` sandboxes
 (no network access, no GitHub Release ever created, the repository never
 touched), so a failing gate stops the run before anything is downloaded or
 published. It then downloads the same run's

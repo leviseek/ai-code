@@ -48,11 +48,18 @@
       - release-metadata/manifest.json is byte-identical (SHA-256) to the
         committed manifest.json the pipeline validated
 
+    Part 2b — publish attachment naming (the exact file list the publish
+    step hands to the GitHub CLI's release-creation command): the four paths
+    are built from the resolved stage.checksum_file — `dist/windows/<checksum
+    file>` for the checksum entry, never a hardcoded default — so a renamed
+    checksum file in the committed manifest flows coherently through resolve,
+    verify, checklist and the release's attachment list.
+
     Part 3 — self-audit: the script's own source contains no network or
     release-creation command invocations (it can never touch the network and
     can never create a Release).
 
-    Covered scenarios (24 tests):
+    Covered scenarios (26 tests):
       1.  committed manifest + matching v<version> tag resolves
       2.  beta channel (valid channel) resolves
       3.  non-v tag (e.g. 'main') is rejected
@@ -77,6 +84,8 @@
      22.  zero-byte CLI binary fails (smoke-gate simulation)
      23.  renamed stage.checksum_file is honored by the checklist (byte-identity still enforced)
      24.  self-audit: no network or release-creation commands in the source
+     25.  publish attachment list uses the resolved checksum file name (never hardcoded)
+     26.  renamed stage.checksum_file flows through resolve -> verify -> checklist -> attachment list
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -159,7 +168,6 @@ $script:GoldenChannel = ''
 if ($null -ne $GoldenRelease) {
     $script:GoldenChannel = [string](Get-JsonProperty -Object $GoldenRelease -Name 'release_channel')
 }
-$script:GoldenHash = (Get-FileHash -LiteralPath $ManifestSource -Algorithm SHA256).Hash
 
 # The checksum manifest name is not hardcoded anywhere in this suite: it flows
 # from the golden manifest's stage.checksum_file (the same single source of
@@ -410,6 +418,30 @@ function Get-ChecksumManifestEntries {
     return @($Names)
 }
 
+function Get-ReleaseAttachmentList {
+    # Simulate the publish step's attachment list construction: the exact
+    # four file paths the workflow hands to the GitHub CLI's release-creation
+    # command —
+    #   'dist/windows/nextide-cli.exe'
+    #   'dist/windows/nextide-shell.exe'
+    #   "dist/windows/<resolved stage.checksum_file>"
+    #   'release-metadata/manifest.json'
+    # — with the checksum entry built from the resolved checksum file name
+    # (the release-meta step's output), never a hardcoded default, so a
+    # renamed stage.checksum_file changes the release's attachments
+    # coherently. The list is the contract under test: exactly four entries
+    # in this order.
+    param(
+        [Parameter(Mandatory)][string]$ChecksumFile
+    )
+    return @(
+        'dist/windows/nextide-cli.exe',
+        'dist/windows/nextide-shell.exe',
+        ('dist/windows/' + $ChecksumFile),
+        'release-metadata/manifest.json'
+    )
+}
+
 function Assert-ReleaseFileManifest {
     # Simulate the release job's publish gate: the four files the publish step
     # attaches must form a consistent release file manifest. Returns
@@ -500,11 +532,17 @@ function Assert-ReleaseFileManifest {
         }
     }
 
-    # 4. The release-metadata manifest must be byte-identical to the committed
-    #    manifest the pipeline validated (the job's SHA-256 compare).
+    # 4. The release-metadata manifest must be byte-identical to the golden
+    #    manifest the pipeline validated (the job's SHA-256 compare). The
+    #    golden is the manifest passed in — the committed manifest for the
+    #    normal cases, or a sandbox manifest when a test exercises a
+    #    legitimate rename — so the contract is always "the downloaded
+    #    metadata is exactly what the resolve step read", never a hardcoded
+    #    baseline.
     if (Test-Path -LiteralPath $MetaManifest -PathType Leaf) {
         $DownloadedHash = (Get-FileHash -LiteralPath $MetaManifest -Algorithm SHA256).Hash
-        if ($DownloadedHash -ne $script:GoldenHash) {
+        $GoldenHash = (Get-FileHash -LiteralPath $GoldenManifestPath -Algorithm SHA256).Hash
+        if ($DownloadedHash -ne $GoldenHash) {
             $Errors.Add('release-metadata manifest.json is not byte-identical to the committed manifest.json')
         }
     }
@@ -946,6 +984,105 @@ Invoke-Test -Name 'release checklist: renamed stage.checksum_file is honored (by
         Assert ($Joined -notmatch 'release attachment missing') 'renamed checksum file must be found under the declared name'
         Assert ($Joined -notmatch 'consumer verifier rejected') 'renamed checksum file must pass the consumer verifier under the declared name'
         Assert ($Joined -notmatch 'do not match the manifest artifact files') 'renamed checksum file must pass the artifact-list cross-check'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# 25. The publish step's attachment list is built from the resolved
+#     stage.checksum_file — never a hardcoded default. The list mirrors the
+#     exact four file paths the workflow hands to the GitHub CLI, with the
+#     checksum entry named by the manifest; a renamed declaration changes the
+#     list accordingly, and the default name never appears.
+Invoke-Test -Name 'release publish: attachment list uses the resolved checksum file name (never hardcoded)' -Body {
+    $Root = New-Sandbox
+    try {
+        Copy-GoldenManifest $Root
+        $ManifestPath = Join-Path $Root 'packaging\windows\manifest.json'
+        $Result = Resolve-ReleaseMeta -ManifestPath $ManifestPath -Tag ('v' + $script:GoldenVersion)
+        Assert $Result.Ok "expected resolution to succeed, got error: $($Result.Error)"
+
+        $Attachments = Get-ReleaseAttachmentList -ChecksumFile $Result.ChecksumFile
+        Assert ($Attachments.Count -eq 4) "expected exactly 4 attachments, got $($Attachments.Count)"
+        Assert ($Attachments[0] -eq 'dist/windows/nextide-cli.exe') "expected the CLI first, got '$($Attachments[0])'"
+        Assert ($Attachments[1] -eq 'dist/windows/nextide-shell.exe') "expected the shell second, got '$($Attachments[1])'"
+        Assert ($Attachments[2] -eq ('dist/windows/' + $script:GoldenChecksumFile)) "expected the declared checksum file third, got '$($Attachments[2])'"
+        Assert ($Attachments[3] -eq 'release-metadata/manifest.json') "expected the metadata manifest last, got '$($Attachments[3])'"
+
+        # A renamed stage.checksum_file in the manifest is reflected in the
+        # attachment list; the hardcoded default never appears.
+        $Renamed = 'CHECKSUMS-v2.txt'
+        Write-SandboxManifest -Root $Root -Json ('{"release":{"release_channel":"stable"},"product":{"version":"' + $script:GoldenVersion + '"},"stage":{"checksum_file":"' + $Renamed + '"}}')
+        $RenamedResult = Resolve-ReleaseMeta -ManifestPath $ManifestPath -Tag ('v' + $script:GoldenVersion)
+        Assert $RenamedResult.Ok "expected the renamed resolution to succeed, got error: $($RenamedResult.Error)"
+        Assert ($RenamedResult.ChecksumFile -eq $Renamed) "expected '$Renamed', got '$($RenamedResult.ChecksumFile)'"
+        $RenamedList = Get-ReleaseAttachmentList -ChecksumFile $RenamedResult.ChecksumFile
+        Assert ($RenamedList[2] -eq ('dist/windows/' + $Renamed)) "expected the renamed checksum file in the list, got '$($RenamedList[2])'"
+        Assert ($RenamedList -notcontains ('dist/windows/' + $script:GoldenChecksumFile)) 'the default checksum name must never be hardcoded into the publish list'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# 26. A renamed stage.checksum_file in the committed-style manifest flows
+#     through the whole simulated publish chain coherently: the resolve step
+#     returns the declared name, the dist is staged under it, the checklist
+#     (with the sandbox manifest as its byte-identity golden) passes in full,
+#     and the publish attachment list names exactly that file — never the
+#     hardcoded default. Test 23 shows the tampered-metadata failure path;
+#     this test shows the legitimate-rename happy path the real job supports
+#     (the rename lives in the committed manifest, so the metadata manifest
+#     stays byte-identical and every gate passes).
+Invoke-Test -Name 'release publish: renamed stage.checksum_file flows through resolve -> checklist -> attachment list' -Body {
+    $Root = New-Sandbox
+    try {
+        $Renamed = 'CHECKSUMS.txt'
+        # The sandbox "committed" manifest, re-declaring the checksum file
+        # name; the metadata copy below is byte-identical to it.
+        $SandboxManifestPath = Join-Path $Root 'packaging\windows\manifest.json'
+        Copy-GoldenManifest $Root
+        $Json = Get-Content -Raw -LiteralPath $SandboxManifestPath | ConvertFrom-Json
+        $Json.stage.checksum_file = $Renamed
+        Set-Content -LiteralPath $SandboxManifestPath -Value ($Json | ConvertTo-Json -Depth 10) -Encoding UTF8
+
+        # Resolve step: the declared (renamed) name is returned.
+        $Result = Resolve-ReleaseMeta -ManifestPath $SandboxManifestPath -Tag ('v' + $script:GoldenVersion)
+        Assert $Result.Ok "expected resolution to succeed, got error: $($Result.Error)"
+        Assert ($Result.ChecksumFile -eq $Renamed) "expected checksum file '$Renamed', got '$($Result.ChecksumFile)'"
+
+        # Stage a dist whose checksum manifest lives under the renamed name.
+        $Dist = Join-Path $Root 'dist\windows'
+        $Meta = Join-Path $Root 'release-metadata'
+        $null = New-Item -ItemType Directory -Force -Path $Dist
+        $null = New-Item -ItemType Directory -Force -Path $Meta
+        $Cli   = Join-Path $Dist 'nextide-cli.exe'
+        $Shell = Join-Path $Dist 'nextide-shell.exe'
+        New-FakeFile -Path $Cli   -Content 'fake nextide-cli.exe payload'
+        New-FakeFile -Path $Shell -Content 'fake nextide-shell.exe payload'
+        Write-ChecksumManifest -Path (Join-Path $Dist $Renamed) -Entries @{
+            'nextide-cli.exe'   = (Get-Sha256Hex $Cli)
+            'nextide-shell.exe' = (Get-Sha256Hex $Shell)
+        }
+        # The release-metadata manifest is byte-identical to the sandbox
+        # (committed) manifest — exactly the release job's contract.
+        Copy-Item -LiteralPath $SandboxManifestPath -Destination (Join-Path $Meta 'manifest.json') -Force
+
+        # The full checklist passes when the sandbox manifest is the golden.
+        $Checklist = Assert-ReleaseFileManifest -Sandbox $Root -GoldenManifestPath $SandboxManifestPath
+        Assert $Checklist.Ok "expected the checklist to pass: $($Checklist.Errors -join '; ')"
+
+        # The publish attachment list names exactly the renamed file.
+        $Attachments = Get-ReleaseAttachmentList -ChecksumFile $Result.ChecksumFile
+        $Expected = @(
+            'dist/windows/nextide-cli.exe',
+            'dist/windows/nextide-shell.exe',
+            ('dist/windows/' + $Renamed),
+            'release-metadata/manifest.json'
+        )
+        Assert (($Attachments -join '|') -eq ($Expected -join '|')) "expected attachments '$($Expected -join ', ')', got '$($Attachments -join ', ')'"
+        Assert ($Attachments -notcontains ('dist/windows/' + $script:GoldenChecksumFile)) 'publish must not fall back to the hardcoded default checksum name'
     }
     finally {
         Remove-Sandbox $Root

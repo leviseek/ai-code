@@ -345,10 +345,11 @@ jobs:
     # the packaging job already proved equals the [workspace.package] version
     # in the root Cargo.toml — so the release is always tagged with exactly
     # the version the artifacts claim. The job's own gate rules are proven
-    # first by a sandboxed simulation suite (test-release-sim.ps1, 24 cases,
+    # first by a sandboxed simulation suite (test-release-sim.ps1, 26 cases,
     # zero framework) that runs right after checkout, before anything is
-    # downloaded or published: it exercises the tag/version rejection rules
-    # and the four-file release file manifest against throwaway %TEMP%
+    # downloaded or published: it exercises the tag/version rejection rules,
+    # the four-file release file manifest and the publish step's attachment
+    # naming against throwaway %TEMP%
     # sandboxes — no network access, no GitHub Release ever created, the
     # repository never touched. The checksum file attached to the release is
     # not hardcoded: its name flows from the committed manifest's
@@ -371,7 +372,7 @@ jobs:
       - name: Verify release job simulation (test-release-sim.ps1 gate)
         # Pre-publish self-test gate for this job's own rules, run in a
         # sandbox before anything is downloaded or published. The zero-framework
-        # suite (24 cases) proves, in two parts, exactly what this job gates:
+        # suite (26 cases) proves, in two parts, exactly what this job gates:
         #   - tag/version rejection rules (the "Resolve release metadata from
         #     manifest (channel + version + checksum file vs tag)" logic):
         #     channel must be exactly stable or beta, product.version must be
@@ -391,6 +392,12 @@ jobs:
         #     this job runs on the downloaded bytes), the checksum entries
         #     exactly matching the manifest artifact list, and the metadata
         #     manifest byte-identical to the committed one.
+        #   - publish attachment naming (the exact file list this job hands to
+        #     the GitHub CLI): the four paths are built from the resolved
+        #     stage.checksum_file — 'dist/windows/<checksum file>' for the
+        #     checksum entry, never a hardcoded default — so a renamed
+        #     checksum file in the committed manifest flows coherently through
+        #     resolve, verify, checklist and the release's attachment list.
         # Every case runs against a throwaway sandbox under $env:TEMP — no
         # network access, no GitHub Release ever created, the repository never
         # touched — so a failing test stops the run before anything is
