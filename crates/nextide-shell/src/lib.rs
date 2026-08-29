@@ -535,6 +535,25 @@ impl DesktopShell {
         self.git_status = Some(snapshot);
     }
 
+    /// Detaches the externally supplied Git status snapshot, returning the
+    /// shell to its pre-integration default: every marker
+    /// [`StatusKind::Clean`], [`ShellSnapshot::git_summary`] `None` and
+    /// [`ShellSnapshot::git_status_text`] `None` in the next
+    /// [`snapshot`](Self::snapshot) and rendered tree rows.
+    ///
+    /// This is the inverse of [`update_git_status`](Self::update_git_status)
+    /// and the only way back to the "Git integration inactive" state —
+    /// replacing the snapshot with an empty one instead keeps `git_summary`
+    /// `Some` and reports `"clean"`, which claims Git is active with a clean
+    /// repository (the documented [`ShellSnapshot::git_status_text`]
+    /// `Some`/`None` contract). Like applying markers, clearing them surfaces
+    /// as `Updated` tree-row changes (with `Clean`/`" "` markers) through the
+    /// usual `workspace.tree.changed` flow; clearing when no snapshot has
+    /// been applied is a no-op.
+    pub fn clear_git_status(&mut self) {
+        self.git_status = None;
+    }
+
     /// Applies an external diff snapshot, replacing the current diff panel.
     ///
     /// The snapshot comes from outside the shell (for example from
@@ -1116,6 +1135,65 @@ mod tests {
         let snapshot = shell.snapshot();
         assert_eq!(snapshot.visible_tree[0].status, StatusKind::Clean);
         assert_eq!(snapshot.git_summary, Some(GitStatusSummary::default()));
+    }
+
+    #[test]
+    fn clear_git_status_restores_the_pre_integration_default() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        shell.update_git_status(status_snapshot(vec![status_entry("main.rs", "M ")]));
+        assert_eq!(
+            shell.snapshot().git_summary,
+            Some(GitStatusSummary {
+                total: 1,
+                staged: 1,
+                ..GitStatusSummary::default()
+            })
+        );
+
+        shell.clear_git_status();
+        assert!(shell.git_status.is_none());
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.git_summary, None);
+        assert_eq!(snapshot.git_status_text(), None);
+        assert_eq!(snapshot.visible_tree[0].status, StatusKind::Clean);
+
+        // Clearing when no snapshot is applied is a no-op.
+        shell.clear_git_status();
+        assert!(shell.git_status.is_none());
+    }
+
+    #[test]
+    fn clear_git_status_surfaces_marker_clearing_as_updated_rows() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        let mut renderer = HeadlessRenderer::default();
+        shell.render_ui(&mut renderer).unwrap();
+        assert!(matches!(&shell.tree_changes()[0], TreeRowChange::Added(_)));
+
+        shell.update_git_status(status_snapshot(vec![status_entry("main.rs", " M")]));
+        shell.render_ui(&mut renderer).unwrap();
+        assert!(
+            matches!(&shell.tree_changes()[0], TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged && row.status_marker == "U")
+        );
+        assert_eq!(shell.tree_change_frame(), 2);
+
+        // Detaching the snapshot clears the badge back to `Clean`/`" "` and
+        // reports it as an `Updated` row change, mirroring how applying
+        // markers surfaces them.
+        shell.clear_git_status();
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(shell.tree_changes().len(), 1);
+        assert!(
+            matches!(&shell.tree_changes()[0], TreeRowChange::Updated(row) if row.status == StatusKind::Clean && row.status_marker == " ")
+        );
+        assert_eq!(shell.tree_change_frame(), 3);
     }
 
     #[test]
