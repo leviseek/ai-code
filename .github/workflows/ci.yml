@@ -38,8 +38,10 @@ jobs:
     # workspace version, the target block vs the pinned x86_64-pc-windows-msvc
     # packaging target, and the release metadata (license / publisher /
     # release_channel) — twice, with no duplicated logic: first the sandboxed
-    # self-test gate (test-build.ps1, 23 cases) proves build.ps1 rejects every
-    # violation, then build.ps1 -SkipBuild re-runs the same read-only
+    # self-test gates (test-build.ps1, 26 cases, plus
+    # test-verify-checksums.ps1, 14 cases, for the consumer-side checksum
+    # verifier) prove the scripts reject every violation, then build.ps1
+    # -SkipBuild re-runs the same read-only
     # validation against the committed manifest.json and the real Cargo.toml
     # before anything is staged. The release binaries are built here
     # (cargo build --release) and the packaging script is invoked with
@@ -71,10 +73,13 @@ jobs:
     # staged directory also carries a generated SHA-256 checksum manifest
     # (SHA256SUMS.txt, named by the manifest's stage.checksum_file): build.ps1
     # -SkipBuild writes it from the verified staged hashes and re-verifies it
-    # on the spot, and a dedicated pre-upload gate re-checks the exact file
-    # against the actual dist/windows contents right before the dist upload,
-    # so consumers of the dist artifact can verify every binary against the
-    # checksum manifest that ships with it.
+    # on the spot, and a dedicated pre-upload gate runs the repository's
+    # consumer-side verifier (packaging/windows/verify-checksums.ps1) read-only
+    # against the exact dist/windows contents right before the dist upload, so
+    # consumers of the dist artifact can verify every binary against the
+    # checksum manifest that ships with it. The verifier's own sandboxed
+    # self-test suite (test-verify-checksums.ps1) runs as an additional
+    # pre-packaging gate alongside test-build.ps1.
     needs: ci
     runs-on: windows-latest
     steps:
@@ -123,6 +128,20 @@ jobs:
         # the run before anything is built or staged.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
 
+      - name: Verify checksum consumer script (test-verify-checksums.ps1 gate)
+        # Pre-packaging self-test gate for the consumer-side checksum verifier
+        # (packaging/windows/verify-checksums.ps1): the sandboxed suite (14
+        # cases, zero framework) proves the script accepts a consistent staging
+        # directory + SHA256SUMS.txt (happy path, GNU-style lowercase hashes,
+        # CRLF line endings, a custom -ChecksumFile name), rejects a bad hash,
+        # a missing file, a malformed line, an empty manifest, a
+        # path-escaped/duplicate entry and an extra unlisted file, and never
+        # writes to the directory it verifies (read-only snapshot assertion).
+        # Every case runs the verifier against a throwaway sandbox under
+        # $env:TEMP — the repository is never touched — so a failing test
+        # stops the run before anything is built or staged.
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-checksums.ps1
+
       - name: Build release binaries
         run: cargo build --release
 
@@ -152,49 +171,17 @@ jobs:
         # Pre-upload gate for the checksum manifest that ships inside
         # dist/windows. build.ps1 -SkipBuild (step above) generated
         # SHA256SUMS.txt from the verified staged hashes and already re-verified
-        # it; this step re-reads the exact file about to be uploaded with
-        # PowerShell's built-in Get-FileHash — no dependencies, no network —
-        # and proves it is consistent with the directory that ships: the file
-        # must exist and parse as '<64-hex>  <file>' lines, every staged
-        # artifact must have exactly one entry, and every entry's hash must
-        # equal the actual SHA-256 of the file in dist/windows. Any missing,
-        # corrupt, extra or mismatched entry fails the run before the upload,
-        # so the checksum manifest that ships is proven correct, not just
-        # present.
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $DistDir = 'dist/windows'
-          $ChecksumPath = Join-Path $DistDir 'SHA256SUMS.txt'
-          if (-not (Test-Path -LiteralPath $ChecksumPath)) {
-            throw "Missing checksum manifest to upload: $ChecksumPath"
-          }
-          $Entries = @{}
-          foreach ($Line in (Get-Content -LiteralPath $ChecksumPath)) {
-            if ([string]::IsNullOrWhiteSpace($Line)) { continue }
-            if ($Line -notmatch '^([0-9a-fA-F]{64})  ([^\r\n]+)$') {
-              throw "Checksum manifest line is not in '<hash>  <file>' format: '$Line'"
-            }
-            $Entries[$Matches[2]] = $Matches[1].ToUpperInvariant()
-          }
-          if ($Entries.Count -eq 0) {
-            throw 'SHA256SUMS.txt is empty'
-          }
-          $Staged = @(Get-ChildItem -LiteralPath $DistDir -File)
-          foreach ($File in $Staged) {
-            if ($File.Name -eq 'SHA256SUMS.txt') { continue }
-            if (-not $Entries.ContainsKey($File.Name)) {
-              throw "Staged artifact '$($File.Name)' has no SHA256SUMS.txt entry"
-            }
-            $Actual = (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash
-            if ($Actual -ne $Entries[$File.Name]) {
-              throw "SHA256SUMS.txt hash mismatch for '$($File.Name)': file says $($Entries[$File.Name]), actual $Actual"
-            }
-          }
-          if ($Entries.Count -ne @($Staged | Where-Object { $_.Name -ne 'SHA256SUMS.txt' }).Count) {
-            throw 'SHA256SUMS.txt declares entries for files not present in the staged directory'
-          }
-          Write-Host "SHA256SUMS.txt OK: $($Entries.Count) entries all match the staged artifacts"
+        # it; this step runs the repository's consumer-side verifier
+        # (packaging/windows/verify-checksums.ps1 — the same script dist
+        # consumers use) read-only against the exact directory about to be
+        # uploaded — no dependencies, no network, nothing written — proving
+        # the manifest parses line by line ('<64-hex-sha256>  <file>'), every
+        # named file exists, every entry's hash equals the actual SHA-256 of
+        # the file, and the directory matches the manifest exactly (no
+        # missing, corrupt, extra or duplicate entries). Any failure exits
+        # non-zero before the upload, so the checksum manifest that ships is
+        # proven correct, not just present.
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir dist\windows
 
       - name: Upload dist/windows artifact
         # The artifact name carries the manifest's release_channel suffix

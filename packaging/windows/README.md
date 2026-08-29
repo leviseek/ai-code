@@ -14,20 +14,24 @@ install anything.
 | Release metadata validation (`license` / `publisher` / `release_channel`) | Done — required, validated read-only; channel must be `stable` or `beta` |
 | Stage CLI + Desktop Shell executables under `dist/windows/` | Done — performed by the script |
 | `SHA256SUMS.txt` checksum manifest for staged artifacts | Done — generated and re-verified by the script from the verified staged SHA-256 hashes; ships inside the `dist/windows` CI artifact |
+| Consumer-side verification of `SHA256SUMS.txt` | Done — `verify-checksums.ps1` reads the checksum manifest and proves every line parses (`<hash>  <file>`), every named file exists, every hash matches the actual file, and the directory matches the manifest exactly; strictly read-only, exits non-zero on any failure |
 | Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
+| Self-tests for the checksum verifier | Done — `test-verify-checksums.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
-| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata — plus the checksum file name) — first via the sandboxed `test-build.ps1` self-test gate (26 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows` (including the generated `SHA256SUMS.txt` checksum manifest, which `build.ps1` writes from the verified staged hashes and re-verifies on the spot), and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact. Immediately before the dist upload a dedicated gate re-checks the exact `SHA256SUMS.txt` about to be uploaded with PowerShell's built-in `Get-FileHash` (no dependencies, no network) — every staged artifact must have exactly one `<hash>  <file>` entry and every entry's hash must equal the actual file — so the checksum manifest that ships is proven correct, not just present. The same resolved channel names a second upload: the committed `packaging/windows/manifest.json` is uploaded as a **channel-suffixed release-metadata artifact** (`nextide-windows-manifest-<channel>`) alongside the binaries, so the validated product identity, pinned target, release metadata (license / publisher / release_channel) and artifact list that produced this release travel with it for later release/publish steps. Immediately before that manifest upload a lightweight gate re-reads the exact file about to be uploaded with PowerShell's built-in `ConvertFrom-Json` (no dependencies, no network, no cargo invocation) and re-asserts the validated identity inline — valid JSON, `schema_version` 1, product name/version, the pinned target block, the release metadata, a non-empty artifact list and a `stage.checksum_file` that is a plain leaf name not colliding with any artifact file, plus a cross-check that the file's `release_channel` equals the channel resolved for the run — so the uploaded manifest is proven valid JSON and consistent with the manifest the pipeline validated |
+| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata — plus the checksum file name) — first via the sandboxed `test-build.ps1` self-test gate (26 cases) and the consumer-side checksum verifier self-test `test-verify-checksums.ps1` (14 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows` (including the generated `SHA256SUMS.txt` checksum manifest, which `build.ps1` writes from the verified staged hashes and re-verifies on the spot), and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact. Immediately before the dist upload a dedicated gate runs the repository's consumer-side verifier `verify-checksums.ps1` read-only against the exact `dist/windows` directory about to be uploaded (no dependencies, no network) — every line must parse as `<hash>  <file>`, every named file must exist, every entry's hash must equal the actual file, and the directory must match the manifest exactly — so the checksum manifest that ships is proven correct, not just present. The same resolved channel names a second upload: the committed `packaging/windows/manifest.json` is uploaded as a **channel-suffixed release-metadata artifact** (`nextide-windows-manifest-<channel>`) alongside the binaries, so the validated product identity, pinned target, release metadata (license / publisher / release_channel) and artifact list that produced this release travel with it for later release/publish steps. Immediately before that manifest upload a lightweight gate re-reads the exact file about to be uploaded with PowerShell's built-in `ConvertFrom-Json` (no dependencies, no network, no cargo invocation) and re-asserts the validated identity inline — valid JSON, `schema_version` 1, product name/version, the pinned target block, the release metadata, a non-empty artifact list and a `stage.checksum_file` that is a plain leaf name not colliding with any artifact file, plus a cross-check that the file's `release_channel` equals the channel resolved for the run — so the uploaded manifest is proven valid JSON and consistent with the manifest the pipeline validated |
 
 ## Layout
 
 ```
 packaging/
   windows/
-    build.ps1       # the only entry point
-    manifest.json   # product metadata, target, artifact list, verification strategy
-    test-build.ps1  # self-contained, sandboxed validation tests for build.ps1
-    README.md       # this file
+    build.ps1                 # the staging entry point (build + stage + generate)
+    verify-checksums.ps1      # consumer-side, strictly read-only verification of SHA256SUMS.txt
+    manifest.json             # product metadata, target, artifact list, verification strategy
+    test-build.ps1            # self-contained, sandboxed validation tests for build.ps1
+    test-verify-checksums.ps1 # self-contained, sandboxed validation tests for verify-checksums.ps1
+    README.md                 # this file
 dist/              # build output, git-ignored (not committed)
   windows/
     nextide-cli.exe
@@ -97,7 +101,51 @@ CI's `packaging-windows` job also re-checks the exact `SHA256SUMS.txt` about
 to be uploaded against the actual `dist/windows` contents immediately before
 the dist upload (every staged artifact must have exactly one entry, every
 entry's hash must equal the real file), so the checksum manifest that ships in
-the `nextide-windows-dist-<channel>` artifact is proven correct.
+the `nextide-windows-dist-<channel>` artifact is proven correct. That
+re-check now runs the repository's own consumer-side verifier
+(`verify-checksums.ps1`, see below), so the exact script dist consumers use is
+exercised on every packaging run.
+
+### Consumer verification (`verify-checksums.ps1`)
+
+`verify-checksums.ps1` is the **consumer** counterpart to the generation done
+by `build.ps1`: it verifies a staged release directory against the checksum
+manifest that ships with it — no rebuild, no re-staging, no cargo invocation,
+no external tools. By default it reads `dist/windows/SHA256SUMS.txt` (the
+committed `stage.checksum_file` value); `-DistDir` points it at any extracted
+release directory and `-ChecksumFile` at a custom manifest name, so a
+downloaded artifact can be verified exactly like the staged directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1
+powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir C:\downloads\nextide-dist
+```
+
+The script proves, in order (any failure exits non-zero with a message):
+
+1. the manifest exists and is non-empty;
+2. every line parses as `<64-hex-sha256>  <file>` — exactly 64 hex
+   characters, exactly two spaces (the GNU `sha256sum -c` compatible format
+   `build.ps1` writes), then a plain leaf file name (no path separators, no
+   `.`/`..`); blank lines are ignored and duplicate entries are rejected;
+3. every named file exists in the staging directory;
+4. every named file's actual SHA-256 equals the manifest hash
+   (case-insensitive — `Get-FileHash` prints uppercase, GNU tools lowercase,
+   both accepted);
+5. the directory matches the manifest exactly: every file in the directory
+   (except the checksum manifest itself, which never lists itself) has
+   exactly one entry, and no entry names a file that is absent.
+
+The script is **strictly read-only** — it contains no `Set-Content`,
+`New-Item`, `Copy-Item` or `Remove-Item` anywhere; it only reads the manifest,
+lists the directory and hashes files with the built-in `Get-FileHash` (no
+dependencies, no network). It never executes the files it verifies and never
+touches the registry. `test-verify-checksums.ps1` proves all of this in a
+sandbox (see [Testing](#testing)), including a read-only snapshot assertion
+that a successful run changes nothing in the verified directory. CI's
+`packaging-windows` job runs the same verifier against the exact
+`dist/windows` contents immediately before the dist artifact upload, so the
+consumer path is exercised on every run.
 
 ### Version consistency
 
@@ -273,8 +321,44 @@ switches: `-BuildScript <path>` points at another copy of `build.ps1` under
 test, `-SandboxRoot <dir>` overrides where sandboxes are created, and
 `-KeepSandbox` keeps the sandboxes for inspection instead of deleting them.
 
+`test-verify-checksums.ps1` validates the consumer verifier the same way —
+zero external framework, every case runs `verify-checksums.ps1` in a child
+process against a throwaway sandbox under the sandbox root (default `%TEMP%`),
+never touching the real repository, and the only thing the suite ever deletes
+is its own sandboxes:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-checksums.ps1
+```
+
+Covered scenarios (14 tests):
+
+| Scenario | Expected result |
+| --- | --- |
+| Happy path (correct manifest, two files) | pass |
+| Bad hash (one entry's hash is wrong) | fail |
+| Missing file (entry names an absent file) | fail |
+| Bad format (line not `<hash>  <file>`) | fail |
+| Missing `SHA256SUMS.txt` | fail |
+| Empty `SHA256SUMS.txt` | fail |
+| Entry name with `..` path escape | fail |
+| Entry name with a path separator | fail |
+| Extra file in the directory without an entry | fail |
+| Duplicate entry for the same file | fail |
+| Lowercase hashes (GNU-style) accepted | pass |
+| CRLF line endings accepted | pass |
+| Custom `-ChecksumFile` name honored | pass |
+| Run is strictly read-only (sandbox snapshot unchanged) | pass |
+
+The suite runs under both Windows PowerShell 5.1 and PowerShell 7 and exits
+`0` when every test passes, `1` otherwise. Useful switches:
+`-VerifyScript <path>` points at another copy of `verify-checksums.ps1` under
+test, `-SandboxRoot <dir>` overrides where sandboxes are created, and
+`-KeepSandbox` keeps them for inspection.
+
 Note: the `cargo build --release` *success* path is not exercised by the
-sandboxed suite. Every sandbox does get a minimal root `Cargo.toml` (a
+`test-build.ps1` sandboxed suite above. Every build-suite sandbox does get a
+minimal root `Cargo.toml` (a
 memberless workspace whose `[workspace.package]` version comes from the
 manifest template, so the version-consistency check runs on every test), but
 that workspace has no member crates and can therefore never produce the
@@ -297,14 +381,12 @@ After a successful run, smoke-test the staged binaries from `dist\windows\`:
 Verify the checksum manifest against the staged files:
 
 ```powershell
+# The repository's consumer verifier (strictly read-only; exits non-zero on
+# any failure — line format, file existence and SHA-256 match):
+powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1
+
 # Git Bash / WSL / any GNU coreutils sha256sum:
 cd dist\windows && sha256sum -c SHA256SUMS.txt
-
-# PowerShell (no external tools — parse and compare every line):
-Get-Content SHA256SUMS.txt | ForEach-Object {
-  $h, $f = $_ -split '  ', 2
-  if ((Get-FileHash $f -Algorithm SHA256).Hash -ne $h.ToUpperInvariant()) { throw "hash mismatch: $f" }
-}
 ```
 
 Note: `cargo test --workspace` and `cargo clippy` are **not** part of this
@@ -319,7 +401,10 @@ target, and the release metadata (`license` / `publisher` / `release_channel`)
 duplicated logic. First it runs `test-build.ps1` itself as a
 pre-packaging self-test gate (a failing self-test stops the run before
 anything is built), which proves the script rejects every violation through
-its 26 sandboxed cases. Then it builds the release binaries with
+its 26 sandboxed cases; alongside it a second gate runs
+`test-verify-checksums.ps1`, the sandboxed self-test of the consumer-side
+checksum verifier (14 cases, including a read-only snapshot proof that a
+successful run changes nothing in the verified directory). Then it builds the release binaries with
 `cargo build --release`, invokes this script with `-SkipBuild` to stage and
 verify them under `dist/windows/` — that run re-applies the same read-only
 manifest/version/target/metadata/checksum-file validation to the committed
@@ -333,12 +418,13 @@ dedicated step right after checkout (read-only local parse, no network, same
 run before the self-test gate, the build, and staging). The channel-suffixed
 name guarantees stable and beta runs produce distinct artifacts and can never
 overwrite each other in the Actions artifact store. Immediately before the
-dist upload a dedicated gate re-checks the exact `SHA256SUMS.txt` about to be
-uploaded with PowerShell's built-in `Get-FileHash` (no dependencies, no
-network): the file must parse as `<hash>  <file>` lines, every staged artifact
-must have exactly one entry, and every entry's hash must equal the actual
-SHA-256 of the file in `dist/windows` — so the checksum manifest that ships is
-proven correct, not just present. The same resolved channel
+dist upload a dedicated gate runs the repository's consumer-side verifier
+`verify-checksums.ps1` read-only against the exact `dist/windows` directory
+about to be uploaded (no dependencies, no network): the file must parse as
+`<hash>  <file>` lines, every named file must exist, every entry's hash must
+equal the actual SHA-256 of the file, and the directory must match the
+manifest exactly (no missing, corrupt, extra or duplicate entries) — so the
+checksum manifest that ships is proven correct, not just present. The same resolved channel
 also names a second upload: the committed `packaging/windows/manifest.json`
 is uploaded as a **release-metadata artifact** (`nextide-windows-manifest-
 <channel>`) alongside the binaries — the exact single source of truth the
