@@ -79,14 +79,14 @@ pub struct EventBus {
 impl EventBus {
     /// Queues `event` for its topic and assigns it the next sequence number.
     ///
-    /// The event is delivered both to the topic's legacy pending queue (visible
-    /// to [`EventBus::pending`] / [`EventBus::drain`]), when they next pull, to
-    /// every [`EventSubscriber`] subscribed to the topic, and — independently
-    /// of all consumer paths — to the topic's retained event log, readable via
-    /// [`EventBus::log`] / [`EventBus::events_since`]. If the log has reached
-    /// its [`EventBus::log_capacity`], the oldest retained event for the topic
-    /// is dropped to make room; the pending queue and subscribers are never
-    /// affected by log eviction.
+    /// The event is delivered to the topic's legacy pending queue (visible to
+    /// [`EventBus::pending`] / [`EventBus::drain`]), to every
+    /// [`EventSubscriber`] subscribed to the topic when they next pull, and —
+    /// independently of all consumer paths — to the topic's retained event
+    /// log, readable via [`EventBus::log`] / [`EventBus::events_since`]. When
+    /// a publish would exceed the log's [`EventBus::log_capacity`], the oldest
+    /// retained event for the topic is dropped first; the pending queue and
+    /// subscribers are never affected by log eviction.
     pub fn publish(&mut self, mut event: Event) {
         event.seq = self.next_seq;
         self.next_seq += 1;
