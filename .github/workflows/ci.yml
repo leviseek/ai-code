@@ -33,9 +33,15 @@ jobs:
     # Produce and upload the Windows release artifacts (dist/windows). Runs
     # only after the checks above pass: `needs: ci` makes the run fail fast,
     # so a failing fmt/clippy/test check stops the pipeline before packaging
-    # ever starts. The sandboxed packaging self-test (test-build.ps1) runs
-    # first as a pre-packaging gate — a failing test stops the run before
-    # anything is built or staged. The release binaries are then built here
+    # ever starts. The job explicitly verifies the packaging manifest in all
+    # four required areas — manifest validity, product.version vs the Cargo
+    # workspace version, the target block vs the pinned x86_64-pc-windows-msvc
+    # packaging target, and the release metadata (license / publisher /
+    # release_channel) — twice, with no duplicated logic: first the sandboxed
+    # self-test gate (test-build.ps1, 23 cases) proves build.ps1 rejects every
+    # violation, then build.ps1 -SkipBuild re-runs the same read-only
+    # validation against the committed manifest.json and the real Cargo.toml
+    # before anything is staged. The release binaries are built here
     # (cargo build --release) and the packaging script is invoked with
     # -SkipBuild, which stages and verifies the freshly built artifacts
     # without rebuilding.
@@ -47,17 +53,34 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Self-test packaging baseline (test-build.ps1)
-        # Runs the sandboxed packaging self-tests before anything is built or
-        # staged: every test runs build.ps1 against a throwaway sandbox copy
-        # under $env:TEMP and never touches the repository, so this step gates
-        # the build/stage/upload on the packaging script behaving correctly.
+      - name: Verify manifest / version / target / metadata (test-build.ps1 gate)
+        # Pre-packaging self-test gate: this is the CI job's explicit
+        # verification of the packaging manifest in all four required areas,
+        # exercised through build.ps1's own validation by the sandboxed suite
+        # (23 cases, zero framework):
+        #   - manifest validity:  missing/invalid JSON, schema_version,
+        #                         artifact list, path escapes
+        #   - version:            product.version == Cargo.toml
+        #                         [workspace.package] version
+        #   - target:             os/architecture/triple == pinned
+        #                         x86_64-pc-windows-msvc packaging target
+        #   - release metadata:   license/publisher required, release_channel
+        #                         exactly stable or beta
+        # Every test runs build.ps1 against a throwaway sandbox copy under
+        # $env:TEMP and never touches the repository, so a failing test stops
+        # the run before anything is built or staged.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
 
       - name: Build release binaries
         run: cargo build --release
 
       - name: Stage release artifacts into dist/windows (-SkipBuild)
+        # Re-runs the same read-only manifest verification the self-test gate
+        # covered (manifest validity, version, target, release metadata)
+        # against the committed manifest.json and the real Cargo.toml before
+        # staging anything, then verifies each staged artifact by size and
+        # SHA-256. No rebuild: the release binaries from the step above are
+        # staged as-is.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -SkipBuild
 
       - name: Upload dist/windows artifact
