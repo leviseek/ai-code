@@ -29,7 +29,10 @@
 //! configures it; the default is finite); when a publish would exceed the
 //! capacity the *oldest* retained events are dropped first, and
 //! [`EventBus::log_start`] reports the oldest retained sequence number so a
-//! cursor reader can detect that eviction happened.
+//! cursor reader can detect that eviction happened; [`EventBus::log_gap`]
+//! answers the same question in one call — the sequence-number distance
+//! between a cursor and the retained head, with `0` meaning the cursor is
+//! still inside the retained window.
 //!
 //! A subscriber is a plain owned value — it holds no reference into the bus,
 //! so there are no lifetimes to manage, no shared state between subscribers,
@@ -167,7 +170,8 @@ impl EventBus {
     /// bus. If the log's oldest retained event has a `seq` greater than
     /// `cursor`, events between the cursor and the log were evicted by
     /// [`EventBus::log_capacity`]; [`EventBus::log_start`] reports the oldest
-    /// retained sequence number so such gaps are detectable.
+    /// retained sequence number so such gaps are detectable, and
+    /// [`EventBus::log_gap`] reports the gap's size in one call.
     pub fn events_since(&self, seq: u64, topic: impl Into<String>) -> Vec<Event> {
         let topic = topic.into();
         self.logs
@@ -191,12 +195,33 @@ impl EventBus {
     ///
     /// A cursor reader can compare this with its cursor: a `log_start` greater
     /// than the cursor means events between the two were evicted by the log's
-    /// capacity.
+    /// capacity. [`EventBus::log_gap`] performs that comparison and returns
+    /// the distance in one call.
     pub fn log_start(&self, topic: &str) -> Option<u64> {
         self.logs
             .get(topic)
             .and_then(|log| log.front())
             .map(|event| event.seq)
+    }
+
+    /// The sequence-number gap between `cursor` and `topic`'s oldest retained
+    /// event — how far the log's eviction has aged past a cursor, in one call.
+    ///
+    /// Returns `Some(log_start - cursor)` when the topic's log is non-empty:
+    /// `Some(0)` means the cursor is still inside the retained window
+    /// (nothing was evicted since the cursor — an `events_since` read starting
+    /// at this cursor is complete), while `Some(gap)` with `gap > 0` means the
+    /// events between the cursor and the retained head were evicted by
+    /// [`EventBus::log_capacity`] (such a read is incomplete). Because `seq`
+    /// numbers are bus-wide, the gap counts *every* event published between
+    /// the cursor and the retained head across all topics, not only this
+    /// topic's; for a single-topic stream it is exactly the number of evicted
+    /// events. Returns `None` when the topic's log is empty — matching
+    /// [`EventBus::log_start`] — so an empty log is distinguishable from a
+    /// cursor that is still inside the window.
+    pub fn log_gap(&self, cursor: u64, topic: &str) -> Option<u64> {
+        self.log_start(topic)
+            .map(|start| start.saturating_sub(cursor))
     }
 
     /// Creates a per-subscriber subscription to `topic`.
@@ -590,6 +615,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn log_gap_reports_eviction_between_cursor_and_retained_head() {
+        let mut bus = EventBus::with_log_capacity(3);
+        for revision in 0..5 {
+            bus.publish(Event::new(
+                "document.changed",
+                format!("revision={revision}"),
+            ));
+        }
+        // Capacity 3 after 5 publishes retains seqs [2, 3, 4].
+        assert_eq!(bus.log_start("document.changed"), Some(2));
+        // A cursor before the retained head has a gap of log_start - cursor.
+        assert_eq!(bus.log_gap(0, "document.changed"), Some(2));
+        assert_eq!(bus.log_gap(1, "document.changed"), Some(1));
+        // Cursors at the retained head or beyond see no gap.
+        assert_eq!(bus.log_gap(2, "document.changed"), Some(0));
+        assert_eq!(bus.log_gap(3, "document.changed"), Some(0));
+        assert_eq!(bus.log_gap(100, "document.changed"), Some(0));
+        // The gap is stable across reads and never consumes anything.
+        assert_eq!(bus.log_gap(0, "document.changed"), Some(2));
+        assert_eq!(bus.pending("document.changed"), 5);
+        assert_eq!(bus.log_len("document.changed"), 3);
+    }
+
+    #[test]
+    fn log_gap_is_none_for_an_empty_or_disabled_log() {
+        let mut bus = EventBus::with_log_capacity(0);
+        bus.publish(Event::new("document.changed", "revision=1"));
+        // Capacity 0 retains nothing, so there is no retained head to measure
+        // the gap against — indistinguishable from never having published.
+        assert_eq!(bus.log_start("document.changed"), None);
+        assert_eq!(bus.log_gap(0, "document.changed"), None);
+        // Unknown topics behave identically.
+        assert_eq!(bus.log_start("document.saved"), None);
+        assert_eq!(bus.log_gap(0, "document.saved"), None);
+    }
+
+    #[test]
+    fn log_gap_counts_bus_wide_seqs_across_interleaved_topics() {
+        let mut bus = EventBus::with_log_capacity(2);
+        // Interleave two topics so the bus-wide seq stream mixes them:
+        // document.changed gets seqs 0, 2, 4 and document.saved gets 1, 3.
+        bus.publish(Event::new("document.changed", "a=1"));
+        bus.publish(Event::new("document.saved", "s=1"));
+        bus.publish(Event::new("document.changed", "a=2"));
+        bus.publish(Event::new("document.saved", "s=2"));
+        bus.publish(Event::new("document.changed", "a=3"));
+        // document.changed retains [2, 4]; document.saved retains [1, 3].
+        assert_eq!(bus.log_start("document.changed"), Some(2));
+        assert_eq!(bus.log_start("document.saved"), Some(1));
+        // The gap is measured in bus-wide seqs: [0, 2) spans both topics'
+        // events, so log_gap(0) for document.changed is 2 even though only
+        // one document.changed event (seq 0) was evicted.
+        assert_eq!(bus.log_gap(0, "document.changed"), Some(2));
+        assert_eq!(bus.log_gap(0, "document.saved"), Some(1));
+        // Cursors inside each retained window have no gap.
+        assert_eq!(bus.log_gap(2, "document.changed"), Some(0));
+        assert_eq!(bus.log_gap(3, "document.saved"), Some(0));
     }
 
     #[test]
