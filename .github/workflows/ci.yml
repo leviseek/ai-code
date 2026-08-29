@@ -372,7 +372,8 @@ jobs:
       - name: Verify release job simulation (test-release-sim.ps1 gate)
         # Pre-publish self-test gate for this job's own rules, run in a
         # sandbox before anything is downloaded or published. The zero-framework
-        # suite (26 cases) proves, in two parts, exactly what this job gates:
+        # suite (26 cases) proves, in its three gate rule sets, exactly what
+        # this job gates:
         #   - tag/version rejection rules (the "Resolve release metadata from
         #     manifest (channel + version + checksum file vs tag)" logic):
         #     channel must be exactly stable or beta, product.version must be

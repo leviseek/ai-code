@@ -83,9 +83,9 @@
      21.  release-metadata manifest not byte-identical to the committed one fails
      22.  zero-byte CLI binary fails (smoke-gate simulation)
      23.  renamed stage.checksum_file is honored by the checklist (byte-identity still enforced)
-     24.  self-audit: no network or release-creation commands in the source
-     25.  publish attachment list uses the resolved checksum file name (never hardcoded)
-     26.  renamed stage.checksum_file flows through resolve -> verify -> checklist -> attachment list
+     24.  publish attachment list uses the resolved checksum file name (never hardcoded)
+     25.  renamed stage.checksum_file flows through resolve -> verify -> checklist -> attachment list
+     26.  self-audit: no network or release-creation commands in the source
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -990,7 +990,7 @@ Invoke-Test -Name 'release checklist: renamed stage.checksum_file is honored (by
     }
 }
 
-# 25. The publish step's attachment list is built from the resolved
+# 24. The publish step's attachment list is built from the resolved
 #     stage.checksum_file — never a hardcoded default. The list mirrors the
 #     exact four file paths the workflow hands to the GitHub CLI, with the
 #     checksum entry named by the manifest; a renamed declaration changes the
@@ -1026,7 +1026,7 @@ Invoke-Test -Name 'release publish: attachment list uses the resolved checksum f
     }
 }
 
-# 26. A renamed stage.checksum_file in the committed-style manifest flows
+# 25. A renamed stage.checksum_file in the committed-style manifest flows
 #     through the whole simulated publish chain coherently: the resolve step
 #     returns the declared name, the dist is staged under it, the checklist
 #     (with the sandbox manifest as its byte-identity golden) passes in full,
@@ -1093,7 +1093,7 @@ Invoke-Test -Name 'release publish: renamed stage.checksum_file flows through re
 # Part 3 — self-audit.
 # ---------------------------------------------------------------------------
 
-# 24. The script's own source must not contain any network or release-creation
+# 26. The script's own source must not contain any network or release-creation
 #     command invocation: this suite can never touch the network and can never
 #     create a GitHub Release, by construction. The only child process it ever
 #     launches is the repository's consumer-side verifier against sandbox
