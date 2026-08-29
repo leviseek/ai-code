@@ -19,6 +19,7 @@ install anything.
 | Self-tests for the checksum verifier | Done — `test-verify-checksums.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
+| CI release job (publish artifacts to GitHub Release) | Done — `.github/workflows/ci.yml` `release` job: on version-tag pushes (`refs/tags/v*`) only, downloads the `packaging-windows` job's channel-suffixed dist + manifest artifacts, re-verifies the downloaded dist with the consumer-side `verify-checksums.ps1` and smoke-tests the downloaded CLI, proves the downloaded manifest is byte-identical to the committed one, asserts the tag is exactly `v<product.version>`, and publishes a GitHub Release with both binaries, `SHA256SUMS.txt` and `manifest.json` attached (see [Verify](#verify)) |
 | CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata — plus the checksum file name) — first via the sandboxed `test-build.ps1` self-test gate (26 cases) and the consumer-side checksum verifier self-test `test-verify-checksums.ps1` (14 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows` (including the generated `SHA256SUMS.txt` checksum manifest, which `build.ps1` writes from the verified staged hashes and re-verifies on the spot), and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact. Immediately before the dist upload a dedicated gate runs the repository's consumer-side verifier `verify-checksums.ps1` read-only against the exact `dist/windows` directory about to be uploaded (no dependencies, no network) — every line must parse as `<hash>  <file>`, every named file must exist, every entry's hash must equal the actual file, and the directory must match the manifest exactly — so the checksum manifest that ships is proven correct, not just present. The same resolved channel names a second upload: the committed `packaging/windows/manifest.json` is uploaded as a **channel-suffixed release-metadata artifact** (`nextide-windows-manifest-<channel>`) alongside the binaries, so the validated product identity, pinned target, release metadata (license / publisher / release_channel) and artifact list that produced this release travel with it for later release/publish steps. Immediately before that manifest upload a lightweight gate re-reads the exact file about to be uploaded with PowerShell's built-in `ConvertFrom-Json` (no dependencies, no network, no cargo invocation) and re-asserts the validated identity inline — valid JSON, `schema_version` 1, product name/version, the pinned target block, the release metadata, a non-empty artifact list and a `stage.checksum_file` that is a plain leaf name not colliding with any artifact file, plus a cross-check that the file's `release_channel` equals the channel resolved for the run — so the uploaded manifest is proven valid JSON and consistent with the manifest the pipeline validated |
 
 ## Layout
@@ -455,3 +456,32 @@ artifact name). No dependencies and no network — the step only reads the
 committed file. That
 job is what exercises the real-repository `cargo build --release` success path
 end to end on CI.
+
+A third `release` job completes the chain on version-tag pushes (`refs/tags/v*`)
+only (it never runs for branches or pull requests, and it runs only after
+`packaging-windows`, via `needs:`). It downloads the same run's
+`nextide-windows-dist-<channel>` and `nextide-windows-manifest-<channel>`
+artifacts and, with no rebuild, no re-staging and no recomputed checksums:
+
+1. asserts the pushed tag is exactly `v<product.version>` from the committed
+   manifest (read-only `ConvertFrom-Json`, same `stable`/`beta` rule) — the
+   final consistency link of the chain, since `product.version` was already
+   proven equal to the `[workspace.package]` Cargo version by `build.ps1`;
+2. proves the downloaded `manifest.json` is byte-identical to the committed
+   manifest the pipeline validated (SHA-256 compare);
+3. re-verifies the downloaded `dist/windows` with the repository's
+   consumer-side verifier `verify-checksums.ps1 -DistDir dist\windows` — the
+   exact consumer path — so the bytes about to be published match their
+   `SHA256SUMS.txt` exactly;
+4. smoke-tests the downloaded `nextide-cli.exe` (`smoke`, panics on failure);
+5. publishes the GitHub Release with `gh release create` (preinstalled on the
+   runner), attaching `nextide-cli.exe`, `nextide-shell.exe`,
+   `SHA256SUMS.txt` and `manifest.json`, with notes naming the
+   version/channel and the checksum verification commands. A release for an
+   existing tag fails loudly (no silent overwrite). The job's token is
+   scoped to `contents: write` (create the release) + `actions: read`
+   (download the artifacts) only.
+
+To publish a release: push a `v<version>` tag matching the manifest version —
+`git tag v0.1.0 && git push origin v0.1.0` — which triggers the full pipeline
+(ci checks → packaging → release).

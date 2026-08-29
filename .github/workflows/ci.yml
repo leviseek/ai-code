@@ -143,7 +143,11 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-checksums.ps1
 
       - name: Build release binaries
-        run: cargo build --release
+        # --locked: the workspace's Cargo.lock is committed and is the exact
+        # dependency graph the release was tested against; the release build
+        # must use it (a stale/out-of-date lockfile fails the build loudly
+        # instead of silently regenerating it mid-release).
+        run: cargo build --release --locked
 
       - name: Stage release artifacts into dist/windows (-SkipBuild)
         # Re-runs the same read-only manifest verification the self-test gate
@@ -307,3 +311,189 @@ jobs:
           name: nextide-windows-manifest-${{ steps.release-channel.outputs.release_channel }}
           path: packaging/windows/manifest.json
           if-no-files-found: error
+
+  release:
+    # Publish the packaged Windows artifacts to a GitHub Release. This is the
+    # terminal step of the release chain: `ci` proves fmt/clippy/test,
+    # `packaging-windows` builds, stages, verifies and uploads the dist and
+    # manifest artifacts, and this job — on a version-tag push only — turns
+    # those verified artifacts into an actual GitHub Release. It never
+    # rebuilds, never re-stages and never recomputes any checksum: it
+    # consumes the artifacts the packaging job uploaded for this exact run
+    # and re-verifies them with the repository's own consumer-side verifier
+    # (packaging/windows/verify-checksums.ps1 — the same script dist
+    # consumers use), so the files attached to the release are proven
+    # byte-for-byte consistent with the checksum manifest that ships with
+    # them. Tag/version consistency is enforced here as the final link of
+    # the chain: the pushed tag must be `v<semver>` (e.g. `v0.1.0`) and its
+    # version must equal `product.version` in the committed manifest, which
+    # the packaging job already proved equals the [workspace.package] version
+    # in the root Cargo.toml — so the release is always tagged with exactly
+    # the version the artifacts claim.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: packaging-windows
+    runs-on: windows-latest
+    permissions:
+      # Job-scoped least privilege: creating the GitHub Release needs
+      # contents: write; downloading this run's workflow artifacts needs
+      # actions: read. Nothing else is granted to this job's token.
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release metadata from manifest (channel + version vs tag)
+        # Read the committed packaging/windows/manifest.json (read-only local
+        # parse, no network, no cargo invocation — same source and same
+        # stable/beta rule the packaging job's resolve step and build.ps1
+        # enforce) and assert the final consistency link: the pushed tag must
+        # be exactly `v<product.version>` (v-prefixed semver), so the release
+        # is created under the tag that names the artifacts' validated
+        # version. The resolved channel and version are exposed as step
+        # outputs so the artifact downloads and the release notes below can
+        # consume them. Any mismatch — a non-v tag, a malformed version, or a
+        # tag that disagrees with the manifest — fails the run before
+        # anything is downloaded or published.
+        id: release-meta
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ManifestPath = 'packaging/windows/manifest.json'
+          if (-not (Test-Path -LiteralPath $ManifestPath)) {
+            throw "Missing manifest: $ManifestPath"
+          }
+          try {
+            $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+          }
+          catch {
+            throw "Manifest is not valid JSON: $($_.Exception.Message)"
+          }
+          $Channel = [string]$Manifest.release.release_channel
+          if ($Channel -ne 'stable' -and $Channel -ne 'beta') {
+            throw "Manifest release.release_channel must be exactly 'stable' or 'beta', got: '$Channel'"
+          }
+          $Version = [string]$Manifest.product.version
+          if ([string]::IsNullOrWhiteSpace($Version)) {
+            throw 'Manifest product.version is missing or blank'
+          }
+          $Tag = $env:REF_NAME
+          if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0)"
+          }
+          if ($Tag.Substring(1) -ne $Version) {
+            throw "Release tag '$Tag' does not match manifest product.version '$Version' (tag must be v<product.version>)"
+          }
+          Write-Host "release: channel=$Channel version=$Version tag=$Tag"
+          "channel=$Channel"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$Version"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Download dist/windows artifact (channel-suffixed)
+        # Download the exact staged directory the packaging job verified and
+        # uploaded for this run (nextide-windows-dist-<channel>). The
+        # channel-suffixed name guarantees this job consumes the artifact of
+        # this run's channel — stable and beta runs can never cross-consume.
+        uses: actions/download-artifact@v4
+        with:
+          name: nextide-windows-dist-${{ steps.release-meta.outputs.channel }}
+          path: dist/windows
+
+      - name: Download manifest.json release-metadata artifact (channel-suffixed)
+        # Download the exact validated release metadata the packaging job
+        # uploaded (nextide-windows-manifest-<channel>) — the artifact to be
+        # attached to the release, so the release carries the precise identity
+        # (product, target, release metadata, artifact list) the pipeline
+        # validated, never re-derived in this job.
+        uses: actions/download-artifact@v4
+        with:
+          name: nextide-windows-manifest-${{ steps.release-meta.outputs.channel }}
+          path: release-metadata
+
+      - name: Verify downloaded manifest matches the committed manifest
+        # Prove the release-metadata artifact is byte-identical to the
+        # committed packaging/windows/manifest.json the whole pipeline
+        # validated: the metadata attached to the release is exactly the
+        # single source of truth that was checked, not a look-alike. A
+        # tampered or mismatched upload fails the run before publishing.
+        shell: pwsh
+        run: |
+          $Committed = (Get-FileHash -LiteralPath 'packaging/windows/manifest.json' -Algorithm SHA256).Hash
+          $Downloaded = Get-ChildItem -LiteralPath 'release-metadata' -Filter 'manifest.json' -File
+          if ($null -eq $Downloaded) {
+            throw 'Downloaded release-metadata artifact contains no manifest.json'
+          }
+          $Actual = (Get-FileHash -LiteralPath $Downloaded.FullName -Algorithm SHA256).Hash
+          if ($Committed -ne $Actual) {
+            throw "Downloaded manifest does not match the committed manifest (committed $Committed, downloaded $Actual)"
+          }
+          Write-Host "manifest.json verified: downloaded artifact is byte-identical to the committed manifest"
+
+      - name: Verify SHA256SUMS.txt of downloaded dist (consumer path)
+        # Re-verify the downloaded artifact with the repository's consumer-side
+        # verifier — the exact script dist consumers use — read-only against
+        # the exact files about to be published (no dependencies, no network).
+        # This is the same verification the packaging job ran before upload,
+        # re-run here on the downloaded bytes, so the release can never attach
+        # a dist whose checksum manifest does not match its own files.
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir dist\windows
+
+      - name: Smoke-test the downloaded CLI artifact
+        # End-to-end proof that the exact binary being published runs: execute
+        # the downloaded release executable's editor-kernel smoke flow (apply
+        # an edit, undo, redo, assert the document text) directly from
+        # dist/windows. The CLI panics on any failure, so a non-zero exit
+        # fails the run before the release is created. The headless shell is
+        # not executed here (it starts an event loop and would block the
+        # runner), matching the packaging job's smoke step.
+        run: .\dist\windows\nextide-cli.exe smoke
+
+      - name: Publish GitHub Release
+        # Create the GitHub Release for the pushed tag with the verified
+        # artifacts attached: both release binaries, the SHA256SUMS.txt
+        # checksum manifest that proves them, and the validated
+        # manifest.json release metadata. gh is preinstalled on the runner;
+        # the release is created under the tag pushed (v<product.version>,
+        # asserted above) targeting the tagged commit. If a release for this
+        # tag already exists, gh fails with a non-zero exit and the job fails
+        # — a release is never silently overwritten. The notes state the
+        # version/channel and point consumers at the checksum manifest, which
+        # can be verified with `sha256sum -c SHA256SUMS.txt` or
+        # verify-checksums.ps1.
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHANNEL: ${{ steps.release-meta.outputs.channel }}
+          VERSION: ${{ steps.release-meta.outputs.version }}
+        run: |
+          $T = [char]96  # backtick, for markdown code spans in the notes
+          $Notes = @"
+          ## NextIDE $env:VERSION ($env:CHANNEL)
+
+          Windows x86_64 release binaries (pinned target x86_64-pc-windows-msvc), built with
+          cargo build --release --locked and staged/verified by packaging/windows/build.ps1 from
+          the committed packaging/windows/manifest.json. Every binary is covered by the
+          SHA256SUMS.txt checksum manifest attached below (GNU sha256sum -c compatible).
+
+          **Artifacts**
+
+          - nextide-cli.exe — NextIDE command-line interface (usage/help and the editor-kernel smoke flow)
+          - nextide-shell.exe — NextIDE headless desktop shell bootstrap (command registry, Git status/diff model layer)
+          - SHA256SUMS.txt — SHA-256 checksum manifest (one '<hash>  <file>' line per binary)
+          - manifest.json — validated release metadata (license / publisher / release_channel / artifact list)
+
+          **Verify**
+
+          - ${T}sha256sum -c SHA256SUMS.txt${T} (GNU/coreutils) or
+          - ${T}powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir <dir>${T}
+          "@
+          $NotesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $NotesFile -Value $Notes -Encoding utf8
+          gh release create "$env:GITHUB_REF_NAME" `
+            'dist/windows/nextide-cli.exe' `
+            'dist/windows/nextide-shell.exe' `
+            'dist/windows/SHA256SUMS.txt' `
+            'release-metadata/manifest.json' `
+            --title "NextIDE $env:VERSION ($env:CHANNEL)" `
+            --notes-file $NotesFile
