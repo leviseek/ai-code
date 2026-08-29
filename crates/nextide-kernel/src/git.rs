@@ -124,6 +124,39 @@
 //! stderr, or from stdout when stderr is empty, because `git commit` prints
 //! some failures (such as "nothing to commit") on stdout.
 //!
+//! # History query
+//!
+//! [`log(root, limit)`](log) lists the repository's commit history with
+//! `git -C <root> log --format=%H%x00%P%x00%an%x00%aI%x00%s --date=iso-strict`:
+//! no shell, and the fields of every record are separated by NUL bytes
+//! (`%x00`, so neither a field nor a record terminator can collide with the
+//! data) with records terminated by newlines — git's own machine-oriented
+//! format atoms, never a human-format line. Each [`GitCommitEntry`] carries
+//! the full `hash`, its `parents` (empty for a root commit, one hash per
+//! parent for a merge), the `author` name, the author `date` in strict ISO
+//! 8601 (for example `2026-08-29T13:57:43+08:00`), and the `subject`. The
+//! [`GitLogSnapshot`] keeps git's own output order — newest commit first, git
+//! log's default reverse-chronological order — and is never re-sorted, so the
+//! order is deterministic for a given repository.
+//!
+//! `limit` caps the snapshot: `Some(n)` also limits the query itself with
+//! `--max-count=n` (a count beyond git's signed limit is not passed to git;
+//! the parsed snapshot is truncated regardless), `Some(0)` short-circuits to
+//! an empty snapshot without spawning git, and `None` returns the whole
+//! history.
+//!
+//! Parsed output is validated before it is trusted: the output must be valid
+//! UTF-8, every record must have exactly the five fields (hash, parents,
+//! author, date, subject) with a non-empty author and date, and every hash —
+//! the commit's own and each parent's — must be non-empty hexadecimal;
+//! anything else is [`io::ErrorKind::InvalidData`]. A subject may be empty
+//! (an `--allow-empty-message` commit). Error behaviour matches [`status`]: a
+//! missing `root` or `git` is [`io::ErrorKind::NotFound`], a non-directory
+//! `root` is [`io::ErrorKind::NotADirectory`], and a non-zero git exit is
+//! [`io::ErrorKind::Other`] with git's message — a repository without any
+//! commits makes `git log` itself fail ("your current branch ... does not
+//! have any commits yet").
+//!
 //! # Branches and checkout
 //!
 //! [`branches(root)`](branches) lists the repository's local branches with
@@ -1339,6 +1372,199 @@ fn check_stage_path(path: &Path) -> io::Result<()> {
 /// Validates a caller-supplied unstage path: see [`check_index_path`].
 fn check_unstage_path(path: &Path) -> io::Result<()> {
     check_index_path(path, "unstage path")
+}
+
+// ---------------------------------------------------------------------------
+// Git history query
+// ---------------------------------------------------------------------------
+
+/// One commit of the repository's history, as parsed from `git log`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitEntry {
+    /// The commit's full object id (40 hex digits for SHA-1 repositories, 64
+    /// for SHA-256).
+    pub hash: String,
+    /// The parent hashes in git's order: empty for a root commit, one hash
+    /// per parent for a merge commit.
+    pub parents: Vec<String>,
+    /// The author name.
+    pub author: String,
+    /// The author date in strict ISO 8601 format (git's `%aI`), for example
+    /// `2026-08-29T13:57:43+08:00`.
+    pub date: String,
+    /// The commit subject as git defines it (`%s`): the first paragraph of
+    /// the message, with line breaks collapsed to spaces. May be empty for an
+    /// `--allow-empty-message` commit.
+    pub subject: String,
+}
+
+/// The parsed result of [`log`]: the repository's commit history in git's own
+/// output order — newest commit first (git log's default reverse-chronological
+/// order) — never re-sorted.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GitLogSnapshot {
+    /// The entries in git's output order. An empty vec means the query
+    /// returned no commits (only possible with a zero `limit`, since git
+    /// itself fails on a repository without any commits).
+    pub entries: Vec<GitCommitEntry>,
+}
+
+impl GitLogSnapshot {
+    /// The number of commits in the snapshot.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the snapshot has no commits.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Lists the repository's commit history and returns the typed snapshot.
+///
+/// Runs `git -C <root> log --format=%H%x00%P%x00%an%x00%aI%x00%s
+/// --date=iso-strict`: no shell, and the root is a single argument. Every
+/// commit becomes one NUL-separated record of hash, parents, author, date and
+/// subject, so no human-format parsing is involved. Entries keep git's output
+/// order (newest commit first) and are never re-sorted.
+///
+/// `limit` caps the returned snapshot: `Some(n)` also limits the query itself
+/// with `--max-count=n` (a count above git's signed limit is not passed to
+/// git), `Some(0)` returns an empty snapshot without spawning git, and `None`
+/// returns the whole history.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::Other`] if `git` exits non-zero (for example `root` is
+///   not inside a Git repository, or the repository has no commits yet); git's
+///   message is included.
+/// - [`io::ErrorKind::InvalidData`] if git's output is not valid UTF-8 or
+///   cannot be parsed (a record with missing or extra fields, a non-empty
+///   non-hexadecimal hash or parent, or an empty author or date).
+pub fn log(root: &Path, limit: Option<usize>) -> io::Result<GitLogSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    if limit == Some(0) {
+        return Ok(GitLogSnapshot::default());
+    }
+    run_log("git", root, limit)
+}
+
+/// Runs `program -C root log --format=... --date=iso-strict` with an optional
+/// `--max-count`; split out so tests can exercise the spawn-failure path with
+/// a program that does not exist.
+fn run_log(program: &str, root: &Path, limit: Option<usize>) -> io::Result<GitLogSnapshot> {
+    let mut command = Command::new(program);
+    command.arg("-C").arg(root).arg("log");
+    // git's --max-count is a signed int; anything beyond it is effectively
+    // unbounded, so the count is simply not passed and the parsed snapshot is
+    // truncated to `limit` below.
+    if let Some(count) = limit.filter(|&count| count <= i32::MAX as usize) {
+        command.arg(format!("--max-count={count}"));
+    }
+    command.args(["--format=%H%x00%P%x00%an%x00%aI%x00%s", "--date=iso-strict"]);
+    let output = command.output()?;
+    ensure_git_success(&output, "log")?;
+    let mut snapshot = parse_log_bytes(output.stdout)?;
+    if let Some(count) = limit {
+        snapshot.entries.truncate(count);
+    }
+    Ok(snapshot)
+}
+
+/// Converts `git log` stdout to UTF-8 and parses it; split out so the
+/// non-UTF-8 path is testable without spawning git.
+fn parse_log_bytes(stdout: Vec<u8>) -> io::Result<GitLogSnapshot> {
+    let stdout = String::from_utf8(stdout).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git log output is not valid UTF-8",
+        )
+    })?;
+    parse_log(&stdout)
+}
+
+/// Parses `hash\0parents\0author\0date\0subject` lines into a snapshot,
+/// preserving git's output order.
+fn parse_log(output: &str) -> io::Result<GitLogSnapshot> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        // Defensive CRLF tolerance; git itself always emits `\n`.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        entries.push(parse_log_line(line)?);
+    }
+    Ok(GitLogSnapshot { entries })
+}
+
+/// Parses one NUL-separated log record into a [`GitCommitEntry`].
+fn parse_log_line(line: &str) -> io::Result<GitCommitEntry> {
+    let mut fields = line.split('\0');
+    let hash = fields
+        .next()
+        .ok_or_else(|| malformed("log record missing hash"))?;
+    let parents = fields
+        .next()
+        .ok_or_else(|| malformed("log record missing parents"))?;
+    let author = fields
+        .next()
+        .ok_or_else(|| malformed("log record missing author"))?;
+    let date = fields
+        .next()
+        .ok_or_else(|| malformed("log record missing date"))?;
+    let subject = fields
+        .next()
+        .ok_or_else(|| malformed("log record missing subject"))?;
+    if fields.next().is_some() {
+        return Err(malformed("log record has more than five fields"));
+    }
+    check_hash(hash, "commit hash")?;
+    let parents = parse_parents(parents)?;
+    if author.is_empty() {
+        return Err(malformed("log record has an empty author"));
+    }
+    if date.is_empty() {
+        return Err(malformed("log record has an empty date"));
+    }
+    Ok(GitCommitEntry {
+        hash: hash.to_string(),
+        parents,
+        author: author.to_string(),
+        date: date.to_string(),
+        subject: subject.to_string(),
+    })
+}
+
+/// Parses the `%P` field of a log record: space-separated parent hashes,
+/// empty for a root commit.
+fn parse_parents(field: &str) -> io::Result<Vec<String>> {
+    if field.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut parents = Vec::new();
+    for parent in field.split(' ') {
+        check_hash(parent, "parent hash")?;
+        parents.push(parent.to_string());
+    }
+    Ok(parents)
+}
+
+/// Rejects empty or non-hexadecimal hashes from git's output. `what` names
+/// the hash in error messages.
+fn check_hash(hash: &str, what: &str) -> io::Result<()> {
+    if hash.is_empty() || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(malformed(&format!("{what} is not hexadecimal")));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5219,6 +5445,453 @@ mod tests {
             return;
         }
         let error = stash_pop(&root, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- log parsing ----
+
+    const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn parses_log_record_with_root_commit() {
+        let entry = parse_log_line(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\0Alice\x002024-01-02T03:04:05+00:00\0first commit",
+        )
+        .unwrap();
+        assert_eq!(entry.hash, HASH);
+        assert!(entry.parents.is_empty());
+        assert_eq!(entry.author, "Alice");
+        assert_eq!(entry.date, "2024-01-02T03:04:05+00:00");
+        assert_eq!(entry.subject, "first commit");
+    }
+
+    #[test]
+    fn parses_log_record_with_parents_and_empty_subject() {
+        let entry = parse_log_line(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccc\0Bob\x002026-08-29T13:57:43+08:00\0",
+        )
+        .unwrap();
+        assert_eq!(
+            entry.parents,
+            [
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "cccccccccccccccccccccccccccccccccccccccc",
+            ]
+        );
+        assert_eq!(entry.subject, "");
+    }
+
+    #[test]
+    fn parses_log_records_in_output_order() {
+        let output = "1111111111111111111111111111111111111111\0\0Alice\x002026-08-29T13:57:43+08:00\0second\n\
+                      2222222222222222222222222222222222222222\0\0Bob\x002026-08-28T13:57:43+08:00\0first\n";
+        let snapshot = parse_log(output).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert!(!snapshot.is_empty());
+        // git's output order is preserved verbatim — never re-sorted.
+        assert_eq!(
+            snapshot.entries[0].hash,
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(snapshot.entries[0].author, "Alice");
+        assert_eq!(snapshot.entries[0].date, "2026-08-29T13:57:43+08:00");
+        assert_eq!(snapshot.entries[0].subject, "second");
+        assert_eq!(snapshot.entries[1].subject, "first");
+    }
+
+    #[test]
+    fn parses_merge_commit_parents_and_special_subject() {
+        let entry = parse_log_line(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccc\0Alice Example\x002024-01-02T03:04:05+00:00\0Merge \"quoted\" 中文: done",
+        )
+        .unwrap();
+        assert_eq!(entry.parents.len(), 2);
+        assert_eq!(entry.parents[0], "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(entry.parents[1], "cccccccccccccccccccccccccccccccccccccccc");
+        assert_eq!(entry.author, "Alice Example");
+        assert_eq!(entry.subject, "Merge \"quoted\" 中文: done");
+    }
+
+    #[test]
+    fn parses_log_with_crlf_line_endings() {
+        let output = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\0Alice\x002024-01-02T03:04:05+00:00\0subject\r\n";
+        let snapshot = parse_log(output).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.entries[0].subject, "subject");
+    }
+
+    #[test]
+    fn rejects_malformed_log_records() {
+        for line in [
+            "",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\0Alice\0date",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\0Alice\0date\0subject\0extra",
+            "not-hex\0\0Alice\0date\0subject",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0not-hex\0Alice\0date\0subject",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\0\0date\0subject",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\0Alice\0\0subject",
+        ] {
+            let error = parse_log_line(line).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "line {line:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_utf8_log_output() {
+        let error = parse_log_bytes(vec![b'a', b'0', 0xff]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ---- log() root and limit handling (no git binary needed) ----
+
+    #[test]
+    fn log_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-git-log-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            log(&missing, None).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn log_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-git-log-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            log(&file, None).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn log_zero_limit_short_circuits_without_git() {
+        // git is never spawned for a zero limit: any directory works, even a
+        // non-repository.
+        let root = temp_dir("logzero");
+        let snapshot = log(&root, Some(0)).unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.len(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_missing_git_binary_surfaces_as_not_found() {
+        let root = temp_dir("lognobinary");
+        let error = run_log("nextide-no-such-git-binary", &root, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- log() integration (requires a git binary) ----
+
+    /// Reads a full revision hash from git, trimmed.
+    fn head_rev(root: &Path, revision: &str) -> String {
+        let output = run_git_capture("git", root, &["rev-parse", revision]).unwrap();
+        String::from_utf8(output).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn log_returns_history_newest_first_with_parsed_fields() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("loghistory", &[("a.txt", "a")]);
+        fs::write(root.join("a.txt"), "b").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "second commit",
+                "--author=Alice <alice@example.com>",
+                "--date=2024-01-02T03:04:05+08:00",
+            ],
+        );
+        fs::write(root.join("a.txt"), "c").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "third commit",
+                "--author=Bob <bob@example.com>",
+                "--date=2024-02-03T04:05:06+08:00",
+            ],
+        );
+
+        let head = head_rev(&root, "HEAD");
+        let second = head_rev(&root, "HEAD~1");
+        let init = head_rev(&root, "HEAD~2");
+
+        let snapshot = log(&root, None).unwrap();
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot.entries[0].hash, head);
+        assert_eq!(snapshot.entries[0].author, "Bob");
+        assert_eq!(snapshot.entries[0].date, "2024-02-03T04:05:06+08:00");
+        assert_eq!(snapshot.entries[0].subject, "third commit");
+        assert_eq!(snapshot.entries[1].hash, second);
+        assert_eq!(snapshot.entries[1].author, "Alice");
+        assert_eq!(snapshot.entries[1].date, "2024-01-02T03:04:05+08:00");
+        assert_eq!(snapshot.entries[1].subject, "second commit");
+        assert_eq!(snapshot.entries[2].hash, init);
+        assert_eq!(snapshot.entries[2].author, "nextide-tests");
+        assert_eq!(snapshot.entries[2].subject, "init");
+        assert!(snapshot.entries[2].parents.is_empty());
+        // The order is git's own: newest commit first.
+        let subjects: Vec<&str> = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.subject.as_str())
+            .collect();
+        assert_eq!(subjects, ["third commit", "second commit", "init"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_respects_limit() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("loglimit", &[("a.txt", "a")]);
+        fs::write(root.join("a.txt"), "b").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "second"],
+        );
+        fs::write(root.join("a.txt"), "c").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "third"],
+        );
+
+        let snapshot = log(&root, Some(2)).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.entries[0].subject, "third");
+        assert_eq!(snapshot.entries[1].subject, "second");
+
+        let snapshot = log(&root, Some(1)).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.entries[0].subject, "third");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_oversized_limit_returns_everything() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("loghuge", &[("a.txt", "a")]);
+        // Larger than git's signed --max-count: the count is not passed to
+        // git, and the snapshot is truncated to the whole history anyway.
+        let snapshot = log(&root, Some(usize::MAX)).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.entries[0].subject, "init");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_parses_merge_commit_with_two_parents() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("logmerge");
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "nextide-tests"]);
+        run_git(
+            &root,
+            &["config", "user.email", "nextide-tests@example.com"],
+        );
+        // Distinct explicit dates make git's output order deterministic.
+        fs::write(root.join("a.txt"), "a").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+                "--date=2023-01-01T00:00:00+00:00",
+            ],
+        );
+        run_git(&root, &["checkout", "-q", "-b", "feature"]);
+        fs::write(root.join("b.txt"), "feature").unwrap();
+        run_git(&root, &["add", "b.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature work",
+                "--date=2024-01-01T00:00:00+00:00",
+            ],
+        );
+        run_git(&root, &["checkout", "-q", "-"]);
+        fs::write(root.join("a.txt"), "master").unwrap();
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-am",
+                "master work",
+                "--date=2024-01-02T00:00:00+00:00",
+            ],
+        );
+        run_git(
+            &root,
+            &["merge", "--no-ff", "-q", "-m", "merge feature", "feature"],
+        );
+
+        let snapshot = log(&root, None).unwrap();
+        assert_eq!(snapshot.len(), 4);
+        let merge = &snapshot.entries[0];
+        assert_eq!(merge.subject, "merge feature");
+        assert_eq!(merge.parents.len(), 2);
+        assert_eq!(
+            merge.parents,
+            [head_rev(&root, "HEAD^1"), head_rev(&root, "HEAD^2")]
+        );
+        let subjects: Vec<&str> = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.subject.as_str())
+            .collect();
+        assert_eq!(
+            subjects,
+            ["merge feature", "master work", "feature work", "init"]
+        );
+        // The root commit has no parents.
+        assert!(snapshot.entries[3].parents.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_from_nested_root_queries_the_whole_repository() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("lognested", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        fs::write(root.join("a.txt"), "c").unwrap();
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-am",
+                "second",
+            ],
+        );
+        // `git -C` resolves the nested root; log is not path-scoped, so the
+        // whole repository history is returned, newest first.
+        let snapshot = log(&root.join("sub"), None).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.entries[0].subject, "second");
+        assert_eq!(snapshot.entries[1].subject, "init");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_parses_unicode_and_quoted_subject() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("logunicode", &[("a.txt", "a")]);
+        fs::write(root.join("a.txt"), "b").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "fix: 中文 \"quoted\" subject",
+            ],
+        );
+        let snapshot = log(&root, None).unwrap();
+        assert_eq!(snapshot.entries[0].subject, "fix: 中文 \"quoted\" subject");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_empty_repository_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        // init_repo always commits; build an empty repository manually.
+        let root = temp_dir("logempty");
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "nextide-tests"]);
+        run_git(
+            &root,
+            &["config", "user.email", "nextide-tests@example.com"],
+        );
+        let error = log(&root, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("does not have any commits yet"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("lognonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = log(&root, None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
