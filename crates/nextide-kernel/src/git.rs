@@ -203,6 +203,15 @@
 //! [`stash_apply`]; the remaining entries are renumbered by git. It returns
 //! the fresh [`GitStatusSnapshot`] from [`status`].
 //!
+//! [`stash_pop(root, index)`](stash_pop) applies entry `stash@{index}` with
+//! `git -C <root> stash pop stash@{index}` and drops it on success: the ref is
+//! formatted into a single argument exactly as in [`stash_apply`], and the
+//! index is validated the same way. Git only drops the entry *after* a
+//! successful apply, so a pop that conflicts with the current worktree fails
+//! with [`io::ErrorKind::Other`] carrying git's message and leaves the entry
+//! in place (with conflict markers in the worktree) — a failed pop never
+//! silently loses an entry.
+//!
 //! ## Dangerous-operation boundary (stash)
 //!
 //! `stash_push` rewrites the worktree of the *whole repository*, not just
@@ -215,9 +224,10 @@
 //! conflict markers and fails with [`io::ErrorKind::Other`] carrying git's
 //! message, and — like `stash_push` — it is scoped to the whole repository,
 //! not to `root`. [`stash_drop`] permanently deletes an entry; the stashed
-//! changes are gone unless they were applied or committed first. `git stash
-//! pop` (apply-plus-drop) is deliberately not offered: a failed apply must
-//! never silently drop an entry.
+//! changes are gone unless they were applied or committed first. [`stash_pop`]
+//! is apply-plus-drop with git's own safety guarantee: the entry is dropped
+//! only after a successful apply, so a failed pop never silently deletes an
+//! entry.
 
 use std::io;
 use std::path::{Component, Path};
@@ -1584,7 +1594,7 @@ fn run_git_stash_push(program: &str, root: &Path, message: Option<&str>) -> io::
 }
 
 // ---------------------------------------------------------------------------
-// Git stash list, apply and drop
+// Git stash list, apply, pop and drop
 // ---------------------------------------------------------------------------
 
 /// One stash entry of a repository, as `git stash list` reports it.
@@ -1715,7 +1725,7 @@ fn parse_stash_line(line: &str) -> io::Result<GitStashEntry> {
 /// can never be parsed as an option. Before git is spawned the index is
 /// validated against a fresh [`stash_list`]: it must name an existing entry,
 /// otherwise the call fails with [`io::ErrorKind::InvalidInput`]. A
-/// successful apply *keeps* the entry — unlike `git stash pop` — and plain
+/// successful apply *keeps* the entry — unlike [`stash_pop`] — and plain
 /// `git stash apply` (without `--index`) restores the changes into the
 /// worktree, so the original staged/unstaged split is not reinstated. See the
 /// "Dangerous-operation boundary (stash)" section in the module docs.
@@ -1805,6 +1815,64 @@ fn run_git_stash_drop(program: &str, root: &Path, index: usize) -> io::Result<()
         .arg(format!("stash@{{{index}}}"))
         .output()?;
     ensure_git_success(&output, "stash drop")
+}
+
+/// Applies the stash entry `stash@{index}` to the worktree, drops it on
+/// success, and returns the resulting [`GitStatusSnapshot`] from [`status`].
+///
+/// Runs `git -C <root> stash pop stash@{index}`: no shell, and the ref is
+/// formatted from the caller-supplied `index` into a single argument, so it
+/// can never be parsed as an option. Before git is spawned the index is
+/// validated against a fresh [`stash_list`] exactly like [`stash_apply`] and
+/// [`stash_drop`]: it must name an existing entry, otherwise the call fails
+/// with [`io::ErrorKind::InvalidInput`].
+///
+/// `git stash pop` is apply-plus-drop with git's own safety guarantee: the
+/// entry is dropped only *after* a successful apply. A pop that conflicts with
+/// the current worktree fails with [`io::ErrorKind::Other`] carrying git's
+/// message and leaves the stash entry in place (with conflict markers in the
+/// worktree), so a failed pop never silently deletes an entry. On success the
+/// entry is dropped (git renumbers the rest) and the changes are restored into
+/// the worktree; as with plain [`stash_apply`], the original staged/unstaged
+/// split is not reinstated.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `index` does not name an existing
+///   stash entry.
+/// - [`io::ErrorKind::Other`] if `git stash pop` exits non-zero (for example
+///   a pop that conflicts with the current worktree, a refusal to overwrite
+///   local changes, or a `root` that is not inside a Git repository); git's
+///   message is included.
+/// - [`io::ErrorKind::InvalidData`] if the fresh [`status`] output cannot be
+///   parsed or reports a path that escapes the repository root.
+pub fn stash_pop(root: &Path, index: usize) -> io::Result<GitStatusSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_stash_index(root, index, "stash pop")?;
+    run_git_stash_pop("git", root, index)?;
+    status(root)
+}
+
+/// Runs `program -C root stash pop stash@{index}`; split out so tests can
+/// exercise the spawn-failure path with a program that does not exist.
+fn run_git_stash_pop(program: &str, root: &Path, index: usize) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .args(["stash", "pop"])
+        .arg(format!("stash@{{{index}}}"))
+        .output()?;
+    ensure_git_success(&output, "stash pop")
 }
 
 /// Rejects a caller-supplied stash index that does not name an existing
@@ -4452,7 +4520,42 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    // ---- stash list/apply/drop integration (requires a git binary) ----
+    // ---- stash_pop() argument safety (no git binary needed) ----
+
+    #[test]
+    fn stash_pop_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-stashpop-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            stash_pop(&missing, 0).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn stash_pop_file_root_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "nextide-stashpop-notdir-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            stash_pop(&file, 0).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_git_binary_for_stash_pop_surfaces_as_not_found() {
+        let root = temp_dir("stashpopnobinary");
+        let error = run_git_stash_pop("nextide-no-such-git-binary", &root, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- stash list/apply/pop/drop integration (requires a git binary) ----
 
     #[test]
     fn stash_list_returns_typed_entries_for_real_repository() {
@@ -4681,6 +4784,135 @@ mod tests {
             return;
         }
         let error = stash_drop(&root, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- stash_pop() integration (requires a git binary) ----
+
+    #[test]
+    fn stash_pop_restores_changes_and_drops_the_entry() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashpop", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+        stash_push(&root, None).unwrap();
+        assert!(status(&root).unwrap().is_clean());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "base");
+        assert_eq!(stash_count(&root), 1);
+
+        // pop applies the change and drops the entry (unlike stash_apply).
+        let snapshot = stash_pop(&root, 0).unwrap();
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "dirty");
+        let entry = find(&snapshot, "a.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        assert_eq!(stash_count(&root), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_pop_renumbers_remaining_entries() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashpoprenum", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "first").unwrap();
+        stash_push(&root, Some("first")).unwrap();
+        fs::write(root.join("a.txt"), "second").unwrap();
+        stash_push(&root, Some("second")).unwrap();
+        assert_eq!(stash_count(&root), 2);
+
+        // Popping the newest entry renumbers the remaining one to stash@{0}.
+        let snapshot = stash_pop(&root, 0).unwrap();
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "second");
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(stash_count(&root), 1);
+        let remaining = stash_list(&root).unwrap();
+        assert_eq!(remaining.entries.len(), 1);
+        assert_eq!(remaining.entries[0].index, 0);
+        assert!(
+            remaining.entries[0].description.ends_with("first"),
+            "description was: {:?}",
+            remaining.entries[0].description
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_pop_conflict_keeps_the_entry() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashpopconflict", &[("a.txt", "base\n")]);
+        fs::write(root.join("a.txt"), "dirty\n").unwrap();
+        stash_push(&root, None).unwrap();
+        // Commit a divergent change on top of the stash base, so popping the
+        // stash is a genuine three-way conflict.
+        fs::write(root.join("a.txt"), "committed\n").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        commit(&root, "divergent change").unwrap();
+
+        let error = stash_pop(&root, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(message.contains("CONFLICT"), "message was: {message}");
+        // Git's pop semantics: the entry is dropped only after a successful
+        // apply, so a conflicting pop keeps the stash in the list.
+        assert_eq!(
+            stash_count(&root),
+            1,
+            "failed pop must keep the stash entry"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_pop_out_of_range_index_is_invalid_input() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashpoprange", &[("a.txt", "base")]);
+        // No stashes: any index is out of range.
+        let error = stash_pop(&root, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("out of range"), "message was: {message}");
+
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+        stash_push(&root, None).unwrap();
+        let error = stash_pop(&root, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("out of range"), "message was: {message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_pop_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("stashpopnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = stash_pop(&root, 0).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
