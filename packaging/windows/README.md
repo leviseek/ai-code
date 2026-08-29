@@ -449,6 +449,9 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1
 cd dist\windows && sha256sum -c SHA256SUMS.txt
 ```
 
+End users verifying a GitHub Release download (not a local build) should
+follow [Verifying a GitHub Release download (end user)](#verifying-a-github-release-download-end-user).
+
 Note: `cargo test --workspace` and `cargo clippy` are **not** part of this
 script — they remain covered by the `ci` job of the CI workflow
 (`.github/workflows/ci.yml`), which is unchanged. A second `packaging-windows`
@@ -554,3 +557,71 @@ artifacts and, with no rebuild, no re-staging and no recomputed checksums:
 To publish a release: push a `v<version>` tag matching the manifest version —
 `git tag v0.1.0 && git push origin v0.1.0` — which triggers the full pipeline
 (ci checks → packaging → release).
+
+## Verifying a GitHub Release download (end user)
+
+The `release` job attaches four assets to each GitHub Release:
+`nextide-cli.exe`, `nextide-shell.exe`, the manifest-declared checksum file
+(`stage.checksum_file`, committed value `SHA256SUMS.txt`) and `manifest.json`
+(release metadata). An end user verifies a download in two steps — checksums
+first, then a CLI smoke — the same two gates CI runs on the exact bytes it
+publishes. Any verification failure means: do **not** run the binaries.
+
+### 1. Download
+
+Create a clean folder and put **only** the two binaries and the checksum file
+in it. `manifest.json` is release metadata and is *not* covered by the checksum
+manifest — the verifier's exact-match rule rejects any file that has no entry,
+so keep it out of the verified folder (next to it is fine):
+
+```powershell
+# PowerShell — set $Tag to the tag of the release you downloaded:
+$Tag  = 'v0.1.0'
+$Dest = '.\nextide-download'
+New-Item -ItemType Directory -Force $Dest | Out-Null
+$Base = "https://github.com/leviseek/ai-code/releases/download/$Tag"
+Invoke-WebRequest -Uri "$Base/nextide-cli.exe"   -OutFile "$Dest\nextide-cli.exe"
+Invoke-WebRequest -Uri "$Base/nextide-shell.exe" -OutFile "$Dest\nextide-shell.exe"
+Invoke-WebRequest -Uri "$Base/SHA256SUMS.txt"    -OutFile "$Dest\SHA256SUMS.txt"
+```
+
+(Downloading the three assets from the release page's "Assets" section with a
+browser is equivalent — just keep `manifest.json` outside `$Dest`.)
+
+### 2. Verify the checksums
+
+The consumer verifier ships in the repository, not on the Release page — fetch
+it from the **same tag** and keep it **outside** `$Dest` (the exact-match rule
+rejects any file the checksum manifest does not list, the script itself
+included):
+
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/leviseek/ai-code/$Tag/packaging/windows/verify-checksums.ps1" -OutFile ".\verify-checksums.ps1"
+powershell -ExecutionPolicy Bypass -File .\verify-checksums.ps1 -DistDir $Dest
+```
+
+Exit code `0` — every file printed as `ok <file>`, ending with
+`==> OK. Checksum manifest verified against the staging directory (read-only).`
+— proves every line parses, every named file exists, every SHA-256 matches the
+manifest, and the folder contains exactly the listed files. Any failure prints
+the reason and exits non-zero. If a release renames its checksum file (a
+different `stage.checksum_file`), pass the name explicitly:
+`-ChecksumFile "$Dest\<that-name>"`.
+
+In Git Bash / WSL the same check works with GNU coreutils:
+
+```bash
+cd nextide-download && sha256sum -c SHA256SUMS.txt
+```
+
+### 3. Smoke-test the CLI
+
+```powershell
+.\nextide-download\nextide-cli.exe        # prints usage/help
+.\nextide-download\nextide-cli.exe smoke  # edit → undo → redo, asserts the document text
+```
+
+`smoke` applies an edit, undoes and redoes it, asserts the document text and
+prints `status: ok` on success; it panics on any failure, so a non-zero exit
+means the binary is not trustworthy — this is the same flow the CI `release`
+job runs against the exact bytes it publishes.
