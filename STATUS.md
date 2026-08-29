@@ -14,7 +14,7 @@ Phase 0：技术基线与核心内核起步。
 - 增加 5 个内核单元测试。
 - 增加 CLI `smoke` 冒烟流程。
 - 通过 `cargo fmt --check`、`cargo test --workspace` 和 CLI 冒烟验证。
-- 当前工作区测试：161 passed，0 failed。
+- 当前工作区测试：167 passed，0 failed（内核 115 + shell 51 + doc-test 1）。
 - Editor Kernel 已支持 `document.changed` 与 `document.saved` 事件。
 - 原子保存成功后可通过 Event Bus 发布保存事件。
 - 增加 LocalRpcRouter/Typed RPC 基线。
@@ -35,8 +35,8 @@ Phase 0：技术基线与核心内核起步。
 
 ## 下一步
 
-1. 接入 VFS 抽象和文件保存。
-2. 增加 Capability Registry、Typed RPC 和 Event Bus 基线。
-3. 增加 Windows 平台进程/终端接口。
-4. 建立 Desktop Shell 原型。
-5. 为 Editor Kernel 增加事件订阅和持久化日志。
+1. 为 Editor Kernel 增加订阅式事件接口与持久化编辑日志（`document.changed`/`document.saved` 等事件已可经 `EventBus` 轮询/排空，订阅式 API 与持久化日志尚未实现）。
+2. 接入 Windows ConPTY 终端后端（`PlatformServices`/`TerminalSession` 接口与 `WindowsPlatform` 进程 spawn/terminate/状态查询已就绪，ConPTY 实现待接入）。
+3. 增加当前文件/全局/正则搜索。
+4. 增加 Git 状态、Diff 与提交服务。
+5. 建立 Windows 安装工程与 CI（编译、测试、打包）流水线。
