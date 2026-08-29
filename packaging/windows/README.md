@@ -16,7 +16,7 @@ install anything.
 | Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
-| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata) — first via the sandboxed `test-build.ps1` self-test gate (23 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows`, and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact |
+| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata) — first via the sandboxed `test-build.ps1` self-test gate (23 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows`, and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact. The same resolved channel names a second upload: the committed `packaging/windows/manifest.json` is uploaded as a **channel-suffixed release-metadata artifact** (`nextide-windows-manifest-<channel>`) alongside the binaries, so the validated product identity, pinned target, release metadata (license / publisher / release_channel) and artifact list that produced this release travel with it for later release/publish steps |
 
 ## Layout
 
@@ -268,7 +268,15 @@ dedicated step right after checkout (read-only local parse, no network, same
 `stable`/`beta` rule `build.ps1` enforces, so an undeclared channel fails the
 run before the self-test gate, the build, and staging). The channel-suffixed
 name guarantees stable and beta runs produce distinct artifacts and can never
-overwrite each other in the Actions artifact store. Before the upload the job
+overwrite each other in the Actions artifact store. The same resolved channel
+also names a second upload: the committed `packaging/windows/manifest.json`
+is uploaded as a **release-metadata artifact** (`nextide-windows-manifest-
+<channel>`) alongside the binaries — the exact single source of truth the
+pipeline consumed and validated (product identity, pinned target, release
+metadata `license` / `publisher` / `release_channel`, artifact list), so later
+release/publish steps can attach it to the release without re-deriving
+anything, and stable/beta runs keep their release metadata separate too.
+Before the upload the job
 also smoke-tests the staged CLI binary itself (`.\dist\windows\nextide-cli.exe
 smoke` — the same flow listed above, panicking on any failure), so the
 artifact that ships is proven to run, not just to hash-match its source. That

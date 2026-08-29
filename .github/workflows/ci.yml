@@ -52,7 +52,14 @@ jobs:
     # overwrite each other's artifact in the Actions artifact store. Before
     # the upload, the staged CLI binary itself is smoke-tested end to end
     # (nextide-cli.exe smoke), so the artifact that ships is proven to run,
-    # not just to hash-match its source.
+    # not just to hash-match its source. Alongside the staged binaries the
+    # job also uploads the committed packaging/windows/manifest.json as a
+    # channel-suffixed release-metadata artifact (nextide-windows-manifest-
+    # <channel>): the validated product identity (name/version), pinned
+    # target, release metadata (license / publisher / release_channel) and
+    # artifact list that produced this release travel with it, so later
+    # release/publish steps can consume the exact single source of truth
+    # without re-deriving anything.
     needs: ci
     runs-on: windows-latest
     steps:
@@ -132,4 +139,21 @@ jobs:
         with:
           name: nextide-windows-dist-${{ steps.release-channel.outputs.release_channel }}
           path: dist/windows
+          if-no-files-found: error
+
+      - name: Upload manifest.json release metadata artifact
+        # Upload the committed packaging manifest as release metadata next to
+        # the staged binaries. manifest.json is the exact single source of
+        # truth the whole packaging pipeline consumed and validated (self-test
+        # gate, then read-only by build.ps1 -SkipBuild against the real
+        # Cargo.toml): product identity, pinned target, release metadata
+        # (license / publisher / release_channel) and the artifact list.
+        # Shipping it with the release lets later release/publish steps attach
+        # the metadata without re-deriving anything. The artifact name uses
+        # the same resolved release_channel output as the dist artifact, so
+        # stable and beta runs keep their release metadata separate too.
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextide-windows-manifest-${{ steps.release-channel.outputs.release_channel }}
+          path: packaging/windows/manifest.json
           if-no-files-found: error
