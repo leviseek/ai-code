@@ -38,6 +38,14 @@
 //!   equals the workspace root in the normal case). For the (rare) case of
 //!   multiple files with the same path, the first in snapshot order wins,
 //!   mirroring the status layer's `marker_for`.
+//! - Display projections turn each view into stable text without drawing
+//!   anything: [`DiffLineView::display_text`] renders `"<marker> <text>"`
+//!   (the single-character kind marker, one space, then the line text),
+//!   [`DiffHunkView::display_header`] renders the raw `@@` header line, and
+//!   [`DiffFileView::file_label`] renders the file's path — with a `" (binary)"`
+//!   suffix for binary files. The formats are fixed and documented, so a diff
+//!   panel can lay these out as text (no GPU, no real drawing) and the text
+//!   never changes between releases.
 //!
 //! [`GitDiffAdapter`] is the mapping contract, with default methods that
 //! delegate to the free functions; [`DefaultGitDiffAdapter`] is the
@@ -132,6 +140,25 @@ impl DiffLineView {
             text: line.text.clone(),
         }
     }
+
+    /// The stable display text for this line: the single-character kind
+    /// marker, one space, then the line text.
+    ///
+    /// The exact format is `"<marker> <text>"` (marker + one space + text),
+    /// so the marker column keeps a fixed width of one character:
+    ///
+    /// - [`DiffLineKind::Context`] → `"  <text>"` (the `' '` marker plus the
+    ///   separator, i.e. two leading spaces before the text)
+    /// - [`DiffLineKind::Added`] → `"+ <text>"`
+    /// - [`DiffLineKind::Removed`] → `"- <text>"`
+    ///
+    /// The separator is always present, so a blank line (empty `text`) still
+    /// renders as `"<marker> "` with its marker and one trailing space. The
+    /// projection is pure — it is derived solely from `kind` and `text` — and
+    /// the exact string is the contract: it never changes between releases.
+    pub fn display_text(&self) -> String {
+        format!("{} {}", self.kind.marker(), self.text)
+    }
 }
 
 /// One UI-consumable hunk of a file diff.
@@ -151,6 +178,17 @@ impl DiffHunkView {
             header: hunk.header.clone(),
             lines: hunk.lines.iter().map(DiffLineView::from_line).collect(),
         }
+    }
+
+    /// The stable display text for this hunk's header: the raw `@@` line
+    /// exactly as git printed it, for example `@@ -1,5 +1,6 @@` (with any
+    /// section heading preserved).
+    ///
+    /// The projection is pure — it returns the stored header verbatim — so a
+    /// diff panel can render the hunk header as text (no GPU, no real
+    /// drawing) and the exact string never changes between releases.
+    pub fn display_header(&self) -> &str {
+        &self.header
     }
 }
 
@@ -180,6 +218,30 @@ impl DiffFileView {
             path: PathBuf::from(file.path.as_str()),
             binary: file.binary,
             hunks: file.hunks.iter().map(DiffHunkView::from_hunk).collect(),
+        }
+    }
+
+    /// The stable file-section label for a diff panel: the file's path with
+    /// `/` separators, plus a `" (binary)"` suffix for binary files.
+    ///
+    /// The exact format is `"<path>"` for text files and `"<path> (binary)"`
+    /// for binary files — the only suffix that exists, so the label is
+    /// parseable (`strip_suffix`) and never changes between releases. The
+    /// path is rebuilt from its components joined by `/`, so the label is
+    /// identical on every platform even though the stored [`Self::path`] is a
+    /// platform-native `PathBuf`; the projection is pure — it never touches
+    /// git or the filesystem.
+    pub fn file_label(&self) -> String {
+        let path = self
+            .path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if self.binary {
+            format!("{path} (binary)")
+        } else {
+            path
         }
     }
 
@@ -525,6 +587,140 @@ mod tests {
             DiffLineView::from_line(&line(GitDiffLineKind::Context, Some(2), Some(3), "both"));
         assert_eq!(context.old_line, Some(2));
         assert_eq!(context.new_line, Some(3));
+    }
+
+    #[test]
+    fn display_text_renders_marker_separator_and_text() {
+        // The exact string is the contract: marker (one char) + one space +
+        // text. The context marker is a space, so context lines get two
+        // leading spaces.
+        assert_eq!(
+            DiffLineView::from_line(&line(
+                GitDiffLineKind::Context,
+                Some(1),
+                Some(1),
+                "use std::io;"
+            ))
+            .display_text(),
+            "  use std::io;"
+        );
+        assert_eq!(
+            DiffLineView::from_line(&line(GitDiffLineKind::Added, None, Some(2), "let x = 2;"))
+                .display_text(),
+            "+ let x = 2;"
+        );
+        assert_eq!(
+            DiffLineView::from_line(&line(GitDiffLineKind::Removed, Some(2), None, "let x = 1;"))
+                .display_text(),
+            "- let x = 1;"
+        );
+        // The display text matches the kind marker exactly, so a consumer can
+        // reconstruct the kind from the first character.
+        let added = DiffLineView::from_line(&line(GitDiffLineKind::Added, None, Some(9), "z"));
+        assert_eq!(
+            added.display_text(),
+            format!("{}{}", added.kind.marker(), " z")
+        );
+        assert_eq!(added.display_text().as_bytes()[0], b'+');
+    }
+
+    #[test]
+    fn display_text_keeps_the_separator_for_blank_lines() {
+        // The separator is always present: a blank line still carries its
+        // marker and one trailing space.
+        assert_eq!(
+            DiffLineView::from_line(&line(GitDiffLineKind::Added, None, Some(3), ""))
+                .display_text(),
+            "+ "
+        );
+        assert_eq!(
+            DiffLineView::from_line(&line(GitDiffLineKind::Context, Some(3), Some(3), ""))
+                .display_text(),
+            "  "
+        );
+    }
+
+    #[test]
+    fn display_header_returns_the_raw_hunk_header() {
+        let view = DiffHunkView::from_hunk(&hunk(
+            "@@ -1,5 +1,6 @@ section",
+            vec![line(GitDiffLineKind::Context, Some(1), Some(1), "title")],
+        ));
+        assert_eq!(view.display_header(), "@@ -1,5 +1,6 @@ section");
+        // The projection is verbatim, including the common heading-less form.
+        assert_eq!(view.display_header(), view.header);
+        let plain = DiffHunkView::from_hunk(&hunk("@@ -10,3 +12,3 @@", Vec::new()));
+        assert_eq!(plain.display_header(), "@@ -10,3 +12,3 @@");
+    }
+
+    #[test]
+    fn file_label_is_stable_for_text_and_binary_files() {
+        let files = sample_files();
+        let text = DiffFileView::from_file(&files[0]);
+        assert_eq!(text.file_label(), "src/lib.rs");
+        assert_eq!(
+            DiffFileView::from_file(&files[1]).file_label(),
+            "docs/notes.md"
+        );
+        // Binary files carry the only existing suffix.
+        assert_eq!(
+            DiffFileView::from_file(&files[2]).file_label(),
+            "assets/logo.png (binary)"
+        );
+    }
+
+    #[test]
+    fn file_label_always_joins_path_components_with_forward_slashes() {
+        // The stored path is a platform-native PathBuf, but the label must be
+        // identical on every platform, so it is rebuilt from the components
+        // joined by `/` — never `Path::display`.
+        let nested = std::path::PathBuf::from("a").join("b").join("c.rs");
+        let view = DiffFileView {
+            path: nested.clone(),
+            binary: false,
+            hunks: Vec::new(),
+        };
+        assert_eq!(view.file_label(), "a/b/c.rs");
+        let binary = DiffFileView {
+            path: nested,
+            binary: true,
+            hunks: Vec::new(),
+        };
+        assert_eq!(binary.file_label(), "a/b/c.rs (binary)");
+    }
+
+    #[test]
+    fn display_projections_compose_across_hunks_and_files() {
+        let view = DiffFileView::from_file(&sample_files()[0]);
+        assert_eq!(view.file_label(), "src/lib.rs");
+        assert_eq!(view.hunks[0].display_header(), "@@ -1,5 +1,6 @@");
+        assert_eq!(view.hunks[1].display_header(), "@@ -10,3 +12,3 @@");
+        let rendered: Vec<String> = view
+            .hunks
+            .iter()
+            .flat_map(|hunk| {
+                std::iter::once(hunk.display_header().to_string())
+                    .chain(hunk.lines.iter().map(DiffLineView::display_text))
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "@@ -1,5 +1,6 @@",
+                "  use std::io;",
+                "- let x = 1;",
+                "+ let x = 2;",
+                "+ let y = x + 1;",
+                "  fn main() {}",
+                "@@ -10,3 +12,3 @@",
+                "  mod tests;",
+                "- old tail",
+            ]
+        );
+        // Binary files render only their label: no hunks, no lines.
+        let binary = DiffFileView::from_file(&sample_files()[2]);
+        assert_eq!(binary.file_label(), "assets/logo.png (binary)");
+        assert!(binary.hunks.is_empty());
     }
 
     #[test]
