@@ -44,11 +44,38 @@ jobs:
     # before anything is staged. The release binaries are built here
     # (cargo build --release) and the packaging script is invoked with
     # -SkipBuild, which stages and verifies the freshly built artifacts
-    # without rebuilding.
+    # without rebuilding. The staged directory is uploaded as a
+    # channel-suffixed workflow artifact (nextide-windows-dist-<channel>):
+    # right after checkout the job reads release.release_channel from the
+    # committed packaging/windows/manifest.json (read-only, no network) and
+    # uses it as the artifact name suffix, so stable and beta runs can never
+    # overwrite each other's artifact in the Actions artifact store.
     needs: ci
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve release channel from manifest (artifact name suffix)
+        # Read release.release_channel out of the committed packaging manifest
+        # (packaging/windows/manifest.json) so the workflow artifact carries
+        # the channel in its name: stable and beta runs can never overwrite
+        # each other's artifact. Read-only parse of a local file — no network,
+        # no cargo invocation. The channel must be exactly stable or beta, the
+        # same rule build.ps1 enforces (and the self-test gate and the
+        # -SkipBuild run re-verify against the same committed manifest), so an
+        # undeclared channel fails the run here, before the self-test gate, the
+        # release build, and staging. The value is also exposed as the step
+        # output release_channel for any later step to consume.
+        id: release-channel
+        shell: pwsh
+        run: |
+          $Manifest = Get-Content -Raw -LiteralPath 'packaging/windows/manifest.json' | ConvertFrom-Json
+          $Channel = $Manifest.release.release_channel
+          if ($Channel -ne 'stable' -and $Channel -ne 'beta') {
+            throw "Manifest release.release_channel must be exactly stable or beta, got: '$Channel'"
+          }
+          Write-Host "release_channel=$Channel"
+          "release_channel=$Channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -84,8 +111,11 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -SkipBuild
 
       - name: Upload dist/windows artifact
+        # The artifact name carries the manifest's release_channel suffix
+        # (resolved by the step above), so stable and beta runs produce
+        # distinct artifacts and can never overwrite each other.
         uses: actions/upload-artifact@v4
         with:
-          name: nextide-windows-dist
+          name: nextide-windows-dist-${{ steps.release-channel.outputs.release_channel }}
           path: dist/windows
           if-no-files-found: error

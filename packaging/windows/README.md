@@ -16,7 +16,7 @@ install anything.
 | Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
-| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata) — first via the sandboxed `test-build.ps1` self-test gate (23 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows`, uploads it as an artifact |
+| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata) — first via the sandboxed `test-build.ps1` self-test gate (23 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows`, and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact |
 
 ## Layout
 
@@ -256,6 +256,12 @@ its 23 sandboxed cases. Then it builds the release binaries with
 verify them under `dist/windows/` — that run re-applies the same read-only
 manifest/version/target/metadata validation to the committed `manifest.json`
 and the real `Cargo.toml` before staging anything — and uploads the staged
-directory as the `nextide-windows-dist` workflow artifact. That job is what
+directory as the `nextide-windows-dist-<channel>` workflow artifact, where
+`<channel>` is `release.release_channel` read from the committed manifest by a
+dedicated step right after checkout (read-only local parse, no network, same
+`stable`/`beta` rule `build.ps1` enforces, so an undeclared channel fails the
+run before the self-test gate, the build, and staging). The channel-suffixed
+name guarantees stable and beta runs produce distinct artifacts and can never
+overwrite each other in the Actions artifact store. That job is what
 exercises the real-repository `cargo build --release` success path end to end
 on CI.
