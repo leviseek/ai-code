@@ -50,6 +50,23 @@
 //!   [`crate::git_diff`] layer's `summary` of the same kernel snapshot and is
 //!   deliberately **unaffected by expansion** — collapsing files never changes
 //!   the status-bar counts.
+//! - [`DiffPanelSnapshot::render_lines`] is the stable *text* projection of
+//!   the panel, one [`String`] per rendered line, so the whole panel can be
+//!   laid out as text (no GPU, no real drawing): every file — in model
+//!   order — renders its [`DiffFileView::file_label`] line first, and every
+//!   expanded file additionally renders each hunk's
+//!   [`crate::git_diff::DiffHunkView::display_header`] line followed by its
+//!   lines' [`DiffLineView::display_text`] lines. Collapsed files render only
+//!   their label line — they stay visible and togglable — and collapsing
+//!   never changes [`DiffPanelSnapshot::summary`], so the status-bar counts
+//!   are preserved. The projection is pure and deterministic: repeated calls
+//!   return identical lines, and toggling one file only removes or restores
+//!   that file's block.
+//!   [`DiffPanelSnapshot::visible_text`] joins the same lines with `'\n'`;
+//!   every rendered line is a single physical line (the kernel parses each
+//!   diff line from one output line, so line texts never contain a newline),
+//!   which makes the joined text unambiguous — splitting on `'\n'` recovers
+//!   `render_lines()` exactly.
 //!
 //! All state transitions are `&mut self` methods that return cheaply and
 //! never allocate more than the projection itself needs; observers return
@@ -65,9 +82,11 @@ use std::path::{Path, PathBuf};
 ///
 /// See the [module docs](self) for the exact contracts: file order is the
 /// stable model path order, every file starts expanded, `visible_lines()` is
-/// the stable projection of the expanded files' lines, and the selection is
-/// an index into that list that is always re-clamped to a visible line after
-/// every mutation.
+/// the stable projection of the expanded files' lines, `render_lines()` /
+/// `visible_text()` project the panel to stable text (file labels, hunk
+/// headers, line display text; collapsed files keep their label line and the
+/// summary never changes), and the selection is an index into the visible
+/// list that is always re-clamped to a visible line after every mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffPanelSnapshot {
     /// The file views in the stable model order (path order; equal paths keep
@@ -167,6 +186,47 @@ impl DiffPanelSnapshot {
             }
         }
         lines
+    }
+
+    /// The stable text projection of the panel: one [`String`] per rendered
+    /// line, ready to lay out as text (no GPU, no real drawing).
+    ///
+    /// Every file — in model order — renders its [`DiffFileView::file_label`]
+    /// line first, so collapsed files still appear and stay togglable. For
+    /// every expanded file the label is followed by each hunk's
+    /// [`crate::git_diff::DiffHunkView::display_header`] line and then by each
+    /// of its lines' [`DiffLineView::display_text`]; collapsed files render
+    /// nothing more than their label line. The projection is pure and
+    /// deterministic: it reads only the panel's own views and expansion
+    /// state, repeated calls return identical lines, and toggling one file
+    /// only removes or restores that file's block — while collapsing never
+    /// changes [`DiffPanelSnapshot::summary`], so the status-bar counts are
+    /// preserved.
+    pub fn render_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for file in &self.files {
+            lines.push(file.file_label());
+            if !self.is_expanded(&file.path) {
+                continue;
+            }
+            for hunk in &file.hunks {
+                lines.push(hunk.display_header().to_string());
+                lines.extend(hunk.lines.iter().map(DiffLineView::display_text));
+            }
+        }
+        lines
+    }
+
+    /// The stable panel text: [`DiffPanelSnapshot::render_lines`] joined with
+    /// `'\n'`.
+    ///
+    /// Every rendered line is a single physical line — the kernel parses each
+    /// diff line from one output line, so line texts never contain a
+    /// newline — which makes the joined text unambiguous: splitting on `'\n'`
+    /// recovers `render_lines()` exactly. An empty panel renders as the empty
+    /// string.
+    pub fn visible_text(&self) -> String {
+        self.render_lines().join("\n")
     }
 
     /// The index of the selected line into the current visible line list, if
@@ -758,5 +818,160 @@ mod tests {
         let from_snapshot = DiffPanelSnapshot::from_snapshot(&snapshot);
         let views = crate::git_diff::file_views(&snapshot);
         assert_eq!(DiffPanelSnapshot::from_views(views), from_snapshot);
+    }
+
+    #[test]
+    fn render_lines_emit_file_labels_hunk_headers_and_display_text_in_order() {
+        let panel = sample_panel();
+        assert_eq!(
+            panel.render_lines(),
+            vec![
+                "assets/logo.png (binary)",
+                "docs/notes.md",
+                "@@ -1,2 +1,1 @@",
+                "  title",
+                "- obsolete line",
+                "src/lib.rs",
+                "@@ -1,5 +1,6 @@",
+                "  use std::io;",
+                "- let x = 1;",
+                "+ let x = 2;",
+                "+ let y = x + 1;",
+                "  fn main() {}",
+                "@@ -10,3 +12,3 @@",
+                "  mod tests;",
+                "- old tail",
+            ]
+        );
+        // The line count is one label per file plus, per expanded file, one
+        // header per hunk and one display-text line per line.
+        assert_eq!(panel.render_lines().len(), 3 + 3 + 9);
+    }
+
+    #[test]
+    fn render_lines_collapsed_files_keep_only_their_label_line() {
+        let mut panel = sample_panel();
+        assert!(panel.toggle_file(Path::new("src/lib.rs")));
+        assert_eq!(
+            panel.render_lines(),
+            vec![
+                "assets/logo.png (binary)",
+                "docs/notes.md",
+                "@@ -1,2 +1,1 @@",
+                "  title",
+                "- obsolete line",
+                "src/lib.rs",
+            ]
+        );
+        // Collapsing every file leaves exactly the label lines, so the files
+        // stay visible and togglable — while the summary counts never move.
+        let full_summary = sample_panel().summary();
+        let mut panel = sample_panel();
+        let paths: Vec<PathBuf> = panel.files().iter().map(|file| file.path.clone()).collect();
+        for path in &paths {
+            panel.toggle_file(path);
+        }
+        assert_eq!(panel.visible_line_count(), 0);
+        assert_eq!(
+            panel.render_lines(),
+            vec!["assets/logo.png (binary)", "docs/notes.md", "src/lib.rs"]
+        );
+        assert_eq!(panel.summary(), full_summary);
+        assert_eq!(panel.summary().total_lines(), 9);
+    }
+
+    #[test]
+    fn render_lines_is_stable_and_only_the_toggled_files_block_changes() {
+        let panel = sample_panel();
+        let full = panel.render_lines();
+        assert_eq!(panel.render_lines(), full);
+        let mut panel = panel;
+        assert!(panel.toggle_file(Path::new("docs/notes.md")));
+        // Only notes.md's block (label + header + its 2 lines) disappears;
+        // every other file's lines are untouched.
+        assert_eq!(
+            panel.render_lines(),
+            vec![
+                "assets/logo.png (binary)",
+                "docs/notes.md",
+                "src/lib.rs",
+                "@@ -1,5 +1,6 @@",
+                "  use std::io;",
+                "- let x = 1;",
+                "+ let x = 2;",
+                "+ let y = x + 1;",
+                "  fn main() {}",
+                "@@ -10,3 +12,3 @@",
+                "  mod tests;",
+                "- old tail",
+            ]
+        );
+        assert!(panel.toggle_file(Path::new("docs/notes.md")));
+        assert_eq!(panel.render_lines(), full);
+    }
+
+    #[test]
+    fn visible_text_joins_render_lines_and_splits_back_exactly() {
+        let panel = sample_panel();
+        let lines = panel.render_lines();
+        assert_eq!(panel.visible_text(), lines.join("\n"));
+        // Because every rendered line is a single physical line, splitting the
+        // joined text on '\n' recovers render_lines() exactly.
+        let text = panel.visible_text();
+        let split: Vec<&str> = text.split('\n').collect();
+        let expected: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(split, expected);
+        // The exact joined string is the contract for the sample panel.
+        assert_eq!(
+            panel.visible_text(),
+            "assets/logo.png (binary)\ndocs/notes.md\n@@ -1,2 +1,1 @@\n  title\n- obsolete line\nsrc/lib.rs\n@@ -1,5 +1,6 @@\n  use std::io;\n- let x = 1;\n+ let x = 2;\n+ let y = x + 1;\n  fn main() {}\n@@ -10,3 +12,3 @@\n  mod tests;\n- old tail"
+        );
+        // An empty panel renders as the empty string with no lines.
+        let empty = DiffPanelSnapshot::default();
+        assert_eq!(empty.render_lines(), Vec::<String>::new());
+        assert_eq!(empty.visible_text(), "");
+    }
+
+    #[test]
+    fn render_lines_keeps_blank_line_display_text() {
+        // Blank lines render with their marker and separator, exactly like
+        // DiffLineView::display_text: an added blank line is "+ ".
+        let panel = DiffPanelSnapshot::from_snapshot(&snapshot(vec![file(
+            "blank.txt",
+            false,
+            vec![hunk(
+                "@@ -1 +1,2 @@",
+                vec![
+                    line(GitDiffLineKind::Context, Some(1), Some(1), "before"),
+                    line(GitDiffLineKind::Added, None, Some(2), ""),
+                ],
+            )],
+        )]));
+        assert_eq!(
+            panel.render_lines(),
+            vec!["blank.txt", "@@ -1 +1,2 @@", "  before", "+ "]
+        );
+    }
+
+    #[test]
+    fn render_lines_agree_with_visible_lines_on_counts() {
+        let mut panel = sample_panel();
+        // Fully expanded: the display-text lines of render_lines are exactly
+        // the visible lines, so the per-file nesting holds for the counts.
+        assert_eq!(panel.render_lines().len(), 15);
+        assert_eq!(panel.visible_line_count(), 9);
+        // Collapsing one file removes exactly its label + headers + lines.
+        assert!(panel.toggle_file(Path::new("src/lib.rs")));
+        assert_eq!(panel.render_lines().len(), 6);
+        assert_eq!(panel.visible_line_count(), 2);
+        assert_eq!(panel.summary(), sample_panel().summary());
+        // A metadata-only file and a binary file render their labels only.
+        let panel = DiffPanelSnapshot::from_snapshot(&snapshot(vec![
+            file("exec.sh", false, Vec::new()),
+            file("img.png", true, Vec::new()),
+        ]));
+        assert_eq!(panel.render_lines(), vec!["exec.sh", "img.png (binary)"]);
+        assert_eq!(panel.visible_line_count(), 0);
+        assert_eq!(panel.summary().files, 2);
     }
 }
