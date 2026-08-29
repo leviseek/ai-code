@@ -8,9 +8,9 @@
   },
   "target": {
     "os": "windows",
-    "arch": "x86_64",
+    "architecture": "x86_64",
     "triple": "x86_64-pc-windows-msvc",
-    "notes": "The project targets Windows. build.ps1 uses the host stable Rust toolchain (cargo build --release); the triple is informational."
+    "notes": "The project targets Windows x86_64. build.ps1 enforces that this target block matches the pinned packaging target x86_64-pc-windows-msvc (os windows, architecture x86_64, triple x86_64-pc-windows-msvc) and fails before building or staging on any mismatch, so a stale or cross-arch manifest can never stage an artifact set for the wrong platform. The release build itself runs with the host stable Rust toolchain (cargo build --release)."
   },
   "build": {
     "profile": "release",

@@ -35,6 +35,9 @@
      12. product.version != Cargo.toml workspace version -> fails
      13. missing Cargo.toml at the repo root    -> fails
      14. Cargo.toml without [workspace.package] version -> fails
+     15. target.architecture mismatch vs pinned x86_64-pc-windows-msvc -> fails
+     16. target.triple mismatch vs pinned x86_64-pc-windows-msvc      -> fails
+     17. target.os mismatch vs pinned windows target                  -> fails
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -277,6 +280,19 @@ function Set-ManifestField {
     $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
     $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
     $Manifest | Add-Member -NotePropertyName $Key -NotePropertyValue $Value -Force
+    Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
+}
+
+function Set-ManifestTargetField {
+    # Overwrite (or add) a field inside the target block of the sandbox manifest.
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)]$Value
+    )
+    $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
+    $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    $Manifest.target | Add-Member -NotePropertyName $Key -NotePropertyValue $Value -Force
     Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
 }
 
@@ -540,6 +556,62 @@ Invoke-Test -Name 'Cargo.toml without [workspace.package] version fails' -Body {
         $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
         Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
         Assert ($Result.Output -match '\[workspace\.package\] version') "expected missing-workspace-version rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 15. Manifest target.architecture does not match the pinned packaging target.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'manifest target.architecture mismatch with pinned packaging target fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestTargetField -Sandbox $Root -Key 'architecture' -Value 'arm64'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'does not match the pinned packaging target') "expected pinned-target rejection in output: $($Result.Output)"
+        Assert ($Result.Output -match 'target\.architecture') "expected 'target.architecture' in output: $($Result.Output)"
+        Assert ($Result.Output -match 'arm64') 'expected the offending architecture value in output'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a target mismatch'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 16. Manifest target.triple does not match the pinned packaging target.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'manifest target.triple mismatch with pinned packaging target fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestTargetField -Sandbox $Root -Key 'triple' -Value 'x86_64-pc-windows-gnu'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'does not match the pinned packaging target') "expected pinned-target rejection in output: $($Result.Output)"
+        Assert ($Result.Output -match 'target\.triple') "expected 'target.triple' in output: $($Result.Output)"
+        Assert ($Result.Output -match 'x86_64-pc-windows-gnu') 'expected the offending triple value in output'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a target mismatch'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 17. Manifest target.os does not match the pinned packaging target.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'manifest target.os mismatch with pinned packaging target fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestTargetField -Sandbox $Root -Key 'os' -Value 'linux'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'does not match the pinned packaging target') "expected pinned-target rejection in output: $($Result.Output)"
+        Assert ($Result.Output -match 'target\.os') "expected 'target.os' in output: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a target mismatch'
     }
     finally {
         Remove-Sandbox $Root

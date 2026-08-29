@@ -44,7 +44,7 @@ artifact list is no longer hardcoded in the script.
 | --- | --- |
 | `schema_version` | Manifest schema version (currently `1`). |
 | `product.name` / `product.version` | Product identity (`NextIDE`, `0.1.0`). `product.version` must equal the `[workspace.package]` version in the root `Cargo.toml`; `build.ps1` enforces the match (see [Version consistency](#version-consistency)). |
-| `target.os` / `target.arch` / `target.triple` | Declared target platform (`windows`, `x86_64`, `x86_64-pc-windows-msvc`). Informational — the script builds with the host toolchain. |
+| `target.os` / `target.architecture` / `target.triple` | Declared target platform (`windows`, `x86_64`, `x86_64-pc-windows-msvc`). **Enforced**: each field must equal the pinned packaging target this script produces — `os` = `windows`, `architecture` = `x86_64`, `triple` = `x86_64-pc-windows-msvc` — and the triple's architecture component must agree with `architecture` (see [Target consistency](#target-consistency)). |
 | `build.profile` / `build.command` / `build.output_dir` | Declared build metadata (informational — the script deliberately always runs the pinned, safe `cargo build --release` from the repo root; it never executes an arbitrary command read from a manifest). |
 | `stage.output_dir` | Declared staging location (informational — the script deliberately pins staging to the repo-local `dist/windows` so a tampered manifest can never redirect writes outside the repository). |
 | `artifacts[]` | Each entry: `id`, `file` (staged file name), `source` (repo-relative path of the release binary), optional `description`, optional `expected_sha256`. `file` must equal the source file name. |
@@ -75,6 +75,20 @@ release that claims a version the workspace does not declare. A missing
 `Cargo.toml`, a missing `[workspace.package]` version, or a mismatch with
 `product.version` is a hard error (non-zero exit).
 
+### Target consistency
+
+`target.os` / `target.architecture` / `target.triple` are not free-form
+either: each must match the **pinned packaging target** this script produces —
+`windows` / `x86_64` / `x86_64-pc-windows-msvc` (64-bit x86 Windows with the
+MSVC toolchain). `build.ps1` compares all three against the pinned values
+before anything is built or staged and fails loudly on any mismatch, so a
+stale or cross-arch manifest (wrong os, wrong architecture such as `arm64`,
+wrong triple such as `x86_64-pc-windows-gnu`, or an architecture/triple pair
+that disagrees with each other) can never stage an artifact set for the wrong
+platform. The release build itself still runs with the host stable Rust
+toolchain (`cargo build --release`) — the pins guarantee the manifest agrees
+with the target the artifacts are actually built for.
+
 ## Prerequisites
 
 - Windows 10/11 (the project targets Windows).
@@ -98,14 +112,18 @@ The script:
    the root `Cargo.toml` (read-only text parse of `Cargo.toml` — no `cargo`
    invocation, no dependencies) and fails before building or staging on any
    mismatch;
-3. runs `cargo build --release` from the repository root and **fails with a
+3. checks that the manifest target block matches the pinned packaging target
+   `x86_64-pc-windows-msvc` (`target.os` = `windows`, `target.architecture` =
+   `x86_64`, `target.triple` = `x86_64-pc-windows-msvc`, mutually consistent)
+   and fails before building or staging on any mismatch;
+4. runs `cargo build --release` from the repository root and **fails with a
    non-zero exit code** if the build fails;
-4. checks that every artifact listed in the manifest exists in
+5. checks that every artifact listed in the manifest exists in
    `target\release\` — an unexpected missing artifact is a hard error, so a
    stale `dist` can never look like a successful build;
-5. creates `dist\windows\` if needed and copies the executables there
+6. creates `dist\windows\` if needed and copies the executables there
    (overwriting in place);
-6. verifies the staged copies exist, match the release binaries by size and
+7. verifies the staged copies exist, match the release binaries by size and
    SHA-256, honor any pinned `expected_sha256`, and prints each file's size
    and SHA-256.
 
@@ -129,8 +147,9 @@ The script is deliberately boring. It never:
 - accesses the network.
 
 Every failure path — missing cargo, failed build, invalid manifest,
-`product.version`/Cargo.toml version mismatch, missing artifact, size/hash
-mismatch — exits non-zero with a message explaining what was wrong.
+`product.version`/Cargo.toml version mismatch, manifest target block mismatch
+with the pinned `x86_64-pc-windows-msvc` packaging target, missing artifact,
+size/hash mismatch — exits non-zero with a message explaining what was wrong.
 
 ## Testing
 
@@ -151,7 +170,7 @@ both Windows PowerShell 5.1 and PowerShell 7.
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
 ```
 
-Covered scenarios (14 tests):
+Covered scenarios (17 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -169,6 +188,9 @@ Covered scenarios (14 tests):
 | `product.version` mismatch with Cargo.toml `[workspace.package]` version | fail before build/staging |
 | Missing root `Cargo.toml` | fail |
 | `Cargo.toml` without `[workspace.package]` version | fail |
+| `target.architecture` mismatch with pinned packaging target (`x86_64`) | fail before build/staging, nothing staged |
+| `target.triple` mismatch with pinned packaging target (`x86_64-pc-windows-msvc`) | fail before build/staging, nothing staged |
+| `target.os` mismatch with pinned packaging target (`windows`) | fail before build/staging, nothing staged |
 
 The script exits `0` when every test passes and `1` when any fails. Useful
 switches: `-BuildScript <path>` points at another copy of `build.ps1` under

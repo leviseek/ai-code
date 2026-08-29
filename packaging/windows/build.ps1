@@ -22,6 +22,14 @@
     before anything is built or staged, so a stale manifest can never ship a
     release that claims a version the workspace does not declare.
 
+    The manifest target block is enforced the same way: target.os must be
+    'windows', target.architecture must be 'x86_64', and target.triple must be
+    'x86_64-pc-windows-msvc' — the pinned packaging target this script
+    produces. A manifest declaring any other target (wrong os, wrong
+    architecture, wrong triple, or an architecture/triple pair that disagrees)
+    fails before anything is built or staged, so a stale or cross-arch manifest
+    can never stage an artifact set for the wrong platform.
+
     It deliberately performs NO dangerous operations:
       - no deleting / cleaning of existing directories (dist is overwritten
         in place with Copy-Item -Force, never removed first)
@@ -31,8 +39,9 @@
 
     The script fails loudly (non-zero exit code) if cargo is missing, the
     release build fails, the manifest is invalid, product.version does not
-    match the Cargo.toml workspace version, or an expected artifact is missing
-    or mismatched before or after staging.
+    match the Cargo.toml workspace version, the manifest target block does not
+    match the pinned packaging target x86_64-pc-windows-msvc, or an expected
+    artifact is missing or mismatched before or after staging.
 
 .PARAMETER SkipBuild
     Skip the `cargo build --release` step and only (re)stage the artifacts
@@ -105,8 +114,14 @@ function Get-ProductManifest {
     if ($null -eq $Manifest.product -or [string]::IsNullOrWhiteSpace($Manifest.product.name)) {
         throw 'Manifest is missing product.name'
     }
-    if ($null -eq $Manifest.target -or [string]::IsNullOrWhiteSpace($Manifest.target.arch)) {
-        throw 'Manifest is missing target.arch'
+    if ($null -eq $Manifest.target -or [string]::IsNullOrWhiteSpace($Manifest.target.os)) {
+        throw 'Manifest is missing target.os'
+    }
+    if ($null -eq $Manifest.target -or [string]::IsNullOrWhiteSpace($Manifest.target.architecture)) {
+        throw 'Manifest is missing target.architecture'
+    }
+    if ($null -eq $Manifest.target -or [string]::IsNullOrWhiteSpace($Manifest.target.triple)) {
+        throw 'Manifest is missing target.triple'
     }
     if ($null -eq $Manifest.verification -or [string]::IsNullOrWhiteSpace($Manifest.verification.algorithm)) {
         throw 'Manifest is missing verification.algorithm'
@@ -169,6 +184,33 @@ function Get-Sha256 {
 
 $Manifest  = Get-ProductManifest
 
+# The manifest target block must match the pinned packaging target this script
+# produces: x86_64-pc-windows-msvc (64-bit x86 Windows with the MSVC
+# toolchain). A manifest declaring any other target (wrong os, wrong
+# architecture, wrong triple, or an architecture/triple pair that disagrees
+# with each other) is a hard error before anything is built or staged, so a
+# stale or cross-arch manifest can never stage an artifact set for the wrong
+# platform.
+$PinnedTargetOs     = 'windows'
+$PinnedTargetArch   = 'x86_64'
+$PinnedTargetTriple = 'x86_64-pc-windows-msvc'
+
+$TargetOs     = Get-ManifestField $Manifest.target 'os'
+$TargetArch   = Get-ManifestField $Manifest.target 'architecture'
+$TargetTriple = Get-ManifestField $Manifest.target 'triple'
+if ($TargetOs -ne $PinnedTargetOs) {
+    throw "Manifest target.os '$TargetOs' does not match the pinned packaging target os '$PinnedTargetOs' (x86_64-pc-windows-msvc)"
+}
+if ($TargetArch -ne $PinnedTargetArch) {
+    throw "Manifest target.architecture '$TargetArch' does not match the pinned packaging target architecture '$PinnedTargetArch' (x86_64-pc-windows-msvc)"
+}
+if ($TargetTriple -ne $PinnedTargetTriple) {
+    throw "Manifest target.triple '$TargetTriple' does not match the pinned packaging target triple '$PinnedTargetTriple'"
+}
+if ($TargetTriple.Split('-')[0] -ne $TargetArch) {
+    throw "Manifest target.architecture '$TargetArch' is inconsistent with target.triple '$TargetTriple' (triple must start with the declared architecture)"
+}
+
 # product.version must equal the [workspace.package] version in the root
 # Cargo.toml. Fail fast (before any build or staging) so a stale manifest can
 # never ship a release that claims a version the workspace does not declare.
@@ -208,15 +250,13 @@ $Report = @($Report) | ForEach-Object { [string]$_ }
 # runs the pinned, safe `cargo build --release` from the repo root, never an
 # arbitrary command read from a manifest, so a tampered manifest cannot make
 # the script execute something else or write outside the repository.
-$TargetOs       = Get-ManifestField $Manifest.target 'os'
-$TargetTriple   = Get-ManifestField $Manifest.target 'triple'
 $Strategy       = Get-ManifestField $Manifest.verification 'strategy'
 
 Write-Step "NextIDE packaging baseline (repo root: $RepoRoot)"
 Write-Host "  manifest: $ManifestPath"
 Write-Host "  product:  $($Manifest.product.name) $ProductVersion"
 Write-Host "  version:  manifest '$ProductVersion' == Cargo.toml [workspace.package] '$CargoVersion'"
-Write-Host "  target:   $TargetOs/$($Manifest.target.arch) ($TargetTriple)"
+Write-Host "  target:   $TargetOs/$TargetArch ($TargetTriple)"
 Write-Host "  verify:   $Strategy / $($Manifest.verification.algorithm)"
 
 if (-not $SkipBuild) {
