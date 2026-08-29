@@ -2,6 +2,7 @@ mod command_registry;
 mod commands;
 mod event_loop;
 mod git_diff;
+mod git_diff_panel;
 mod git_status;
 mod input;
 mod keymap;
@@ -28,6 +29,7 @@ pub use git_diff::{
     DefaultGitDiffAdapter, DiffFileView, DiffHunkView, DiffLineKind, DiffLineView, DiffSummary,
     GitDiffAdapter,
 };
+pub use git_diff_panel::DiffPanelSnapshot;
 pub use git_status::{
     aggregate_directory_status, marker_for, status_kind, summary, summary_text, tree_statuses,
     DefaultGitStatusAdapter, GitStatusAdapter, GitStatusSummary, StatusKind, TreeStatus,
