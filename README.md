@@ -2,6 +2,8 @@
 
 NextIDE is a local-first, capability-oriented coding IDE.
 
+[![CI](https://github.com/leviseek/ai-code/actions/workflows/ci.yml/badge.svg)](https://github.com/leviseek/ai-code/actions/workflows/ci.yml)
+
 ## Workspace status
 
 The repository currently contains the first Phase 0 vertical slice:
@@ -64,3 +66,13 @@ cargo run -p nextide-cli -- task-smoke
 Background async tasks can also be bridged to a caller-owned `EventBus`: `TaskManager::spawn_async_with_sink` / `spawn_async_timeout_with_sink` accept an `AsyncTaskEventSink`, and the UI thread polls the matching `TaskEventReceiver` (e.g. each frame) and replays what it consumed into the `EventBus` with `publish_into` — so the background worker never holds the non-thread-safe bus, while the async task's lifecycle and output still surface as `task.*` events.
 
 The editor kernel is the single source of truth for document mutations. UI, AI, collaboration, and extensions must eventually submit changes through the same transaction API.
+
+## CI
+
+GitHub Actions CI (`.github/workflows/ci.yml`) runs on a `windows-latest` runner, since the project targets Windows, and gates every push and pull request with the same three checks that are verified locally:
+
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+
+The workflow installs only the stable Rust toolchain (with `rustfmt` and `clippy` components); the workspace has no external dependencies and nothing else is downloaded. See the [workflow status](https://github.com/leviseek/ai-code/actions/workflows/ci.yml) for current runs.
