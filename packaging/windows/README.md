@@ -567,12 +567,50 @@ The `release` job attaches four assets to each GitHub Release:
 first, then a CLI smoke — the same two gates CI runs on the exact bytes it
 publishes. Any verification failure means: do **not** run the binaries.
 
+### Release assets and the checksum file name consistency
+
+Each Release page's "Assets" section lists exactly four files, with two
+distinct roles — two are checksum-covered binaries, two are not:
+
+| Asset | Role | Covered by the checksum manifest? |
+| --- | --- | --- |
+| `nextide-cli.exe` | CLI binary | Yes — has a `<hash>  <file>` entry |
+| `nextide-shell.exe` | Desktop Shell binary | Yes — has a `<hash>  <file>` entry |
+| `<checksum file>` (committed value `SHA256SUMS.txt`) | The SHA-256 checksum manifest listing the two binaries | No — it is the manifest itself and never lists itself |
+| `manifest.json` | Release metadata (product identity, pinned target, license, publisher, channel, artifact list) | **No** — release metadata, not a release binary |
+
+Two consistency rules follow, and both guard the same trap: the four assets
+are *not* interchangeable files.
+
+1. **The checksum asset's file name is exactly `stage.checksum_file` from the
+   committed manifest — never an arbitrary name.** The name on the Release
+   page, the file `build.ps1` generates inside `dist/windows`, the name
+   `verify-checksums.ps1` reads by default, and the name the release notes
+   reference in `sha256sum -c <file>` are one and the same value (committed
+   value `SHA256SUMS.txt`). A release whose checksum asset was renamed only on
+   the Release page — without renaming `stage.checksum_file` in
+   `packaging/windows/manifest.json` — is inconsistent by construction: verify
+   against the name shown on the page, and treat the release as broken if that
+   name does not equal the manifest-declared one.
+
+2. **`manifest.json` is release metadata, not a checksum-covered file — never
+   put it in the checksum directory.** The checksum manifest covers exactly the
+   two binaries. The consumer verifier (and GNU `sha256sum -c`) enforce an
+   exact-match contract: any file in the verified folder that has no entry is
+   rejected. `manifest.json` has no entry by design, so a folder holding all
+   four Release assets can **never** verify — the rejection is the contract
+   working, not a broken download. Keep `manifest.json` outside the verified
+   folder (next to it is fine); it is metadata *about* the release, not
+   something the checksum manifest covers.
+
 ### 1. Download
 
 Create a clean folder and put **only** the two binaries and the checksum file
 in it. `manifest.json` is release metadata and is *not* covered by the checksum
 manifest — the verifier's exact-match rule rejects any file that has no entry,
-so keep it out of the verified folder (next to it is fine):
+so keep it out of the verified folder (next to it is fine; see
+[Release assets and the checksum file name consistency](#release-assets-and-the-checksum-file-name-consistency)
+above for why a folder with all four assets in it can never verify):
 
 ```powershell
 # PowerShell — set $Tag to the tag of the release you downloaded:
