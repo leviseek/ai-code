@@ -329,7 +329,13 @@ jobs:
     # version must equal `product.version` in the committed manifest, which
     # the packaging job already proved equals the [workspace.package] version
     # in the root Cargo.toml — so the release is always tagged with exactly
-    # the version the artifacts claim.
+    # the version the artifacts claim. The job's own gate rules are proven
+    # first by a sandboxed simulation suite (test-release-sim.ps1, 22 cases,
+    # zero framework) that runs right after checkout, before anything is
+    # downloaded or published: it exercises the tag/version rejection rules
+    # and the four-file release file manifest against throwaway %TEMP%
+    # sandboxes — no network access, no GitHub Release ever created, the
+    # repository never touched.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: packaging-windows
     runs-on: windows-latest
@@ -341,6 +347,32 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify release job simulation (test-release-sim.ps1 gate)
+        # Pre-publish self-test gate for this job's own rules, run in a
+        # sandbox before anything is downloaded or published. The zero-framework
+        # suite (22 cases) proves, in two parts, exactly what this job gates:
+        #   - tag/version rejection rules (the "Resolve release metadata from
+        #     manifest (channel + version vs tag)" logic): channel must be
+        #     exactly stable or beta, product.version must be non-blank, the
+        #     pushed tag must be exactly v<product.version> — non-v tags,
+        #     malformed semver (v0.1, v0.1.0.1), pre-release tags (v0.1.0-beta),
+        #     tags that disagree with the manifest version, invalid channels,
+        #     blank versions, invalid JSON and missing manifests are all
+        #     rejected; the committed manifest resolves with its matching tag.
+        #   - release file manifest (the four files the publish step attaches:
+        #     nextide-cli.exe, nextide-shell.exe, SHA256SUMS.txt and
+        #     release-metadata/manifest.json): every attachment present and
+        #     non-empty, the dist directory passing the repository's own
+        #     consumer-side verifier (verify-checksums.ps1 — the same gate
+        #     this job runs on the downloaded bytes), the checksum entries
+        #     exactly matching the manifest artifact list, and the metadata
+        #     manifest byte-identical to the committed one.
+        # Every case runs against a throwaway sandbox under $env:TEMP — no
+        # network access, no GitHub Release ever created, the repository never
+        # touched — so a failing test stops the run before anything is
+        # downloaded or published.
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-release-sim.ps1
 
       - name: Resolve release metadata from manifest (channel + version vs tag)
         # Read the committed packaging/windows/manifest.json (read-only local
