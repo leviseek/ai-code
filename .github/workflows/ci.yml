@@ -49,7 +49,10 @@ jobs:
     # right after checkout the job reads release.release_channel from the
     # committed packaging/windows/manifest.json (read-only, no network) and
     # uses it as the artifact name suffix, so stable and beta runs can never
-    # overwrite each other's artifact in the Actions artifact store.
+    # overwrite each other's artifact in the Actions artifact store. Before
+    # the upload, the staged CLI binary itself is smoke-tested end to end
+    # (nextide-cli.exe smoke), so the artifact that ships is proven to run,
+    # not just to hash-match its source.
     needs: ci
     runs-on: windows-latest
     steps:
@@ -109,6 +112,17 @@ jobs:
         # SHA-256. No rebuild: the release binaries from the step above are
         # staged as-is.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -SkipBuild
+
+      - name: Smoke-test the staged CLI artifact (nextide-cli.exe smoke)
+        # End-to-end proof that the packaged binary actually runs: execute the
+        # staged release executable's editor-kernel smoke flow (apply an edit,
+        # undo, redo, assert the document text) directly from dist/windows.
+        # The CLI panics on any failure, so a non-zero exit fails the run
+        # before the artifact is uploaded — hash equality alone would not
+        # catch a binary that fails to start or misbehaves at runtime. The
+        # headless shell is not executed here (it starts an event loop and
+        # would block the runner).
+        run: .\dist\windows\nextide-cli.exe smoke
 
       - name: Upload dist/windows artifact
         # The artifact name carries the manifest's release_channel suffix

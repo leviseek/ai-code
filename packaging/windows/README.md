@@ -226,9 +226,15 @@ test, `-SandboxRoot <dir>` overrides where sandboxes are created, and
 `-KeepSandbox` keeps the sandboxes for inspection instead of deleting them.
 
 Note: the `cargo build --release` *success* path is not exercised by the
-sandboxed suite (there is no `Cargo.toml` in a sandbox); it is covered by CI
-(`.github/workflows/ci.yml`). The suite does verify that a failing build makes
-the script exit non-zero without staging anything.
+sandboxed suite. Every sandbox does get a minimal root `Cargo.toml` (a
+memberless workspace whose `[workspace.package]` version comes from the
+manifest template, so the version-consistency check runs on every test), but
+that workspace has no member crates and can therefore never produce the
+release binaries — only the happy-path staging of fake binaries is sandboxed.
+The real build is covered by CI (`.github/workflows/ci.yml`), which also
+smoke-tests the staged `nextide-cli.exe` before uploading it. The suite does
+verify that a failing build makes the script exit non-zero without staging
+anything.
 
 ## Verify
 
@@ -262,6 +268,9 @@ dedicated step right after checkout (read-only local parse, no network, same
 `stable`/`beta` rule `build.ps1` enforces, so an undeclared channel fails the
 run before the self-test gate, the build, and staging). The channel-suffixed
 name guarantees stable and beta runs produce distinct artifacts and can never
-overwrite each other in the Actions artifact store. That job is what
-exercises the real-repository `cargo build --release` success path end to end
-on CI.
+overwrite each other in the Actions artifact store. Before the upload the job
+also smoke-tests the staged CLI binary itself (`.\dist\windows\nextide-cli.exe
+smoke` — the same flow listed above, panicking on any failure), so the
+artifact that ships is proven to run, not just to hash-match its source. That
+job is what exercises the real-repository `cargo build --release` success path
+end to end on CI.
