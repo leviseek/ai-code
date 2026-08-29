@@ -24,7 +24,9 @@
     "output_dir": "target/release"
   },
   "stage": {
-    "output_dir": "dist/windows"
+    "output_dir": "dist/windows",
+    "checksum_file": "SHA256SUMS.txt",
+    "notes": "The staging directory also receives a generated SHA-256 checksum manifest: one '<hash>  <file>' line per staged artifact, in manifest artifact order, LF line endings (GNU sha256sum -c compatible). The file name is required and validated read-only by build.ps1 before anything is built or staged — it must be a plain leaf name (no path separators, no '.'/'..') and must not collide with any declared artifact file, because the checksum manifest is generated, not staged. build.ps1 regenerates it on every run from the verified staged hashes and re-verifies it (parses it back and matches every line against the staged SHA-256) before finishing."
   },
   "artifacts": [
     {

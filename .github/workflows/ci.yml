@@ -67,7 +67,14 @@ jobs:
     # the release metadata and a non-empty artifact list, plus a cross-check
     # that the file's release_channel equals the channel resolved for this
     # run — so the uploaded manifest is proven consistent with the manifest
-    # the pipeline validated and with the channel in the artifact name.
+    # the pipeline validated and with the channel in the artifact name. The
+    # staged directory also carries a generated SHA-256 checksum manifest
+    # (SHA256SUMS.txt, named by the manifest's stage.checksum_file): build.ps1
+    # -SkipBuild writes it from the verified staged hashes and re-verifies it
+    # on the spot, and a dedicated pre-upload gate re-checks the exact file
+    # against the actual dist/windows contents right before the dist upload,
+    # so consumers of the dist artifact can verify every binary against the
+    # checksum manifest that ships with it.
     needs: ci
     runs-on: windows-latest
     steps:
@@ -121,10 +128,12 @@ jobs:
 
       - name: Stage release artifacts into dist/windows (-SkipBuild)
         # Re-runs the same read-only manifest verification the self-test gate
-        # covered (manifest validity, version, target, release metadata)
-        # against the committed manifest.json and the real Cargo.toml before
-        # staging anything, then verifies each staged artifact by size and
-        # SHA-256. No rebuild: the release binaries from the step above are
+        # covered (manifest validity, version, target, release metadata,
+        # checksum file name) against the committed manifest.json and the
+        # real Cargo.toml before staging anything, then verifies each staged
+        # artifact by size and SHA-256 and writes the SHA256SUMS.txt checksum
+        # manifest from the verified hashes (re-verifying it by parsing it
+        # back). No rebuild: the release binaries from the step above are
         # staged as-is.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -SkipBuild
 
@@ -139,10 +148,62 @@ jobs:
         # would block the runner).
         run: .\dist\windows\nextide-cli.exe smoke
 
+      - name: Verify SHA256SUMS.txt before dist artifact upload
+        # Pre-upload gate for the checksum manifest that ships inside
+        # dist/windows. build.ps1 -SkipBuild (step above) generated
+        # SHA256SUMS.txt from the verified staged hashes and already re-verified
+        # it; this step re-reads the exact file about to be uploaded with
+        # PowerShell's built-in Get-FileHash — no dependencies, no network —
+        # and proves it is consistent with the directory that ships: the file
+        # must exist and parse as '<64-hex>  <file>' lines, every staged
+        # artifact must have exactly one entry, and every entry's hash must
+        # equal the actual SHA-256 of the file in dist/windows. Any missing,
+        # corrupt, extra or mismatched entry fails the run before the upload,
+        # so the checksum manifest that ships is proven correct, not just
+        # present.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $DistDir = 'dist/windows'
+          $ChecksumPath = Join-Path $DistDir 'SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $ChecksumPath)) {
+            throw "Missing checksum manifest to upload: $ChecksumPath"
+          }
+          $Entries = @{}
+          foreach ($Line in (Get-Content -LiteralPath $ChecksumPath)) {
+            if ([string]::IsNullOrWhiteSpace($Line)) { continue }
+            if ($Line -notmatch '^([0-9a-fA-F]{64})  ([^\r\n]+)$') {
+              throw "Checksum manifest line is not in '<hash>  <file>' format: '$Line'"
+            }
+            $Entries[$Matches[2]] = $Matches[1].ToUpperInvariant()
+          }
+          if ($Entries.Count -eq 0) {
+            throw 'SHA256SUMS.txt is empty'
+          }
+          $Staged = @(Get-ChildItem -LiteralPath $DistDir -File)
+          foreach ($File in $Staged) {
+            if ($File.Name -eq 'SHA256SUMS.txt') { continue }
+            if (-not $Entries.ContainsKey($File.Name)) {
+              throw "Staged artifact '$($File.Name)' has no SHA256SUMS.txt entry"
+            }
+            $Actual = (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash
+            if ($Actual -ne $Entries[$File.Name]) {
+              throw "SHA256SUMS.txt hash mismatch for '$($File.Name)': file says $($Entries[$File.Name]), actual $Actual"
+            }
+          }
+          if ($Entries.Count -ne @($Staged | Where-Object { $_.Name -ne 'SHA256SUMS.txt' }).Count) {
+            throw 'SHA256SUMS.txt declares entries for files not present in the staged directory'
+          }
+          Write-Host "SHA256SUMS.txt OK: $($Entries.Count) entries all match the staged artifacts"
+
       - name: Upload dist/windows artifact
         # The artifact name carries the manifest's release_channel suffix
         # (resolved by the step above), so stable and beta runs produce
-        # distinct artifacts and can never overwrite each other.
+        # distinct artifacts and can never overwrite each other. The uploaded
+        # directory includes the SHA256SUMS.txt checksum manifest generated
+        # and verified by build.ps1 -SkipBuild and re-verified by the step
+        # above, so consumers of the artifact can verify every binary against
+        # the manifest that ships with it.
         uses: actions/upload-artifact@v4
         with:
           name: nextide-windows-dist-${{ steps.release-channel.outputs.release_channel }}
@@ -162,7 +223,9 @@ jobs:
         # target block must equal the pinned windows / x86_64 /
         # x86_64-pc-windows-msvc packaging target, the release block must
         # carry non-empty license/publisher with a release_channel of exactly
-        # stable or beta, and the artifact list must be non-empty — and the
+        # stable or beta, stage.checksum_file must be a plain leaf name that
+        # does not collide with any artifact file, and the artifact list must
+        # be non-empty — and the
         # file's release_channel must equal the channel this run resolved
         # right after checkout (steps.release-channel), so the uploaded
         # manifest is proven consistent with the manifest the run validated
@@ -215,6 +278,12 @@ jobs:
           if ($Channel -ne $env:RESOLVED_CHANNEL) {
             throw "Manifest release_channel '$Channel' does not match the channel resolved for this run: '$env:RESOLVED_CHANNEL'"
           }
+          if ($null -eq $Manifest.stage -or [string]::IsNullOrWhiteSpace([string]$Manifest.stage.checksum_file)) {
+            throw 'Manifest stage.checksum_file is missing or blank'
+          }
+          if ($Manifest.stage.checksum_file -match '[\\/]' -or $Manifest.stage.checksum_file -eq '.' -or $Manifest.stage.checksum_file -eq '..') {
+            throw "Manifest stage.checksum_file must be a plain file name, got: '$($Manifest.stage.checksum_file)'"
+          }
           $Artifacts = @($Manifest.artifacts)
           if ($Artifacts.Count -eq 0) {
             throw 'Manifest declares no artifacts'
@@ -225,8 +294,11 @@ jobs:
                 [string]::IsNullOrWhiteSpace([string]$Artifact.source)) {
               throw 'Every manifest artifact needs non-empty id, file and source'
             }
+            if ($Artifact.file -eq $Manifest.stage.checksum_file) {
+              throw "Manifest stage.checksum_file '$($Manifest.stage.checksum_file)' collides with artifact file '$($Artifact.file)'"
+            }
           }
-          Write-Host "Manifest OK: valid JSON, schema $($Manifest.schema_version), product $($Manifest.product.name) $($Manifest.product.version), target $($Manifest.target.os)/$($Manifest.target.architecture) ($($Manifest.target.triple)), channel $Channel, $($Artifacts.Count) artifacts"
+          Write-Host "Manifest OK: valid JSON, schema $($Manifest.schema_version), product $($Manifest.product.name) $($Manifest.product.version), target $($Manifest.target.os)/$($Manifest.target.architecture) ($($Manifest.target.triple)), channel $Channel, $($Artifacts.Count) artifacts, checksum file $($Manifest.stage.checksum_file)"
 
       - name: Upload manifest.json release metadata artifact
         # Upload the committed packaging manifest as release metadata next to

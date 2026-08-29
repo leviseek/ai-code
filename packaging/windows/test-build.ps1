@@ -20,7 +20,8 @@
 
     Covered scenarios:
       1. -SkipBuild happy path: artifacts staged, size+SHA-256 verified,
-         report printed, pre-existing files in dist\windows\ preserved
+         report printed, SHA256SUMS.txt checksum manifest written and
+         matching, pre-existing files in dist\windows\ preserved
       2. missing manifest.json                  -> fails
       3. missing release artifact (source)      -> fails
       4. wrong pinned expected_sha256           -> fails
@@ -44,6 +45,9 @@
      21. missing release.release_channel        -> fails
      22. release.release_channel not stable/beta (e.g. 'alpha')       -> fails
      23. release.release_channel 'beta' (valid channel)               -> passes
+     24. stage.checksum_file with a path separator                    -> fails
+     25. stage.checksum_file colliding with an artifact file name     -> fails
+     26. custom stage.checksum_file name (CHECKSUMS.txt)              -> passes
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -317,6 +321,20 @@ function Set-ManifestReleaseField {
     Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
 }
 
+function Set-ManifestStageField {
+    # Overwrite (or add) a field inside the stage block of the sandbox
+    # manifest (e.g. stage.checksum_file).
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)]$Value
+    )
+    $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
+    $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    $Manifest.stage | Add-Member -NotePropertyName $Key -NotePropertyValue $Value -Force
+    Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
+}
+
 function Remove-ManifestProperty {
     # Remove a top-level property from the sandbox manifest (e.g. the whole
     # release block) to test missing-block rejection.
@@ -365,6 +383,22 @@ Invoke-Test -Name 'SkipBuild happy path stages artifacts and preserves pre-exist
         Assert ((Get-Sha256Hex $Cli) -eq (Get-Sha256Hex $CliSrc)) 'staged cli SHA-256 differs from source'
         Assert ((Get-Sha256Hex $Shell) -eq (Get-Sha256Hex $ShellSrc)) 'staged shell SHA-256 differs from source'
         Assert ((Get-Item -LiteralPath $Cli).Length -eq (Get-Item -LiteralPath $CliSrc).Length) 'staged cli size differs from source'
+
+        # The run must also write a SHA256SUMS.txt checksum manifest: one
+        # '<64-hex>  <file>' line per staged artifact, matching the staged
+        # hashes exactly.
+        $Checksum = Join-Path $Dist 'SHA256SUMS.txt'
+        Assert (Test-Path -LiteralPath $Checksum) 'SHA256SUMS.txt was not generated'
+        $Lines = @(Get-Content -LiteralPath $Checksum)
+        Assert ($Lines.Count -eq 2) "expected 2 checksum lines, got $($Lines.Count): $($Result.Output)"
+        foreach ($Line in $Lines) {
+            Assert ($Line -match '^[0-9a-fA-F]{64}  [^\r\n]+$') "checksum line is not in '<hash>  <file>' format: '$Line'"
+        }
+        Assert ($Lines[0] -match '  nextide-cli\.exe$') 'expected nextide-cli.exe entry in SHA256SUMS.txt'
+        Assert ($Lines[1] -match '  nextide-shell\.exe$') 'expected nextide-shell.exe entry in SHA256SUMS.txt'
+        Assert ((($Lines[0] -split '  ')[0]).ToUpperInvariant() -eq (Get-Sha256Hex $Cli)) 'SHA256SUMS.txt cli hash does not match the staged file'
+        Assert ((($Lines[1] -split '  ')[0]).ToUpperInvariant() -eq (Get-Sha256Hex $Shell)) 'SHA256SUMS.txt shell hash does not match the staged file'
+        Assert ($Result.Output -match 'SHA256SUMS\.txt') 'expected the checksum manifest mention in output'
 
         Assert ((Get-Content -Raw -LiteralPath $Keep) -eq 'sentinel: must survive') 'pre-existing file in dist\windows was modified or deleted'
         Assert ($Result.Output -match 'Done\.') 'expected completion banner in output'
@@ -747,6 +781,69 @@ Invoke-Test -Name "release.release_channel 'beta' passes" -Body {
         Assert ($Result.ExitCode -eq 0) "expected exit 0, got $($Result.ExitCode)`n$($Result.Output)"
         Assert ($Result.Output -match 'channel=beta') 'expected the release channel line in output'
         Assert (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe')) 'nextide-cli.exe was not staged'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 24. stage.checksum_file must be a plain leaf name: a path separator means
+#     the generated checksum manifest would land outside the staging root.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'stage.checksum_file with a path separator fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Set-ManifestStageField -Sandbox $Root -Key 'checksum_file' -Value 'sub\SHA256SUMS.txt'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'checksum_file') "expected 'checksum_file' rejection in output: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a checksum-file violation'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 25. stage.checksum_file must not collide with a declared artifact file name
+#     (the checksum manifest is generated, never staged from a build output).
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'stage.checksum_file colliding with an artifact file name fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Set-ManifestStageField -Sandbox $Root -Key 'checksum_file' -Value 'nextide-cli.exe'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'collides') "expected checksum-file collision rejection in output: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a checksum-file collision'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 26. A custom stage.checksum_file name is honored (positive counterpart of
+#     tests 24/25): the file is generated under that name and the default
+#     SHA256SUMS.txt is not written.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name "custom stage.checksum_file name passes" -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Set-ManifestStageField -Sandbox $Root -Key 'checksum_file' -Value 'CHECKSUMS.txt'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -eq 0) "expected exit 0, got $($Result.ExitCode)`n$($Result.Output)"
+        $Dist = Join-Path $Root 'dist\windows'
+        $Checksum = Join-Path $Dist 'CHECKSUMS.txt'
+        Assert (Test-Path -LiteralPath $Checksum) 'custom checksum file was not generated'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Dist 'SHA256SUMS.txt'))) 'default SHA256SUMS.txt must not be written when a custom name is declared'
+        $Lines = @(Get-Content -LiteralPath $Checksum)
+        Assert ($Lines.Count -eq 2) "expected 2 checksum lines, got $($Lines.Count): $($Result.Output)"
+        Assert ($Result.Output -match 'CHECKSUMS\.txt') 'expected the custom checksum file name in output'
     }
     finally {
         Remove-Sandbox $Root
