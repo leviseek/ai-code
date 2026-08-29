@@ -13,6 +13,7 @@ pub mod capability;
 pub mod editor_view;
 pub mod events;
 pub mod file_tree;
+pub mod git;
 pub mod platform;
 pub mod process;
 pub mod render;
@@ -33,6 +34,7 @@ pub use capability::{CapabilityDescriptor, CapabilityRegistry, CapabilitySummary
 pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};
 pub use file_tree::{FileNode, FileNodeKind, FileTreeModel};
+pub use git::{status, GitFileState, GitStatusCode, GitStatusEntry, GitStatusSnapshot};
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};
 pub use render::{HeadlessSurface, RenderSurface, SurfaceSize};
