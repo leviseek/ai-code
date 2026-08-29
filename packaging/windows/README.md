@@ -10,6 +10,7 @@ install anything.
 | Area | Status |
 | --- | --- |
 | Release build (`cargo build --release`) | Done — performed and verified by the script |
+| Manifest-driven artifact list + verification | Done — `manifest.json` is the single source of truth; `build.ps1` validates and enforces it |
 | Stage CLI + Desktop Shell executables under `dist/windows/` | Done — performed by the script |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
@@ -20,15 +21,43 @@ install anything.
 ```
 packaging/
   windows/
-    build.ps1   # the only entry point
-    README.md   # this file
-dist/           # build output, git-ignored (not committed)
+    build.ps1      # the only entry point
+    manifest.json  # product metadata, target, artifact list, verification strategy
+    README.md      # this file
+dist/              # build output, git-ignored (not committed)
   windows/
     nextide-cli.exe
     nextide-shell.exe
 ```
 
 `dist/` is generated output and is ignored by git (see `.gitignore`).
+
+## Manifest (`manifest.json`)
+
+`manifest.json` describes what this packaging baseline produces and how it
+verifies it. `build.ps1` reads it as the **single source of truth** — the
+artifact list is no longer hardcoded in the script.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Manifest schema version (currently `1`). |
+| `product.name` / `product.version` | Product identity (`NextIDE`, `0.1.0`). |
+| `target.os` / `target.arch` / `target.triple` | Declared target platform (`windows`, `x86_64`, `x86_64-pc-windows-msvc`). Informational — the script builds with the host toolchain. |
+| `build.profile` / `build.command` / `build.output_dir` | How the release binaries are produced. |
+| `stage.output_dir` | Where artifacts are copied (`dist/windows`). |
+| `artifacts[]` | Each entry: `id`, `file` (staged file name), `source` (repo-relative path of the release binary), optional `description`, optional `expected_sha256`. `file` must equal the source file name. |
+| `verification.strategy` / `verification.algorithm` | Verification strategy (`exists-and-sha256` with SHA-256). |
+| `verification.rules` | `source_must_exist`, `staged_must_exist`, `staged_must_match_source` (all default to enforce when absent) and `report` (which fields to print: `size_bytes`, `sha256`). |
+
+Every artifact `source` must be a repo-relative path — rooted paths and `..`
+segments are rejected by the script.
+
+### Pinning hashes
+
+An artifact may declare `expected_sha256`. When present, the staged copy's
+SHA-256 must match it **exactly**, otherwise the script fails. The committed
+manifest leaves it unset because release binaries change with every build;
+pin it in a release flow when you want bit-for-bit reproducibility.
 
 ## Prerequisites
 
@@ -47,14 +76,18 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 
 The script:
 
-1. runs `cargo build --release` from the repository root and **fails with a
+1. loads and validates `manifest.json` — an invalid or incomplete manifest is
+   a hard error (non-zero exit);
+2. runs `cargo build --release` from the repository root and **fails with a
    non-zero exit code** if the build fails;
-2. checks that every expected executable exists in `target\release\`
-   (`nextide-cli.exe`, `nextide-shell.exe`) — an unexpected missing artifact
-   is a hard error, so a stale `dist` can never look like a successful build;
-3. creates `dist\windows\` if needed and copies the executables there
+3. checks that every artifact listed in the manifest exists in
+   `target\release\` — an unexpected missing artifact is a hard error, so a
+   stale `dist` can never look like a successful build;
+4. creates `dist\windows\` if needed and copies the executables there
    (overwriting in place);
-4. verifies the staged copies exist and prints each one's size and SHA-256.
+5. verifies the staged copies exist, match the release binaries by size and
+   SHA-256, honor any pinned `expected_sha256`, and prints each file's size
+   and SHA-256.
 
 To re-stage already-built executables without rebuilding:
 
@@ -73,7 +106,9 @@ The script is deliberately boring. It never:
 - reads or writes anything outside the repository;
 - accesses the network.
 
-Every failure path exits non-zero with a message explaining what was missing.
+Every failure path — missing cargo, failed build, invalid manifest, missing
+artifact, size/hash mismatch — exits non-zero with a message explaining what
+was wrong.
 
 ## Verify
 

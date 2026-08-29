@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "product": {
+    "name": "NextIDE",
+    "version": "0.1.0",
+    "description": "NextIDE is a minimal, platform-neutral editor kernel with a CLI and a headless desktop shell bootstrap (Rust workspace)."
+  },
+  "target": {
+    "os": "windows",
+    "arch": "x86_64",
+    "triple": "x86_64-pc-windows-msvc",
+    "notes": "The project targets Windows. build.ps1 uses the host stable Rust toolchain (cargo build --release); the triple is informational."
+  },
+  "build": {
+    "profile": "release",
+    "command": "cargo build --release",
+    "output_dir": "target/release"
+  },
+  "stage": {
+    "output_dir": "dist/windows"
+  },
+  "artifacts": [
+    {
+      "id": "nextide-cli",
+      "file": "nextide-cli.exe",
+      "source": "target/release/nextide-cli.exe",
+      "description": "NextIDE command-line interface (usage/help and the editor-kernel smoke flow)"
+    },
+    {
+      "id": "nextide-shell",
+      "file": "nextide-shell.exe",
+      "source": "target/release/nextide-shell.exe",
+      "description": "NextIDE headless desktop shell bootstrap (command registry, Git status/diff model layer)"
+    }
+  ],
+  "verification": {
+    "strategy": "exists-and-sha256",
+    "algorithm": "SHA256",
+    "rules": {
+      "source_must_exist": true,
+      "staged_must_exist": true,
+      "staged_must_match_source": true,
+      "report": ["size_bytes", "sha256"]
+    },
+    "notes": "Every artifact is checked before staging (source must exist) and after staging (staged copy must exist and match the release binary by size and SHA-256). An artifact may additionally pin an expected_sha256; when present, the staged hash must equal it exactly."
+  }
+}

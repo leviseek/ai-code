@@ -74,11 +74,13 @@ A minimal Windows packaging baseline lives in [`packaging/windows/`](packaging/w
 1. builds the release binaries: `cargo build --release`
 2. stages the CLI and Desktop Shell executables under `dist/windows/`
 
+[`packaging/windows/manifest.json`](packaging/windows/manifest.json) is the single source of truth for the product metadata, target architecture, artifact list, and verification strategy (exists-and-sha256); `build.ps1` loads, validates, and enforces it.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 ```
 
-The script verifies the release build succeeds and that every expected executable exists before copying, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. Installer, signing, and a CI packaging job are later phases (see `STATUS.md`).
+The script verifies the release build succeeds, validates the manifest, checks that every manifest artifact exists before copying, and after staging verifies each staged copy matches its release binary by size and SHA-256, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. Installer, signing, and a CI packaging job are later phases (see `STATUS.md`).
 
 ## CI
 
