@@ -15,6 +15,13 @@
     must exist and match the release binary by size and SHA-256). An artifact
     may pin an `expected_sha256`; when present, the staged hash must equal it.
 
+    Additionally, manifest product.version must equal the [workspace.package]
+    version declared in the root Cargo.toml (the single source of truth for the
+    workspace version). The script parses Cargo.toml read-only as plain text —
+    no cargo invocation, no TOML dependency — and fails loudly on a mismatch
+    before anything is built or staged, so a stale manifest can never ship a
+    release that claims a version the workspace does not declare.
+
     It deliberately performs NO dangerous operations:
       - no deleting / cleaning of existing directories (dist is overwritten
         in place with Copy-Item -Force, never removed first)
@@ -23,8 +30,9 @@
       - no network access
 
     The script fails loudly (non-zero exit code) if cargo is missing, the
-    release build fails, the manifest is invalid, or an expected artifact is
-    missing or mismatched before or after staging.
+    release build fails, the manifest is invalid, product.version does not
+    match the Cargo.toml workspace version, or an expected artifact is missing
+    or mismatched before or after staging.
 
 .PARAMETER SkipBuild
     Skip the `cargo build --release` step and only (re)stage the artifacts
@@ -122,12 +130,57 @@ function Get-ProductManifest {
     return $Manifest
 }
 
+function Get-CargoWorkspaceVersion {
+    # Read-only text parse of the root Cargo.toml: extract the version declared
+    # in the [workspace.package] table. No cargo invocation, no TOML library —
+    # just a line scan that tracks the current TOML section and matches
+    # `version = "x.y.z"` (double-quoted, per Cargo.toml convention) inside
+    # [workspace.package]. This is the single source of truth the manifest
+    # product.version must match.
+    $CargoToml = Join-Path $RepoRoot 'Cargo.toml'
+    if (-not (Test-Path -LiteralPath $CargoToml)) {
+        throw "Missing Cargo.toml at the repo root: $CargoToml (required to validate manifest product.version)"
+    }
+
+    $InWorkspacePackage = $false
+    $Version = $null
+    foreach ($Line in (Get-Content -LiteralPath $CargoToml -Encoding UTF8)) {
+        $Trimmed = $Line.Trim()
+        if ($Trimmed -match '^\[') {
+            # New TOML section header: only [workspace.package] is of interest.
+            $InWorkspacePackage = ($Trimmed -eq '[workspace.package]')
+            continue
+        }
+        if ($InWorkspacePackage -and $Trimmed -match '^version\s*=\s*"(?<v>[^"]+)"') {
+            $Version = $Matches['v']
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        throw "Cargo.toml at $CargoToml does not declare a [workspace.package] version (the single source of truth manifest product.version must match)"
+    }
+    return $Version
+}
+
 function Get-Sha256 {
     param([Parameter(Mandatory)][string]$Path)
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
 $Manifest  = Get-ProductManifest
+
+# product.version must equal the [workspace.package] version in the root
+# Cargo.toml. Fail fast (before any build or staging) so a stale manifest can
+# never ship a release that claims a version the workspace does not declare.
+$ProductVersion = Get-ManifestField $Manifest.product 'version'
+$CargoVersion   = Get-CargoWorkspaceVersion
+if ($null -eq $ProductVersion) {
+    throw 'Manifest is missing product.version'
+}
+if ($ProductVersion -ne $CargoVersion) {
+    throw "Manifest product.version '$ProductVersion' does not match Cargo.toml [workspace.package] version '$CargoVersion'"
+}
+
 $Artifacts = @($Manifest.artifacts) | ForEach-Object {
     [pscustomobject]@{
         Id             = $_.id
@@ -155,7 +208,6 @@ $Report = @($Report) | ForEach-Object { [string]$_ }
 # runs the pinned, safe `cargo build --release` from the repo root, never an
 # arbitrary command read from a manifest, so a tampered manifest cannot make
 # the script execute something else or write outside the repository.
-$ProductVersion = Get-ManifestField $Manifest.product 'version'
 $TargetOs       = Get-ManifestField $Manifest.target 'os'
 $TargetTriple   = Get-ManifestField $Manifest.target 'triple'
 $Strategy       = Get-ManifestField $Manifest.verification 'strategy'
@@ -163,6 +215,7 @@ $Strategy       = Get-ManifestField $Manifest.verification 'strategy'
 Write-Step "NextIDE packaging baseline (repo root: $RepoRoot)"
 Write-Host "  manifest: $ManifestPath"
 Write-Host "  product:  $($Manifest.product.name) $ProductVersion"
+Write-Host "  version:  manifest '$ProductVersion' == Cargo.toml [workspace.package] '$CargoVersion'"
 Write-Host "  target:   $TargetOs/$($Manifest.target.arch) ($TargetTriple)"
 Write-Host "  verify:   $Strategy / $($Manifest.verification.algorithm)"
 

@@ -74,21 +74,21 @@ A minimal Windows packaging baseline lives in [`packaging/windows/`](packaging/w
 1. builds the release binaries: `cargo build --release`
 2. stages the CLI and Desktop Shell executables under `dist/windows/`
 
-[`packaging/windows/manifest.json`](packaging/windows/manifest.json) is the single source of truth for the product metadata, target architecture, artifact list, and verification strategy (exists-and-sha256); `build.ps1` loads, validates, and enforces it.
+[`packaging/windows/manifest.json`](packaging/windows/manifest.json) is the single source of truth for the product metadata, target architecture, artifact list, and verification strategy (exists-and-sha256); `build.ps1` loads, validates, and enforces it. `product.version` must equal the `[workspace.package]` version declared in the root `Cargo.toml` (the workspace's single version source — every member crate inherits it via `version.workspace = true`); `build.ps1` enforces the match by a read-only text parse of `Cargo.toml` (no `cargo` invocation, no dependencies) and fails before building or staging on any mismatch.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 ```
 
-The script verifies the release build succeeds, validates the manifest, checks that every manifest artifact exists before copying, and after staging verifies each staged copy matches its release binary by size and SHA-256, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. Installer, signing, and a CI packaging job are later phases (see `STATUS.md`).
+The script verifies the release build succeeds, validates the manifest, checks that `product.version` matches the Cargo.toml workspace version, checks that every manifest artifact exists before copying, and after staging verifies each staged copy matches its release binary by size and SHA-256, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. Installer, signing, and a CI packaging job are later phases (see `STATUS.md`).
 
-The baseline is self-tested by [`packaging/windows/test-build.ps1`](packaging/windows/test-build.ps1) — a zero-framework PowerShell suite that runs `build.ps1` against throwaway sandbox copies under `%TEMP%` (the real repository is never modified) and covers the `-SkipBuild` happy path plus every failure mode: missing manifest, missing artifact, wrong pinned hash, path escapes (`..` and rooted paths), invalid JSON, file-name mismatch, unsupported schema version, and a failed release build. It also proves pre-existing files in `dist\windows\` are preserved (the script only overwrites, never deletes):
+The baseline is self-tested by [`packaging/windows/test-build.ps1`](packaging/windows/test-build.ps1) — a zero-framework PowerShell suite that runs `build.ps1` against throwaway sandbox copies under `%TEMP%` (the real repository is never modified) and covers the `-SkipBuild` happy path plus every failure mode: missing manifest, missing artifact, wrong pinned hash, path escapes (`..` and rooted paths), invalid JSON, file-name mismatch, unsupported schema version, a failed release build, a `product.version`/Cargo.toml workspace-version mismatch, a missing root `Cargo.toml`, and a `Cargo.toml` without a `[workspace.package]` version. It also proves pre-existing files in `dist\windows\` are preserved (the script only overwrites, never deletes):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
 ```
 
-The suite exits `0` when all 11 tests pass and `1` otherwise.
+The suite exits `0` when all 14 tests pass and `1` otherwise.
 
 ## CI
 

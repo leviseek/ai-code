@@ -1,6 +1,6 @@
 [package]
 name = "nextide-shell"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Platform-neutral desktop shell bootstrap for NextIDE"

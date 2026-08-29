@@ -3,7 +3,8 @@
   "product": {
     "name": "NextIDE",
     "version": "0.1.0",
-    "description": "NextIDE is a minimal, platform-neutral editor kernel with a CLI and a headless desktop shell bootstrap (Rust workspace)."
+    "description": "NextIDE is a minimal, platform-neutral editor kernel with a CLI and a headless desktop shell bootstrap (Rust workspace).",
+    "notes": "product.version must equal the [workspace.package] version declared in the root Cargo.toml; build.ps1 enforces the match by read-only text parsing of Cargo.toml (no cargo invocation, no dependencies) and fails before building or staging on any mismatch."
   },
   "target": {
     "os": "windows",

@@ -43,7 +43,7 @@ artifact list is no longer hardcoded in the script.
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | Manifest schema version (currently `1`). |
-| `product.name` / `product.version` | Product identity (`NextIDE`, `0.1.0`). |
+| `product.name` / `product.version` | Product identity (`NextIDE`, `0.1.0`). `product.version` must equal the `[workspace.package]` version in the root `Cargo.toml`; `build.ps1` enforces the match (see [Version consistency](#version-consistency)). |
 | `target.os` / `target.arch` / `target.triple` | Declared target platform (`windows`, `x86_64`, `x86_64-pc-windows-msvc`). Informational — the script builds with the host toolchain. |
 | `build.profile` / `build.command` / `build.output_dir` | Declared build metadata (informational — the script deliberately always runs the pinned, safe `cargo build --release` from the repo root; it never executes an arbitrary command read from a manifest). |
 | `stage.output_dir` | Declared staging location (informational — the script deliberately pins staging to the repo-local `dist/windows` so a tampered manifest can never redirect writes outside the repository). |
@@ -60,6 +60,20 @@ An artifact may declare `expected_sha256`. When present, the staged copy's
 SHA-256 must match it **exactly**, otherwise the script fails. The committed
 manifest leaves it unset because release binaries change with every build;
 pin it in a release flow when you want bit-for-bit reproducibility.
+
+### Version consistency
+
+`product.version` is not free-form: it must equal the `[workspace.package]`
+version declared in the root `Cargo.toml`, which is the single source of truth
+for the workspace version (every member crate inherits it via
+`version.workspace = true`). `build.ps1` enforces the match by parsing
+`Cargo.toml` **read-only as plain text** — a line scan that tracks TOML
+sections and reads `version = "x.y.z"` inside `[workspace.package]`. No
+`cargo` invocation and no TOML dependency is involved, and the check runs
+before anything is built or staged, so a stale manifest can never ship a
+release that claims a version the workspace does not declare. A missing
+`Cargo.toml`, a missing `[workspace.package]` version, or a mismatch with
+`product.version` is a hard error (non-zero exit).
 
 ## Prerequisites
 
@@ -80,14 +94,18 @@ The script:
 
 1. loads and validates `manifest.json` — an invalid or incomplete manifest is
    a hard error (non-zero exit);
-2. runs `cargo build --release` from the repository root and **fails with a
+2. checks that `product.version` equals the `[workspace.package]` version in
+   the root `Cargo.toml` (read-only text parse of `Cargo.toml` — no `cargo`
+   invocation, no dependencies) and fails before building or staging on any
+   mismatch;
+3. runs `cargo build --release` from the repository root and **fails with a
    non-zero exit code** if the build fails;
-3. checks that every artifact listed in the manifest exists in
+4. checks that every artifact listed in the manifest exists in
    `target\release\` — an unexpected missing artifact is a hard error, so a
    stale `dist` can never look like a successful build;
-4. creates `dist\windows\` if needed and copies the executables there
+5. creates `dist\windows\` if needed and copies the executables there
    (overwriting in place);
-5. verifies the staged copies exist, match the release binaries by size and
+6. verifies the staged copies exist, match the release binaries by size and
    SHA-256, honor any pinned `expected_sha256`, and prints each file's size
    and SHA-256.
 
@@ -105,12 +123,14 @@ The script is deliberately boring. It never:
   `Copy-Item -Force`; it never runs `Remove-Item`);
 - touches the registry, the Start Menu, or any system location;
 - signs, installs, or registers anything;
-- reads or writes anything outside the repository;
+- reads or writes anything outside the repository (the version check reads
+  `Cargo.toml` at the repo root as plain text only; the only `cargo`
+  invocation is the pinned release build);
 - accesses the network.
 
-Every failure path — missing cargo, failed build, invalid manifest, missing
-artifact, size/hash mismatch — exits non-zero with a message explaining what
-was wrong.
+Every failure path — missing cargo, failed build, invalid manifest,
+`product.version`/Cargo.toml version mismatch, missing artifact, size/hash
+mismatch — exits non-zero with a message explaining what was wrong.
 
 ## Testing
 
@@ -118,16 +138,20 @@ was wrong.
 assertions — **no external test framework** — and without ever touching the
 real repository: every test runs `build.ps1` against a throwaway sandbox copy
 under the sandbox root (default `%TEMP%`), then deletes its own sandbox again.
-The only thing the suite ever deletes is those sandboxes; the repository's
-`dist\windows\` is never written to, and one test plants a sentinel file in
-the sandbox's staging directory to prove the script preserves pre-existing
-files (it only overwrites, never deletes).
+Each sandbox also gets a minimal root `Cargo.toml` whose
+`[workspace.package]` version is read from the manifest template, so the
+version-consistency check runs on every test (the mismatch cases overwrite
+that `Cargo.toml`). The only thing the suite ever deletes is those sandboxes;
+the repository's `dist\windows\` is never written to, and one test plants a
+sentinel file in the sandbox's staging directory to prove the script preserves
+pre-existing files (it only overwrites, never deletes). The suite runs under
+both Windows PowerShell 5.1 and PowerShell 7.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
 ```
 
-Covered scenarios (11 tests):
+Covered scenarios (14 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -141,7 +165,10 @@ Covered scenarios (11 tests):
 | Invalid manifest JSON | fail |
 | `file` differs from the source file name | fail |
 | Unsupported `schema_version` | fail |
-| Failed release build (no `Cargo.toml` in the sandbox, no `-SkipBuild`) | fail loudly, nothing staged |
+| Failed release build (memberless workspace, no `-SkipBuild`) | fail loudly, nothing staged |
+| `product.version` mismatch with Cargo.toml `[workspace.package]` version | fail before build/staging |
+| Missing root `Cargo.toml` | fail |
+| `Cargo.toml` without `[workspace.package]` version | fail |
 
 The script exits `0` when every test passes and `1` when any fails. Useful
 switches: `-BuildScript <path>` points at another copy of `build.ps1` under

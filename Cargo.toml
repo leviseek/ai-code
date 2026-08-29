@@ -6,3 +6,9 @@ members = [
     "crates/nextide-shell",
 ]
 
+# Single source of truth for the workspace version. Every member package
+# inherits it via `version.workspace = true`, and packaging/windows/build.ps1
+# enforces that manifest product.version matches this value.
+[workspace.package]
+version = "0.1.0"
+

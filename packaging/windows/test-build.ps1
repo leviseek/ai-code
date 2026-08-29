@@ -13,6 +13,11 @@
     touched, and one test proves the script itself preserves pre-existing
     files in the staging directory (it only overwrites, never deletes).
 
+    Each sandbox also gets a minimal root Cargo.toml whose [workspace.package]
+    version is read from the manifest template, so the version-consistency
+    check (manifest product.version == Cargo.toml [workspace.package] version)
+    is exercised on every run; the mismatch cases overwrite that Cargo.toml.
+
     Covered scenarios:
       1. -SkipBuild happy path: artifacts staged, size+SHA-256 verified,
          report printed, pre-existing files in dist\windows\ preserved
@@ -25,7 +30,11 @@
       8. invalid manifest JSON                  -> fails
       9. artifact file != source file name      -> fails
      10. unsupported manifest schema_version    -> fails
-     11. failed release build (no Cargo.toml)   -> fails loudly
+     11. failed release build (workspace without packages, no -SkipBuild)
+                                                -> fails loudly
+     12. product.version != Cargo.toml workspace version -> fails
+     13. missing Cargo.toml at the repo root    -> fails
+     14. Cargo.toml without [workspace.package] version -> fails
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -68,6 +77,14 @@ if (-not (Test-Path -LiteralPath $ManifestSource)) {
 }
 if (-not (Test-Path -LiteralPath $SandboxRoot)) {
     throw "Sandbox root does not exist: $SandboxRoot"
+}
+
+# The sandbox Cargo.toml's [workspace.package] version is derived from the
+# manifest template so the tests stay version-agnostic.
+$TemplateManifest = Get-Content -Raw -LiteralPath $ManifestSource | ConvertFrom-Json
+$script:TemplateVersion = $TemplateManifest.product.version
+if ([string]::IsNullOrWhiteSpace($script:TemplateVersion)) {
+    throw "Manifest template does not declare product.version: $ManifestSource"
 }
 
 # Run build.ps1 in a child process of the same PowerShell edition so the exit
@@ -128,6 +145,24 @@ function Assert {
     }
 }
 
+function Write-SandboxCargoToml {
+    # Every sandbox gets a minimal root Cargo.toml so the version-consistency
+    # check (manifest product.version == [workspace.package] version) runs on
+    # every test; version defaults to the manifest template's product.version.
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [string]$Version = $script:TemplateVersion
+    )
+    $CargoToml = @(
+        '[workspace]'
+        'resolver = "2"'
+        ''
+        '[workspace.package]'
+        "version = `"$Version`""
+    ) -join "`r`n"
+    Set-Content -LiteralPath (Join-Path $Sandbox 'Cargo.toml') -Value $CargoToml -Encoding ASCII
+}
+
 function New-Sandbox {
     param([switch]$WithManifest)
     $Root = Join-Path $SandboxRoot ('nextide-test-build-' + [guid]::NewGuid().ToString('N'))
@@ -137,6 +172,7 @@ function New-Sandbox {
     if ($WithManifest) {
         Copy-Item -LiteralPath $ManifestSource -Destination (Join-Path $Pkg 'manifest.json')
     }
+    Write-SandboxCargoToml -Sandbox $Root
     $script:Sandboxes += $Root
     return $Root
 }
@@ -169,7 +205,19 @@ function Invoke-BuildScript {
     # $LASTEXITCODE in this function — that would shadow the automatic
     # variable and the engine would no longer update it.
     $PSNativeCommandUseErrorActionPreference = $false
-    $Output = (& $ShellExe $ChildArgs 2>&1 | Out-String)
+    # Under Windows PowerShell 5.1 a native stderr line becomes an error
+    # record, and with EAP=Stop the merged 2>&1 pipeline aborts on the first
+    # line (truncating the capture). EAP=Continue lets the full output through
+    # so the child's error text still lands in $Result.Output on both
+    # PowerShell editions.
+    $PreviousEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $Output = (& $ShellExe $ChildArgs 2>&1 | Out-String)
+    }
+    finally {
+        $ErrorActionPreference = $PreviousEAP
+    }
     return [pscustomobject]@{
         ExitCode = $LASTEXITCODE
         Output   = $Output
@@ -427,18 +475,71 @@ Invoke-Test -Name 'unsupported manifest schema_version fails' -Body {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Failed release build fails loudly (sandbox has no Cargo.toml).
+# 11. Failed release build fails loudly (sandbox workspace has no packages).
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'failed release build fails loudly' -Body {
     $Root = New-Sandbox -WithManifest
     try {
-        # No target\release binaries and no Cargo.toml: without -SkipBuild the
-        # script must reach the build step and fail there (cargo missing or
-        # failing -> non-zero exit; either way the script exits non-zero).
+        # No target\release binaries and no crates: the sandbox Cargo.toml
+        # passes the version-consistency check but the memberless workspace
+        # cannot produce the release artifacts. Without -SkipBuild the script
+        # must reach the build step and fail there (cargo missing or failing
+        # -> non-zero exit; either way the script exits non-zero and stages
+        # nothing).
         $Result = Invoke-BuildScript -Sandbox $Root
         Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
         Assert ($Result.Output -match 'Building release binaries') 'expected the build step to be reached'
         Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a failed build'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 12. Manifest product.version does not match Cargo.toml [workspace.package].
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'manifest product.version mismatch with Cargo.toml workspace version fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Write-SandboxCargoToml -Sandbox $Root -Version '9.9.9'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'does not match Cargo.toml') "expected version-mismatch rejection in output: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a version mismatch'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 13. Cargo.toml missing at the repo root.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'missing Cargo.toml fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Remove-Item -LiteralPath (Join-Path $Root 'Cargo.toml') -Force
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'Missing Cargo.toml') "expected 'Missing Cargo.toml' in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 14. Cargo.toml present but no [workspace.package] version.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'Cargo.toml without [workspace.package] version fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-Content -LiteralPath (Join-Path $Root 'Cargo.toml') -Value "[workspace]`r`nresolver = `"2`"`r`n" -Encoding ASCII
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match '\[workspace\.package\] version') "expected missing-workspace-version rejection in output: $($Result.Output)"
     }
     finally {
         Remove-Sandbox $Root
