@@ -70,6 +70,9 @@ pub struct DesktopShell {
     /// The externally supplied Git status snapshot, if any. Applied to
     /// snapshots and render rows by [`DesktopShell::snapshot`]; the shell
     /// never runs git itself, so `None` keeps every marker [`StatusKind::Clean`].
+    /// Files are marked by exact path ([`marker_for`]); directories are marked
+    /// with the aggregated status of everything below them
+    /// ([`aggregate_directory_status`]).
     pub git_status: Option<GitStatusSnapshot>,
     /// The externally supplied diff panel snapshot, if any. Toggled and
     /// navigated by the pure state interface ([`DesktopShell::toggle_diff_file`],
@@ -519,11 +522,15 @@ impl DesktopShell {
     ///
     /// The snapshot comes from outside the shell (for example from
     /// `nextide_kernel::git::status`); this method never runs git itself.
-    /// Paths are matched exactly, as in [`marker_for`]: an entry whose path
-    /// equals a visible tree node's path marks that node, everything else
-    /// stays [`StatusKind::Clean`], and the snapshot's [`summary`] is exposed
-    /// as [`ShellSnapshot::git_summary`] for the status bar. A later call
-    /// replaces the previous snapshot.
+    /// File nodes are matched exactly, as in [`marker_for`]: an entry whose
+    /// path equals a visible file node's path marks that node. Directory nodes
+    /// are marked with the aggregated status of every entry below them, as in
+    /// [`aggregate_directory_status`] (the most severe descendant kind, or
+    /// the directory's own entry when it has one, for example a submodule);
+    /// a directory with no changed entry under it stays [`StatusKind::Clean`],
+    /// as does every node when no Git snapshot has been applied. The
+    /// snapshot's [`summary`] is exposed as [`ShellSnapshot::git_summary`]
+    /// for the status bar. A later call replaces the previous snapshot.
     pub fn update_git_status(&mut self, snapshot: GitStatusSnapshot) {
         self.git_status = Some(snapshot);
     }
@@ -597,8 +604,20 @@ impl DesktopShell {
         );
         if let Some(git) = self.git_status.as_ref() {
             snapshot.git_summary = Some(summary(git));
+            // Files carry their exact-path marker; directories carry the
+            // aggregated status of everything below them (via the pure
+            // `aggregate_directory_status` projection), so a directory whose
+            // children changed shows the most severe descendant kind instead
+            // of staying `Clean`. Porcelain names files, not directories, so a
+            // directory only ever changes because its children changed (or
+            // because it has its own entry, for example a submodule).
+            let statuses = tree_statuses(git);
             for item in &mut snapshot.visible_tree {
-                item.status = marker_for(git, &item.path).unwrap_or(StatusKind::Clean);
+                item.status = if item.directory {
+                    aggregate_directory_status(&statuses, &item.path).unwrap_or(StatusKind::Clean)
+                } else {
+                    marker_for(git, &item.path).unwrap_or(StatusKind::Clean)
+                };
             }
         }
         if let Some(panel) = self.diff_panel.as_ref() {
@@ -1161,6 +1180,169 @@ mod tests {
             matches!(&shell.tree_changes()[0], TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged && row.status_marker == "U")
         );
         assert_eq!(shell.tree_change_frame(), 2);
+    }
+
+    /// A visible tree with `src/` (expanded, so its children are visible),
+    /// `src/main.rs` and a top-level `notes.md`.
+    fn shell_with_src_tree() -> DesktopShell {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("src", nextide_kernel::FileNodeKind::Directory);
+        shell
+            .app
+            .file_tree
+            .add("src/main.rs", nextide_kernel::FileNodeKind::File);
+        shell
+            .app
+            .file_tree
+            .add("notes.md", nextide_kernel::FileNodeKind::File);
+        shell.app.file_tree.toggle(&std::path::PathBuf::from("src"));
+        shell
+    }
+
+    #[test]
+    fn directory_markers_aggregate_descendant_status_in_snapshot_and_rows() {
+        let mut shell = shell_with_src_tree();
+        shell.update_git_status(status_snapshot(vec![
+            status_entry("src/main.rs", "M "),
+            status_entry("notes.md", "??"),
+        ]));
+
+        let snapshot = shell.snapshot();
+        // Sorted by path: notes.md, src, src/main.rs. The file keeps its exact
+        // marker; the directory aggregates the change under it.
+        assert_eq!(snapshot.visible_tree[0].status, StatusKind::Untracked);
+        assert_eq!(snapshot.visible_tree[1].status, StatusKind::Staged);
+        assert_eq!(snapshot.visible_tree[2].status, StatusKind::Staged);
+        assert_eq!(
+            snapshot.git_summary,
+            Some(GitStatusSummary {
+                total: 2,
+                staged: 1,
+                unstaged: 0,
+                untracked: 1,
+                conflicted: 0,
+            })
+        );
+
+        // The badge reaches render rows through the same projection.
+        let mut renderer = HeadlessRenderer::default();
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(renderer.tree_rows()[1].status, StatusKind::Staged);
+        assert_eq!(renderer.tree_rows()[1].status_marker, "S");
+    }
+
+    #[test]
+    fn directory_marker_uses_the_most_severe_descendant_kind() {
+        let mut shell = shell_with_src_tree();
+        shell.update_git_status(status_snapshot(vec![
+            status_entry("src/a.rs", "UU"),
+            status_entry("src/b.rs", "M "),
+        ]));
+        let snapshot = shell.snapshot();
+        // A conflicted child outranks a staged child in the aggregation.
+        let src = snapshot
+            .visible_tree
+            .iter()
+            .find(|item| item.path == std::path::Path::new("src"))
+            .unwrap();
+        assert_eq!(src.status, StatusKind::Conflicted);
+        assert_eq!(src.status.marker(), "!");
+    }
+
+    #[test]
+    fn directory_without_changed_descendants_stays_clean() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("vendor", nextide_kernel::FileNodeKind::Directory);
+        shell
+            .app
+            .file_tree
+            .add("vendor/lib.rs", nextide_kernel::FileNodeKind::File);
+        shell
+            .app
+            .file_tree
+            .toggle(&std::path::PathBuf::from("vendor"));
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        shell.update_git_status(status_snapshot(vec![status_entry("main.rs", " M")]));
+
+        let snapshot = shell.snapshot();
+        // "main.rs" sorts before "vendor": the changed file is marked, the
+        // directory without changed descendants stays Clean.
+        assert_eq!(snapshot.visible_tree[0].status, StatusKind::Unstaged);
+        let vendor = snapshot
+            .visible_tree
+            .iter()
+            .find(|item| item.path == std::path::Path::new("vendor"))
+            .unwrap();
+        assert_eq!(vendor.status, StatusKind::Clean);
+    }
+
+    #[test]
+    fn directory_with_its_own_entry_keeps_that_kind() {
+        // A directory-level porcelain entry (for example a submodule) marks
+        // the directory itself even without any child entries.
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("vendor", nextide_kernel::FileNodeKind::Directory);
+        shell.update_git_status(status_snapshot(vec![status_entry("vendor", "M ")]));
+        assert_eq!(shell.snapshot().visible_tree[0].status, StatusKind::Staged);
+    }
+
+    #[test]
+    fn clean_replacement_clears_directory_markers() {
+        let mut shell = shell_with_src_tree();
+        shell.update_git_status(status_snapshot(vec![status_entry("src/main.rs", "M ")]));
+        assert_eq!(shell.snapshot().visible_tree[1].status, StatusKind::Staged);
+
+        // A clean replacement clears the directory markers too, keeping the
+        // (zero) summary: the snapshot exists, it just has no entries.
+        shell.update_git_status(status_snapshot(Vec::new()));
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.visible_tree[1].status, StatusKind::Clean);
+        assert_eq!(snapshot.git_summary, Some(GitStatusSummary::default()));
+    }
+
+    #[test]
+    fn directory_marker_change_surfaces_as_updated_rows() {
+        let mut shell = shell_with_src_tree();
+        let mut renderer = HeadlessRenderer::default();
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(shell.tree_changes().len(), 3);
+        assert!(shell
+            .tree_changes()
+            .iter()
+            .all(|change| matches!(change, TreeRowChange::Added(_))));
+
+        // Applying a change under src moves both the file and the directory
+        // from Clean to a badge, so both surface as Updated rows.
+        shell.update_git_status(status_snapshot(vec![status_entry("src/main.rs", " M")]));
+        shell.render_ui(&mut renderer).unwrap();
+        let src = shell
+            .tree_changes()
+            .iter()
+            .find(|change| change.path() == std::path::Path::new("src"))
+            .expect("src must change");
+        assert!(
+            matches!(src, TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged && row.status_marker == "U")
+        );
+        let file = shell
+            .tree_changes()
+            .iter()
+            .find(|change| change.path() == std::path::Path::new("src/main.rs"))
+            .expect("src/main.rs must change");
+        assert!(
+            matches!(file, TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged && row.status_marker == "U")
+        );
     }
 
     // Diff panel helpers: build kernel diff snapshots without git.

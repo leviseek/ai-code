@@ -14,8 +14,11 @@ pub struct TreeItem {
     ///
     /// [`StatusKind::Clean`] when the path has no pending change or when no
     /// Git snapshot has been applied yet. Porcelain status names files, not
-    /// directories, so a directory without its own entry stays `Clean` even
-    /// when some of its children are marked.
+    /// directories, so a file without its own entry stays `Clean`; a
+    /// directory carries the aggregated status of everything below it (the
+    /// most severe descendant kind, or its own entry when it has one, for
+    /// example a submodule), so it is marked whenever any changed entry is
+    /// under it.
     pub status: StatusKind,
 }
 
