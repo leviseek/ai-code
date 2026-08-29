@@ -59,7 +59,15 @@ jobs:
     # target, release metadata (license / publisher / release_channel) and
     # artifact list that produced this release travel with it, so later
     # release/publish steps can consume the exact single source of truth
-    # without re-deriving anything.
+    # without re-deriving anything. Immediately before that upload a
+    # lightweight gate re-reads the exact file about to be uploaded with
+    # PowerShell's built-in ConvertFrom-Json (no dependencies, no network, no
+    # cargo invocation) and re-asserts the validated identity inline — valid
+    # JSON, schema_version 1, product name/version, the pinned target block,
+    # the release metadata and a non-empty artifact list, plus a cross-check
+    # that the file's release_channel equals the channel resolved for this
+    # run — so the uploaded manifest is proven consistent with the manifest
+    # the pipeline validated and with the channel in the artifact name.
     needs: ci
     runs-on: windows-latest
     steps:
@@ -141,17 +149,100 @@ jobs:
           path: dist/windows
           if-no-files-found: error
 
+      - name: Verify manifest.json before release-metadata upload
+        # Lightweight pre-upload gate for the release-metadata artifact. The
+        # exact file about to be uploaded (the committed
+        # packaging/windows/manifest.json) is re-read and parsed with
+        # PowerShell's built-in ConvertFrom-Json — no dependencies, no
+        # network, no cargo invocation — so a missing, corrupt, truncated or
+        # invalid-JSON file fails the run right here, before any upload. The
+        # step then re-asserts, inline, the same identity the pipeline
+        # already validated (the self-test gate and build.ps1 -SkipBuild):
+        # schema_version must be 1, product name/version must be present, the
+        # target block must equal the pinned windows / x86_64 /
+        # x86_64-pc-windows-msvc packaging target, the release block must
+        # carry non-empty license/publisher with a release_channel of exactly
+        # stable or beta, and the artifact list must be non-empty — and the
+        # file's release_channel must equal the channel this run resolved
+        # right after checkout (steps.release-channel), so the uploaded
+        # manifest is proven consistent with the manifest the run validated
+        # and with the channel embedded in the artifact name. Any mismatch
+        # fails the run before the upload.
+        shell: pwsh
+        env:
+          RESOLVED_CHANNEL: ${{ steps.release-channel.outputs.release_channel }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ManifestPath = 'packaging/windows/manifest.json'
+          if (-not (Test-Path -LiteralPath $ManifestPath)) {
+            throw "Missing manifest to upload: $ManifestPath"
+          }
+          try {
+            $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+          }
+          catch {
+            throw "Manifest to upload is not valid JSON: $($_.Exception.Message)"
+          }
+
+          if ($Manifest.schema_version -ne 1) {
+            throw "Manifest schema_version must be 1, got: '$($Manifest.schema_version)'"
+          }
+          if ($null -eq $Manifest.product -or [string]::IsNullOrWhiteSpace([string]$Manifest.product.name)) {
+            throw 'Manifest product.name is missing or blank'
+          }
+          if ([string]::IsNullOrWhiteSpace([string]$Manifest.product.version)) {
+            throw 'Manifest product.version is missing or blank'
+          }
+          if ($Manifest.target.os -ne 'windows') {
+            throw "Manifest target.os must be 'windows', got: '$($Manifest.target.os)'"
+          }
+          if ($Manifest.target.architecture -ne 'x86_64') {
+            throw "Manifest target.architecture must be 'x86_64', got: '$($Manifest.target.architecture)'"
+          }
+          if ($Manifest.target.triple -ne 'x86_64-pc-windows-msvc') {
+            throw "Manifest target.triple must be 'x86_64-pc-windows-msvc', got: '$($Manifest.target.triple)'"
+          }
+          if ($null -eq $Manifest.release -or [string]::IsNullOrWhiteSpace([string]$Manifest.release.license)) {
+            throw 'Manifest release.license is missing or blank'
+          }
+          if ([string]::IsNullOrWhiteSpace([string]$Manifest.release.publisher)) {
+            throw 'Manifest release.publisher is missing or blank'
+          }
+          $Channel = [string]$Manifest.release.release_channel
+          if ($Channel -ne 'stable' -and $Channel -ne 'beta') {
+            throw "Manifest release.release_channel must be exactly 'stable' or 'beta', got: '$Channel'"
+          }
+          if ($Channel -ne $env:RESOLVED_CHANNEL) {
+            throw "Manifest release_channel '$Channel' does not match the channel resolved for this run: '$env:RESOLVED_CHANNEL'"
+          }
+          $Artifacts = @($Manifest.artifacts)
+          if ($Artifacts.Count -eq 0) {
+            throw 'Manifest declares no artifacts'
+          }
+          foreach ($Artifact in $Artifacts) {
+            if ([string]::IsNullOrWhiteSpace([string]$Artifact.id) -or
+                [string]::IsNullOrWhiteSpace([string]$Artifact.file) -or
+                [string]::IsNullOrWhiteSpace([string]$Artifact.source)) {
+              throw 'Every manifest artifact needs non-empty id, file and source'
+            }
+          }
+          Write-Host "Manifest OK: valid JSON, schema $($Manifest.schema_version), product $($Manifest.product.name) $($Manifest.product.version), target $($Manifest.target.os)/$($Manifest.target.architecture) ($($Manifest.target.triple)), channel $Channel, $($Artifacts.Count) artifacts"
+
       - name: Upload manifest.json release metadata artifact
         # Upload the committed packaging manifest as release metadata next to
         # the staged binaries. manifest.json is the exact single source of
         # truth the whole packaging pipeline consumed and validated (self-test
         # gate, then read-only by build.ps1 -SkipBuild against the real
         # Cargo.toml): product identity, pinned target, release metadata
-        # (license / publisher / release_channel) and the artifact list.
-        # Shipping it with the release lets later release/publish steps attach
-        # the metadata without re-deriving anything. The artifact name uses
-        # the same resolved release_channel output as the dist artifact, so
-        # stable and beta runs keep their release metadata separate too.
+        # (license / publisher / release_channel) and the artifact list. The
+        # step above re-parsed this exact file with ConvertFrom-Json and
+        # re-asserted that identity right before this upload, so the file
+        # that ships is proven valid JSON and consistent with the validated
+        # manifest. Shipping it with the release lets later release/publish
+        # steps attach the metadata without re-deriving anything. The
+        # artifact name uses the same resolved release_channel output as the
+        # dist artifact, so stable and beta runs keep their release metadata
+        # separate too.
         uses: actions/upload-artifact@v4
         with:
           name: nextide-windows-manifest-${{ steps.release-channel.outputs.release_channel }}

@@ -16,7 +16,7 @@ install anything.
 | Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
-| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata) — first via the sandboxed `test-build.ps1` self-test gate (23 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows`, and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact. The same resolved channel names a second upload: the committed `packaging/windows/manifest.json` is uploaded as a **channel-suffixed release-metadata artifact** (`nextide-windows-manifest-<channel>`) alongside the binaries, so the validated product identity, pinned target, release metadata (license / publisher / release_channel) and artifact list that produced this release travel with it for later release/publish steps |
+| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, **explicitly verifies the manifest in all four required areas** (manifest validity, version, target, release metadata) — first via the sandboxed `test-build.ps1` self-test gate (23 cases), then read-only against the committed manifest by `build.ps1 -SkipBuild` before staging — builds the release binaries, stages `dist/windows`, and uploads it as a **channel-suffixed** artifact (`nextide-windows-dist-<channel>`): right after checkout the job reads `release.release_channel` from the committed manifest and uses it as the artifact name suffix, so stable and beta runs can never overwrite each other's artifact. The same resolved channel names a second upload: the committed `packaging/windows/manifest.json` is uploaded as a **channel-suffixed release-metadata artifact** (`nextide-windows-manifest-<channel>`) alongside the binaries, so the validated product identity, pinned target, release metadata (license / publisher / release_channel) and artifact list that produced this release travel with it for later release/publish steps. Immediately before that manifest upload a lightweight gate re-reads the exact file about to be uploaded with PowerShell's built-in `ConvertFrom-Json` (no dependencies, no network, no cargo invocation) and re-asserts the validated identity inline — valid JSON, `schema_version` 1, product name/version, the pinned target block, the release metadata and a non-empty artifact list, plus a cross-check that the file's `release_channel` equals the channel resolved for the run — so the uploaded manifest is proven valid JSON and consistent with the manifest the pipeline validated |
 
 ## Layout
 
@@ -279,6 +279,20 @@ anything, and stable/beta runs keep their release metadata separate too.
 Before the upload the job
 also smoke-tests the staged CLI binary itself (`.\dist\windows\nextide-cli.exe
 smoke` — the same flow listed above, panicking on any failure), so the
-artifact that ships is proven to run, not just to hash-match its source. That
+artifact that ships is proven to run, not just to hash-match its source.
+Immediately before the release-metadata upload the job then re-reads the
+committed `packaging/windows/manifest.json` — the exact file about to be
+uploaded — with PowerShell's built-in `ConvertFrom-Json` and re-asserts the
+validated identity inline: the file must parse as valid JSON (a missing,
+corrupt or invalid-JSON file fails the run before any upload), `schema_version`
+must be 1, `product.name`/`product.version` must be present, the target block
+must equal the pinned `windows` / `x86_64` / `x86_64-pc-windows-msvc` packaging
+target, the release block must carry non-empty `license`/`publisher` with a
+`release_channel` of exactly `stable` or `beta`, the artifact list must be
+non-empty, and the file's `release_channel` must equal the channel this run
+resolved right after checkout (so the uploaded manifest is proven consistent
+with the manifest the pipeline validated and with the channel embedded in the
+artifact name). No dependencies and no network — the step only reads the
+committed file. That
 job is what exercises the real-repository `cargo build --release` success path
 end to end on CI.
