@@ -103,6 +103,19 @@
 //! HEAD`) and its subject as git defines it (`git log -1 --format=%s`: the
 //! first paragraph, with line breaks collapsed to spaces).
 //!
+//! [`amend(root, message)`](amend) replaces the current HEAD commit with
+//! `git -C <root> commit --amend --message=<message>` and returns the same
+//! [`GitCommitResult`] as [`commit`]: the fresh HEAD hash and subject. The
+//! message validation and the result parsing are shared with [`commit`], so
+//! an empty or NUL message is [`io::ErrorKind::InvalidInput`], root and
+//! git-binary errors match [`status`], and any git failure (for example a
+//! repository with no commits yet: "You have nothing to amend.") is
+//! [`io::ErrorKind::Other`] with git's message. The amend never opens an
+//! editor — the message is always supplied — and it rewrites the last commit
+//! in place: the parent stays the same, staged changes are folded in, and
+//! the hash always changes, so like any history rewrite it must only be
+//! applied to commits that have not been published.
+//!
 //! Error behaviour matches [`status`] and [`diff`]: a missing `root` or
 //! `git` is [`io::ErrorKind::NotFound`], a non-directory `root` is
 //! [`io::ErrorKind::NotADirectory`], and a non-zero git exit (for example a
@@ -1133,14 +1146,93 @@ pub fn commit(root: &Path, message: &str) -> io::Result<GitCommitResult> {
     }
     check_commit_message(message)?;
     run_git_commit("git", root, message)?;
-    let hash = run_git_capture("git", root, &["rev-parse", "HEAD"])?;
+    read_head_commit("git", root)
+}
+
+/// Replaces the current HEAD commit — with the staged changes, or just the
+/// new message when nothing is staged — and returns its hash and summary.
+///
+/// Runs `git -C <root> commit --amend --message=<message>`: no shell, and
+/// the message is a single `--message=<message>` argument exactly as in
+/// [`commit`], so it cannot be parsed as an option even when it looks like
+/// one (for example `--amend`). Message validation and the returned
+/// [`GitCommitResult`] (the fresh HEAD hash via `git rev-parse HEAD` and the
+/// git-defined subject via `git log -1 --format=%s`) are shared with
+/// [`commit`].
+///
+/// Amending rewrites the last commit in place: its parent and tree are
+/// reused (staged changes are folded in), but the commit's hash always
+/// changes, so this is a history rewrite that must only be applied to
+/// commits that have not been published.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `message` is empty or whitespace-only
+///   or contains a NUL byte.
+/// - [`io::ErrorKind::Other`] if `git commit --amend` exits non-zero (for
+///   example a repository with no commits yet — "You have nothing to amend."
+///   — or a failing commit hook); git's message is included.
+pub fn amend(root: &Path, message: &str) -> io::Result<GitCommitResult> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_commit_message(message)?;
+    run_git_amend("git", root, message)?;
+    read_head_commit("git", root)
+}
+
+/// Runs `program -C root commit --message=<message>`; split out so tests can
+/// exercise the spawn-failure path with a program that does not exist.
+fn run_git_commit(program: &str, root: &Path, message: &str) -> io::Result<()> {
+    run_git_commit_with(program, root, message, &[], "commit")
+}
+
+/// Runs `program -C root commit --amend --message=<message>`; split out so
+/// tests can exercise the spawn-failure path with a program that does not
+/// exist.
+fn run_git_amend(program: &str, root: &Path, message: &str) -> io::Result<()> {
+    run_git_commit_with(program, root, message, &["--amend"], "commit --amend")
+}
+
+/// Runs `program -C root commit [<extra>...] --message=<message>`; the shared
+/// runner behind [`run_git_commit`] and [`run_git_amend`].
+fn run_git_commit_with(
+    program: &str,
+    root: &Path,
+    message: &str,
+    extra: &[&str],
+    label: &str,
+) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("commit")
+        .args(extra)
+        .arg(format!("--message={message}"))
+        .output()?;
+    ensure_git_success(&output, label)
+}
+
+/// Reads back the current HEAD commit's full hash (`git rev-parse HEAD`) and
+/// git-defined subject (`git log -1 --format=%s`) into a
+/// [`GitCommitResult`]; shared by [`commit`] and [`amend`].
+fn read_head_commit(program: &str, root: &Path) -> io::Result<GitCommitResult> {
+    let hash = run_git_capture(program, root, &["rev-parse", "HEAD"])?;
     let hash = String::from_utf8(hash).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "git rev-parse output is not valid UTF-8",
         )
     })?;
-    let summary = run_git_capture("git", root, &["log", "-1", "--format=%s"])?;
+    let summary = run_git_capture(program, root, &["log", "-1", "--format=%s"])?;
     let summary = String::from_utf8(summary).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1151,18 +1243,6 @@ pub fn commit(root: &Path, message: &str) -> io::Result<GitCommitResult> {
         hash: hash.trim_end().to_string(),
         summary: summary.trim_end().to_string(),
     })
-}
-
-/// Runs `program -C root commit --message=<message>`; split out so tests can
-/// exercise the spawn-failure path with a program that does not exist.
-fn run_git_commit(program: &str, root: &Path, message: &str) -> io::Result<()> {
-    let output = Command::new(program)
-        .arg("-C")
-        .arg(root)
-        .arg("commit")
-        .arg(format!("--message={message}"))
-        .output()?;
-    ensure_git_success(&output, "commit")
 }
 
 /// Runs `program -C root <args>` and returns stdout; a non-zero exit is an
@@ -3517,6 +3597,232 @@ mod tests {
             return;
         }
         let error = commit(&root, "message").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- amend() argument safety (no git binary needed) ----
+
+    #[test]
+    fn amend_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-amend-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            amend(&missing, "message").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn amend_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-amend-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            amend(&file, "message").unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn amend_empty_message_is_invalid_input() {
+        let root = temp_dir("amendempty");
+        for message in ["", "   ", "\n\n", "\t"] {
+            let error = amend(&root, message).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "message {message:?} should be rejected"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn amend_message_with_nul_is_invalid_input() {
+        let root = temp_dir("amendnul");
+        let error = amend(&root, "subject\0nul").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_amend_surfaces_as_not_found() {
+        let root = temp_dir("amendnobinary");
+        let error = run_git_amend("nextide-no-such-git-binary", &root, "message").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- amend() integration (requires a git binary) ----
+
+    /// The full 40-character hash of the revision named by `rev` (for example
+    /// `HEAD`, `HEAD^` or `HEAD^{tree}`).
+    fn rev_hash(root: &Path, rev: &str) -> String {
+        let bytes = run_git_capture("git", root, &["rev-parse", rev]).unwrap();
+        String::from_utf8(bytes).unwrap().trim().to_string()
+    }
+
+    /// The number of commits reachable from `HEAD`.
+    fn commit_count(root: &Path) -> usize {
+        let bytes = run_git_capture("git", root, &["rev-list", "--count", "HEAD"]).unwrap();
+        String::from_utf8(bytes).unwrap().trim().parse().unwrap()
+    }
+
+    /// `git log -1 <format>` for the current HEAD, with the trailing newline
+    /// stripped.
+    fn head_log(root: &Path, format: &str) -> String {
+        let bytes = run_git_capture("git", root, &["log", "-1", format]).unwrap();
+        String::from_utf8(bytes).unwrap().trim_end().to_string()
+    }
+
+    #[test]
+    fn amend_changes_hash_and_subject_in_place() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("amendok", &[("a.txt", "a\n")]);
+        let original = rev_hash(&root, "HEAD");
+        assert_eq!(head_log(&root, "--format=%s"), "init");
+        assert_eq!(commit_count(&root), 1);
+
+        let result = amend(&root, "amended subject").unwrap();
+        assert_eq!(result.summary, "amended subject");
+        assert_eq!(result.hash.len(), 40);
+        assert!(result.hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(result.hash, original, "amend must create a new commit hash");
+
+        // The amended commit replaced the original one: same count, new
+        // subject, and the returned hash is the actual HEAD.
+        assert_eq!(commit_count(&root), 1);
+        assert_eq!(head_log(&root, "--format=%s"), "amended subject");
+        assert_eq!(rev_hash(&root, "HEAD"), result.hash);
+        assert!(status(&root).unwrap().is_clean());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn amend_keeps_parent_and_tree_when_nothing_staged() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("amendtree", &[("a.txt", "a\n")]);
+        fs::write(root.join("a.txt"), "b\n").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        let second = commit(&root, "second").unwrap();
+        let parent = rev_hash(&root, "HEAD^");
+        let tree = rev_hash(&root, "HEAD^{tree}");
+
+        // Amending with nothing staged rewrites only the message: the parent
+        // and the tree are reused, and no commit is added.
+        let result = amend(&root, "second amended").unwrap();
+        assert_eq!(result.summary, "second amended");
+        assert_ne!(result.hash, second.hash);
+        assert_eq!(rev_hash(&root, "HEAD^"), parent);
+        assert_eq!(rev_hash(&root, "HEAD^{tree}"), tree);
+        assert_eq!(commit_count(&root), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn amend_folds_staged_changes_into_the_head_commit() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("amendstage", &[("a.txt", "a\n")]);
+        fs::write(root.join("a.txt"), "CHANGED\n").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        let before = rev_hash(&root, "HEAD");
+
+        let result = amend(&root, "amend with staged change").unwrap();
+        assert_eq!(result.summary, "amend with staged change");
+        assert_ne!(result.hash, before);
+        // The staged content is now part of the amended commit...
+        assert_eq!(head_log(&root, "--format=%B"), "amend with staged change");
+        let content = run_git_capture("git", &root, &["show", "HEAD:a.txt"]).unwrap();
+        assert_eq!(String::from_utf8(content).unwrap(), "CHANGED\n");
+        // ...and the worktree is clean afterwards.
+        assert!(status(&root).unwrap().is_clean());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn amend_treats_option_like_messages_as_message_text() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("amendopt", &[("a.txt", "a\n")]);
+        // An option-like message is recorded verbatim via --message=<msg>,
+        // never parsed as a git option.
+        let result = amend(&root, "--amend").unwrap();
+        assert_eq!(result.summary, "--amend");
+        assert_eq!(head_log(&root, "--format=%s"), "--amend");
+        assert_eq!(commit_count(&root), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn amend_multiline_message_reports_git_subject() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("amendmulti", &[("a.txt", "a\n")]);
+        let result = amend(&root, "subject line\n\nbody line\nmore body").unwrap();
+        assert_eq!(result.summary, "subject line");
+        // The full message is stored verbatim (git appends a trailing
+        // newline; `%B` emits the raw body).
+        let body = run_git_capture("git", &root, &["log", "-1", "--format=%B"]).unwrap();
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.starts_with("subject line\n\nbody line\nmore body\n"),
+            "body was: {body:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn amend_nothing_to_amend_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_clean_repo("amendnothing");
+        // A repository with no commits has nothing to amend.
+        let error = amend(&root, "message").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("nothing to amend"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn amend_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("amendnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = amend(&root, "message").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
