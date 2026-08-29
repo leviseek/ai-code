@@ -272,6 +272,21 @@
 //! and `remove_remote`) surfaces as [`io::ErrorKind::Other`] with git's
 //! message. Root and git-binary error behaviour matches [`remotes`].
 //!
+//! [`remote_url(root, name)`](remote_url) queries a single remote and
+//! [`remote_exists(root, name)`](remote_exists) reports whether a remote is
+//! configured under `name`. Both run the same strictly local `git -C <root>
+//! remote -v` query as [`remotes`] — never contacting a network or
+//! performing a fetch or a push — and reuse its parsing and validation, and
+//! both validate `name` with the same rules as the management operations
+//! before git is spawned. `remote_url` returns the [`GitRemote`] whose name
+//! matches; a name that is not configured surfaces as
+//! [`io::ErrorKind::NotFound`] with the name in the message (unlike
+//! `set_remote_url` and `remove_remote`, which let git report it).
+//! `remote_exists` returns `Ok(true)` exactly when the snapshot contains the
+//! name and `Ok(false)` for a validly named but absent remote; root,
+//! git-binary, git-exit and parse errors are reported exactly as [`remotes`]
+//! does.
+//!
 //! # Restore and stash
 //!
 //! [`restore(root, paths)`](restore) discards the named paths' *worktree*
@@ -2550,6 +2565,100 @@ fn run_git_remote_remove(program: &str, root: &Path, name: &str) -> io::Result<(
         .arg(name)
         .output()?;
     ensure_git_success(&output, "remote remove")
+}
+
+/// Returns the remote configured under `name`, as [`remotes`] reports it.
+///
+/// Runs the same strictly local `git -C <root> remote -v` query as
+/// [`remotes`] and returns the [`GitRemote`] whose name matches: no shell,
+/// no network access, no fetch or push. The name is validated with
+/// `check_remote_name_arg` before git is spawned, exactly like the remote
+/// management operations, so an invalid name is
+/// [`io::ErrorKind::InvalidInput`] rather than a "not found" result. A
+/// validly named remote that is not configured surfaces as
+/// [`io::ErrorKind::NotFound`] with the name in the message — unlike
+/// [`set_remote_url`] and [`remove_remote`], which let git report it.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist, `git` is not on
+///   `PATH`, or no remote is configured under `name`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `name` fails validation.
+/// - [`io::ErrorKind::Other`] if `git` exits non-zero (for example `root` is
+///   not inside a Git repository); git's stderr is included in the message.
+/// - [`io::ErrorKind::InvalidData`] if git's output cannot be parsed.
+pub fn remote_url(root: &Path, name: &str) -> io::Result<GitRemote> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_remote_name_arg(name)?;
+    run_remote_lookup("git", root, name)
+}
+
+/// Runs `program -C root remote -v` and returns the remote whose name
+/// matches; split out so tests can exercise the spawn-failure path with a
+/// program that does not exist.
+fn run_remote_lookup(program: &str, root: &Path, name: &str) -> io::Result<GitRemote> {
+    let snapshot = run_remotes(program, root)?;
+    snapshot
+        .remotes
+        .into_iter()
+        .find(|remote| remote.name == name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no remote named {name:?} is configured"),
+            )
+        })
+}
+
+/// Whether a remote is configured under `name`.
+///
+/// Runs the same strictly local `git -C <root> remote -v` query as
+/// [`remotes`] and returns `Ok(true)` exactly when the parsed snapshot
+/// contains a remote with that name: no shell, no network access, no fetch
+/// or push. The name is validated with `check_remote_name_arg` before git is
+/// spawned, exactly like the remote management operations, so an invalid
+/// name is [`io::ErrorKind::InvalidInput`] rather than `Ok(false)`. Root,
+/// git-binary, git-exit and parse errors are reported exactly as [`remotes`]
+/// does; only a *validly named, absent* remote yields `Ok(false)`.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `name` fails validation.
+/// - [`io::ErrorKind::Other`] if `git` exits non-zero (for example `root` is
+///   not inside a Git repository); git's stderr is included in the message.
+/// - [`io::ErrorKind::InvalidData`] if git's output cannot be parsed.
+pub fn remote_exists(root: &Path, name: &str) -> io::Result<bool> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_remote_name_arg(name)?;
+    run_remote_exists("git", root, name)
+}
+
+/// Runs `program -C root remote -v` and reports whether `name` is present;
+/// split out so tests can exercise the spawn-failure path with a program
+/// that does not exist.
+fn run_remote_exists(program: &str, root: &Path, name: &str) -> io::Result<bool> {
+    Ok(run_remotes(program, root)?
+        .remotes
+        .iter()
+        .any(|remote| remote.name == name))
 }
 
 /// Validates a caller-supplied remote name before git is spawned: it must be
@@ -8222,6 +8331,246 @@ mod tests {
             return;
         }
         let error = remove_remote(&root, "origin").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- remote lookup (remote_url / remote_exists) argument validation
+    // (no git binary needed) ----
+
+    #[test]
+    fn remote_lookup_rejects_unsafe_names_before_spawning() {
+        // Argument validation happens before git is spawned, so these fail
+        // with InvalidInput on a valid directory even when git is missing.
+        let root = temp_dir("remotelookupbad");
+        for name in ["", "bad name", "-f", "a..b", "bad\0name"] {
+            let error = remote_url(&root, name).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "remote_url name {name:?} should be rejected"
+            );
+            let error = remote_exists(&root, name).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "remote_exists name {name:?} should be rejected"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- remote lookup root validation (no git binary needed) ----
+
+    #[test]
+    fn remote_url_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-remote-url-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            remote_url(&missing, "origin").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn remote_exists_missing_root_is_not_found() {
+        let missing = std::env::temp_dir().join(format!(
+            "nextide-remote-exists-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            remote_exists(&missing, "origin").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn remote_url_file_root_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "nextide-remote-url-notdir-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            remote_url(&file, "origin").unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn remote_exists_file_root_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "nextide-remote-exists-notdir-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            remote_exists(&file, "origin").unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_git_binary_for_remote_lookup_surfaces_as_not_found() {
+        let root = temp_dir("remotelookupnobinary");
+        let error = run_remote_lookup("nextide-no-such-git-binary", &root, "origin").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_remote_exists_surfaces_as_not_found() {
+        let root = temp_dir("remoteexistsnobinary");
+        let error = run_remote_exists("nextide-no-such-git-binary", &root, "origin").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- remote lookup integration (requires a git binary) ----
+
+    #[test]
+    fn remote_url_returns_the_named_remote() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("remoteurl", &[("a.txt", "a")]);
+        add_remote(&root, "origin", "https://github.com/foo/bar.git").unwrap();
+        // An explicit pushurl makes fetch and push differ.
+        run_git(
+            &root,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "ssh://git@example.com/push.git",
+            ],
+        );
+        add_remote(&root, "backup", "/local/backup").unwrap();
+        // A remote whose fetch URL is removed keeps only its push URL: git
+        // prints a bare `name<TAB>` line for the missing fetch URL.
+        run_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "onlypush",
+                "ssh://git@example.com/only-push.git",
+            ],
+        );
+        run_git(&root, &["config", "--unset", "remote.onlypush.url"]);
+        run_git(
+            &root,
+            &[
+                "config",
+                "remote.onlypush.pushurl",
+                "ssh://git@example.com/only-push.git",
+            ],
+        );
+
+        let origin = remote_url(&root, "origin").unwrap();
+        assert_eq!(origin.name, "origin");
+        assert_eq!(
+            origin.fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        assert_eq!(origin.push_urls, ["ssh://git@example.com/push.git"]);
+
+        let backup = remote_url(&root, "backup").unwrap();
+        assert_eq!(backup.fetch_url.as_deref(), Some("/local/backup"));
+        assert_eq!(backup.push_urls, ["/local/backup"]);
+
+        let onlypush = remote_url(&root, "onlypush").unwrap();
+        assert_eq!(onlypush.fetch_url, None);
+        assert_eq!(onlypush.push_urls, ["ssh://git@example.com/only-push.git"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_url_unknown_remote_is_not_found() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("remoteurlnope", &[("a.txt", "a")]);
+        let error = remote_url(&root, "nope").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let message = error.to_string();
+        assert!(message.contains("nope"), "message was: {message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_exists_reports_true_and_false() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("remoteexists", &[("a.txt", "a")]);
+        assert!(!remote_exists(&root, "origin").unwrap());
+        add_remote(&root, "origin", "https://github.com/foo/bar.git").unwrap();
+        assert!(remote_exists(&root, "origin").unwrap());
+        assert!(!remote_exists(&root, "nope").unwrap());
+        // A slash name resolves to the same remote.
+        add_remote(
+            &root,
+            "upstream/backup",
+            "https://github.com/foo/backup.git",
+        )
+        .unwrap();
+        assert!(remote_exists(&root, "upstream/backup").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_lookup_from_nested_root_queries_the_whole_repository() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("remotelookupnested", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        add_remote(&root, "origin", "https://github.com/foo/bar.git").unwrap();
+        // Remotes are repository-global configuration, so a nested root
+        // queries the same set.
+        let origin = remote_url(&root.join("sub"), "origin").unwrap();
+        assert_eq!(origin.name, "origin");
+        assert_eq!(
+            origin.fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        assert!(remote_exists(&root.join("sub"), "origin").unwrap());
+        assert!(!remote_exists(&root.join("sub"), "nope").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_lookup_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("remotelookupnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = remote_url(&root, "origin").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let error = remote_exists(&root, "origin").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(

@@ -35,12 +35,12 @@ pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};
 pub use file_tree::{FileNode, FileNodeKind, FileTreeModel};
 pub use git::{
-    add_remote, amend, branches, checkout, commit, delete_tag, diff, log, remotes, remove_remote,
-    restore, set_remote_url, stage, stash_apply, stash_drop, stash_list, stash_pop, stash_push,
-    status, tag, tags, unstage, GitBranch, GitBranchSnapshot, GitCommitEntry, GitCommitResult,
-    GitDiffFile, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitDiffSnapshot, GitFileState,
-    GitLogSnapshot, GitRemote, GitRemoteSnapshot, GitStashEntry, GitStashSnapshot, GitStatusCode,
-    GitStatusEntry, GitStatusSnapshot, GitTag, GitTagSnapshot,
+    add_remote, amend, branches, checkout, commit, delete_tag, diff, log, remote_exists,
+    remote_url, remotes, remove_remote, restore, set_remote_url, stage, stash_apply, stash_drop,
+    stash_list, stash_pop, stash_push, status, tag, tags, unstage, GitBranch, GitBranchSnapshot,
+    GitCommitEntry, GitCommitResult, GitDiffFile, GitDiffHunk, GitDiffLine, GitDiffLineKind,
+    GitDiffSnapshot, GitFileState, GitLogSnapshot, GitRemote, GitRemoteSnapshot, GitStashEntry,
+    GitStashSnapshot, GitStatusCode, GitStatusEntry, GitStatusSnapshot, GitTag, GitTagSnapshot,
 };
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};
