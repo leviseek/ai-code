@@ -35,11 +35,11 @@ pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};
 pub use file_tree::{FileNode, FileNodeKind, FileTreeModel};
 pub use git::{
-    amend, branches, checkout, commit, diff, log, restore, stage, stash_apply, stash_drop,
+    amend, branches, checkout, commit, diff, log, remotes, restore, stage, stash_apply, stash_drop,
     stash_list, stash_pop, stash_push, status, tags, unstage, GitBranch, GitBranchSnapshot,
     GitCommitEntry, GitCommitResult, GitDiffFile, GitDiffHunk, GitDiffLine, GitDiffLineKind,
-    GitDiffSnapshot, GitFileState, GitLogSnapshot, GitStashEntry, GitStashSnapshot, GitStatusCode,
-    GitStatusEntry, GitStatusSnapshot, GitTag, GitTagSnapshot,
+    GitDiffSnapshot, GitFileState, GitLogSnapshot, GitRemote, GitRemoteSnapshot, GitStashEntry,
+    GitStashSnapshot, GitStatusCode, GitStatusEntry, GitStatusSnapshot, GitTag, GitTagSnapshot,
 };
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};

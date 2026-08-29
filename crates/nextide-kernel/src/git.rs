@@ -204,6 +204,31 @@
 //! `root` is not inside a Git repository) is [`io::ErrorKind::Other`] with
 //! git's stderr in the message.
 //!
+//! # Remotes
+//!
+//! [`remotes(root)`](remotes) lists the repository's configured remotes with
+//! `git -C <root> remote -v`: no shell, and the query is strictly read-only —
+//! it only reads the local Git configuration and never contacts a network or
+//! performs any fetch or push. Git prints one line per remote URL as
+//! `name<TAB>url (fetch|push)`; each [`GitRemote`] carries the remote's
+//! `name`, the `fetch_url` from its `(fetch)` line (the
+//! `remote.<name>.url` value — `None` when the remote has no fetch URL, in
+//! which case git prints a bare `name<TAB>` line), and the `push_urls` from
+//! its `(push)` lines in git's order: a remote without an explicit
+//! `remote.<name>.pushurl` reports its fetch URL as the single push URL, and
+//! a multi-valued `pushurl` yields one entry per value. URLs are kept exactly
+//! as git prints them — they may contain spaces and are never interpreted as
+//! paths or passed back to git. The snapshot is stably sorted by name. Parsed
+//! output must be valid UTF-8, every line must be `name<TAB>url (fetch)`,
+//! `name<TAB>url (push)` or the bare `name<TAB>` form, every name must be
+//! non-empty, free of whitespace and pass the same escape-rejecting check as
+//! status paths, and a remote may carry at most one fetch line; anything else
+//! is [`io::ErrorKind::InvalidData`]. Error behaviour matches [`tags`]: a
+//! missing `root` or `git` is [`io::ErrorKind::NotFound`], a non-directory
+//! `root` is [`io::ErrorKind::NotADirectory`], and a non-zero git exit (for
+//! example `root` is not inside a Git repository) is [`io::ErrorKind::Other`]
+//! with git's stderr in the message.
+//!
 //! # Restore and stash
 //!
 //! [`restore(root, paths)`](restore) discards the named paths' *worktree*
@@ -1921,6 +1946,212 @@ fn parse_tag_line(line: &str) -> io::Result<GitTag> {
         name: name.to_string(),
         object: object.to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Git remotes
+// ---------------------------------------------------------------------------
+
+/// One remote of a repository, as `git remote -v` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRemote {
+    /// The remote's name — the part before the tab, for example `origin`.
+    pub name: String,
+    /// The URL git fetches from, from the remote's `(fetch)` line (the
+    /// `remote.<name>.url` value). `None` when the remote has no fetch URL
+    /// configured — git then prints a bare `name<TAB>` line.
+    pub fetch_url: Option<String>,
+    /// The URLs git pushes to, from the remote's `(push)` lines in git's
+    /// order. A remote without an explicit `remote.<name>.pushurl` reports
+    /// its fetch URL as the single push URL; a multi-valued `pushurl` yields
+    /// one entry per value.
+    pub push_urls: Vec<String>,
+}
+
+/// The parsed result of [`remotes`]: every remote of the repository, stably
+/// sorted by name.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GitRemoteSnapshot {
+    /// The remotes, stably sorted by [`GitRemote::name`] in byte-wise order.
+    /// An empty vec means the repository has no configured remotes.
+    pub remotes: Vec<GitRemote>,
+}
+
+impl GitRemoteSnapshot {
+    /// The number of remotes.
+    pub fn len(&self) -> usize {
+        self.remotes.len()
+    }
+
+    /// Whether the repository has no configured remotes.
+    pub fn is_empty(&self) -> bool {
+        self.remotes.is_empty()
+    }
+}
+
+/// Lists the repository's configured remotes and returns the stably sorted
+/// snapshot.
+///
+/// Runs `git -C <root> remote -v`: no shell, and the query is strictly
+/// read-only — it only reads the local Git configuration, never contacts a
+/// network and never performs a fetch or push. Every line is git's own
+/// machine-oriented `name<TAB>url (fetch|push)` output (or the bare
+/// `name<TAB>` form for a remote without a fetch URL), so no human-format
+/// parsing is involved.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::Other`] if `git` exits non-zero (for example `root` is
+///   not inside a Git repository); git's stderr is included in the message.
+/// - [`io::ErrorKind::InvalidData`] if git's output is not valid UTF-8 or
+///   cannot be parsed (a malformed line, a duplicate fetch line, an empty
+///   URL, or a name that fails validation).
+pub fn remotes(root: &Path) -> io::Result<GitRemoteSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    run_remotes("git", root)
+}
+
+/// Runs `program -C root remote -v`; split out so tests can exercise the
+/// spawn-failure path with a program that does not exist.
+fn run_remotes(program: &str, root: &Path) -> io::Result<GitRemoteSnapshot> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "-v"])
+        .output()?;
+    ensure_git_success(&output, "remote -v")?;
+    parse_remotes_bytes(output.stdout)
+}
+
+/// Converts `git remote -v` stdout to UTF-8 and parses it; split out so the
+/// non-UTF-8 path is testable without spawning git.
+fn parse_remotes_bytes(stdout: Vec<u8>) -> io::Result<GitRemoteSnapshot> {
+    let stdout = String::from_utf8(stdout).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git remote -v output is not valid UTF-8",
+        )
+    })?;
+    parse_remotes(&stdout)
+}
+
+/// Parses `name<TAB>url (fetch|push)` lines (or bare `name<TAB>` lines for
+/// remotes without a fetch URL) into a snapshot, stably sorted by name.
+fn parse_remotes(output: &str) -> io::Result<GitRemoteSnapshot> {
+    let mut by_name: Vec<RemoteBuilder> = Vec::new();
+    for line in output.lines() {
+        // Defensive CRLF tolerance; git itself always emits `\n`.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let (name, rest) = line
+            .split_once('\t')
+            .ok_or_else(|| malformed("remote line must be name<TAB>url (fetch|push)"))?;
+        check_remote_name(name)?;
+        let index = match by_name.iter().position(|builder| builder.name == name) {
+            Some(index) => index,
+            None => {
+                by_name.push(RemoteBuilder::new(name.to_string()));
+                by_name.len() - 1
+            }
+        };
+        by_name[index].push_line(rest)?;
+    }
+    let mut remotes: Vec<GitRemote> = by_name.into_iter().map(RemoteBuilder::finish).collect();
+    remotes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(GitRemoteSnapshot { remotes })
+}
+
+/// How much of a remote's fetch URL has been seen while its lines are being
+/// parsed.
+#[derive(PartialEq, Eq)]
+enum FetchState {
+    /// No fetch line seen yet.
+    Unset,
+    /// A bare `name<TAB>` line: the remote has no fetch URL.
+    Bare,
+    /// A `name<TAB>url (fetch)` line.
+    Set(String),
+}
+
+/// Accumulates one remote's lines while `git remote -v` output is parsed.
+struct RemoteBuilder {
+    name: String,
+    fetch: FetchState,
+    push_urls: Vec<String>,
+}
+
+impl RemoteBuilder {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            fetch: FetchState::Unset,
+            push_urls: Vec::new(),
+        }
+    }
+
+    /// Consumes one line's tab-free remainder: `url (fetch)`, `url (push)`
+    /// or the empty remainder of a bare fetch line.
+    fn push_line(&mut self, rest: &str) -> io::Result<()> {
+        if let Some(url) = rest.strip_suffix(" (fetch)") {
+            if self.fetch != FetchState::Unset {
+                return Err(malformed("remote has more than one fetch line"));
+            }
+            if url.is_empty() {
+                return Err(malformed("remote fetch URL is empty"));
+            }
+            self.fetch = FetchState::Set(url.to_string());
+        } else if let Some(url) = rest.strip_suffix(" (push)") {
+            if url.is_empty() {
+                return Err(malformed("remote push URL is empty"));
+            }
+            self.push_urls.push(url.to_string());
+        } else if rest.is_empty() {
+            // git's bare `name<TAB>` line for a remote without a fetch URL.
+            if self.fetch != FetchState::Unset {
+                return Err(malformed("remote fetch line contradicts its URL line"));
+            }
+            self.fetch = FetchState::Bare;
+        } else {
+            return Err(malformed(
+                "remote line must end in \" (fetch)\", \" (push)\", or be bare",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds the finished [`GitRemote`].
+    fn finish(self) -> GitRemote {
+        let fetch_url = match self.fetch {
+            FetchState::Set(url) => Some(url),
+            FetchState::Unset | FetchState::Bare => None,
+        };
+        GitRemote {
+            name: self.name,
+            fetch_url,
+            push_urls: self.push_urls,
+        }
+    }
+}
+
+/// Validates a remote name parsed from `git remote -v` output: it must be
+/// non-empty, free of whitespace, and pass the same escape-rejecting check
+/// as status paths (git's own remote names are restricted ref-like names, so
+/// anything else means corrupt configuration).
+fn check_remote_name(name: &str) -> io::Result<()> {
+    check_safe_path(name)?;
+    if name.chars().any(char::is_whitespace) {
+        return Err(malformed("remote name contains whitespace"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -6284,6 +6515,368 @@ mod tests {
             return;
         }
         let error = tags(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- remotes parsing ----
+
+    #[test]
+    fn parses_fetch_and_push_lines_into_typed_remotes() {
+        let output = concat!(
+            "origin\thttps://github.com/foo/bar.git (fetch)\n",
+            "origin\thttps://github.com/foo/bar.git (push)\n",
+        );
+        let snapshot = parse_remotes(output).unwrap();
+        assert_eq!(snapshot.remotes.len(), 1);
+        let origin = &snapshot.remotes[0];
+        assert_eq!(origin.name, "origin");
+        assert_eq!(
+            origin.fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        // Without an explicit pushurl, git reports the fetch URL as the
+        // single push URL.
+        assert_eq!(origin.push_urls, ["https://github.com/foo/bar.git"]);
+    }
+
+    #[test]
+    fn parses_distinct_pushurl() {
+        let output = concat!(
+            "origin\thttps://github.com/foo/bar.git (fetch)\n",
+            "origin\tgit@github.com:foo/bar.git (push)\n",
+        );
+        let snapshot = parse_remotes(output).unwrap();
+        let origin = &snapshot.remotes[0];
+        assert_eq!(
+            origin.fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        assert_eq!(origin.push_urls, ["git@github.com:foo/bar.git"]);
+    }
+
+    #[test]
+    fn parses_multiple_pushurls_in_git_order() {
+        let output = concat!(
+            "origin\thttps://github.com/foo/bar.git (fetch)\n",
+            "origin\tssh://git@example.com/push1.git (push)\n",
+            "origin\tssh://git@example.com/push2.git (push)\n",
+        );
+        let snapshot = parse_remotes(output).unwrap();
+        let origin = &snapshot.remotes[0];
+        assert_eq!(
+            origin.fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        assert_eq!(
+            origin.push_urls,
+            [
+                "ssh://git@example.com/push1.git",
+                "ssh://git@example.com/push2.git"
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_remote_without_fetch_url_from_bare_line() {
+        // A remote with a pushurl but no url: git prints a bare `name<TAB>`
+        // line for the missing fetch URL.
+        let output = concat!(
+            "onlypush\t\n",
+            "onlypush\tssh://git@example.com/only-push.git (push)\n",
+        );
+        let snapshot = parse_remotes(output).unwrap();
+        assert_eq!(snapshot.remotes.len(), 1);
+        let onlypush = &snapshot.remotes[0];
+        assert_eq!(onlypush.name, "onlypush");
+        assert_eq!(onlypush.fetch_url, None);
+        assert_eq!(onlypush.push_urls, ["ssh://git@example.com/only-push.git"]);
+    }
+
+    #[test]
+    fn parses_urls_containing_spaces() {
+        // `git remote -v` prints URLs raw, never quoted, so a URL with
+        // spaces is everything between the tab and the trailing suffix.
+        let output = concat!(
+            "second\t/local/path with spaces (fetch)\n",
+            "second\t/local/path with spaces (push)\n",
+        );
+        let snapshot = parse_remotes(output).unwrap();
+        let second = &snapshot.remotes[0];
+        assert_eq!(second.fetch_url.as_deref(), Some("/local/path with spaces"));
+        assert_eq!(second.push_urls, ["/local/path with spaces"]);
+    }
+
+    #[test]
+    fn parses_remote_with_fetch_line_only() {
+        let output = "origin\thttps://github.com/foo/bar.git (fetch)\n";
+        let snapshot = parse_remotes(output).unwrap();
+        let origin = &snapshot.remotes[0];
+        assert_eq!(
+            origin.fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        assert!(origin.push_urls.is_empty());
+    }
+
+    #[test]
+    fn parses_remote_lines_with_crlf() {
+        let output = "origin\thttps://x.git (fetch)\r\norigin\thttps://x.git (push)\r\n";
+        let snapshot = parse_remotes(output).unwrap();
+        assert_eq!(snapshot.remotes.len(), 1);
+        assert_eq!(snapshot.remotes[0].name, "origin");
+        assert_eq!(
+            snapshot.remotes[0].fetch_url.as_deref(),
+            Some("https://x.git")
+        );
+    }
+
+    #[test]
+    fn parses_remotes_and_sorts_by_name() {
+        let output = concat!(
+            "zeta\tz-url (fetch)\n",
+            "zeta\tz-url (push)\n",
+            "alpha\ta-url (fetch)\n",
+            "alpha\ta-url (push)\n",
+            "beta\tb-url (fetch)\n",
+            "beta\tb-url (push)\n",
+        );
+        let snapshot = parse_remotes(output).unwrap();
+        let names: Vec<&str> = snapshot.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta", "zeta"]);
+    }
+
+    #[test]
+    fn empty_remote_output_is_empty_snapshot() {
+        let snapshot = parse_remotes("").unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.len(), 0);
+        assert!(snapshot.remotes.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_remote_lines() {
+        for line in [
+            "origin",                  // no tab separator
+            "\turl (fetch)",           // empty name
+            "origin\t (fetch)",        // empty fetch URL
+            "origin\t (push)",         // empty push URL
+            "origin\turl (clone)",     // unknown suffix
+            "origin\turl",             // missing suffix
+            "origin\turl (fetch)junk", // trailing data
+            "bad name\turl (fetch)",   // whitespace in name
+            "/abs\turl (fetch)",       // absolute-looking name
+            "C:\\win\turl (fetch)",    // drive-looking name
+        ] {
+            let error = parse_remotes(line).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "line {line:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_fetch_lines() {
+        for output in [
+            // A bare line followed by a real fetch line for the same remote.
+            "origin\t\norigin\thttps://x.git (fetch)\n",
+            // Two fetch lines for the same remote.
+            "origin\thttps://a.git (fetch)\norigin\thttps://b.git (fetch)\n",
+        ] {
+            let error = parse_remotes(output).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "output {output:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_utf8_remote_output() {
+        let error = parse_remotes_bytes(vec![0xFF, 0xFE]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ---- remotes() root validation (no git binary needed) ----
+
+    #[test]
+    fn remotes_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-remotes-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            remotes(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn remotes_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-remotes-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            remotes(&file).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_git_binary_for_remotes_surfaces_as_not_found() {
+        let root =
+            std::env::temp_dir().join(format!("nextide-remotes-nobinary-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let error = run_remotes("nextide-no-such-git-binary", &root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- remotes() integration (requires a git binary) ----
+
+    #[test]
+    fn remotes_empty_repository_returns_empty_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("remotesempty", &[("a.txt", "a")]);
+        let snapshot = remotes(&root).unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.len(), 0);
+        assert!(snapshot.remotes.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remotes_reports_real_configured_remotes() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("remotesreal", &[("a.txt", "a")]);
+        // A plain remote: fetch and push share the URL.
+        run_git(
+            &root,
+            &["remote", "add", "origin", "https://github.com/foo/bar.git"],
+        );
+        // A multi-valued pushurl makes fetch and push differ; git tries the
+        // push URLs in order.
+        run_git(
+            &root,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "ssh://git@example.com/push1.git",
+            ],
+        );
+        run_git(
+            &root,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                "ssh://git@example.com/push2.git",
+            ],
+        );
+        // A URL containing spaces is stored and printed raw.
+        run_git(
+            &root,
+            &["remote", "add", "spaced", "/local/path with spaces"],
+        );
+        // A remote whose fetch URL is removed keeps only its push URL: git
+        // prints a bare `name<TAB>` line for the missing fetch URL.
+        run_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "onlypush",
+                "ssh://git@example.com/only-push.git",
+            ],
+        );
+        run_git(&root, &["config", "--unset", "remote.onlypush.url"]);
+        run_git(
+            &root,
+            &[
+                "config",
+                "remote.onlypush.pushurl",
+                "ssh://git@example.com/only-push.git",
+            ],
+        );
+
+        let snapshot = remotes(&root).unwrap();
+        let names: Vec<&str> = snapshot.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["onlypush", "origin", "spaced"]);
+
+        let onlypush = &snapshot.remotes[0];
+        assert_eq!(onlypush.fetch_url, None);
+        assert_eq!(onlypush.push_urls, ["ssh://git@example.com/only-push.git"]);
+
+        let origin = &snapshot.remotes[1];
+        assert_eq!(
+            origin.fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        assert_eq!(
+            origin.push_urls,
+            [
+                "ssh://git@example.com/push1.git",
+                "ssh://git@example.com/push2.git"
+            ]
+        );
+
+        let spaced = &snapshot.remotes[2];
+        assert_eq!(spaced.fetch_url.as_deref(), Some("/local/path with spaces"));
+        assert_eq!(spaced.push_urls, ["/local/path with spaces"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remotes_from_nested_root_queries_the_whole_repository() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("remotesnested", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        run_git(
+            &root,
+            &["remote", "add", "origin", "https://github.com/foo/bar.git"],
+        );
+        // Remotes are repository-global configuration, so a nested root
+        // queries the same set.
+        let snapshot = remotes(&root.join("sub")).unwrap();
+        assert_eq!(snapshot.remotes.len(), 1);
+        assert_eq!(snapshot.remotes[0].name, "origin");
+        assert_eq!(
+            snapshot.remotes[0].fetch_url.as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remotes_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("remotesnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = remotes(&root).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
