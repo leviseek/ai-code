@@ -67,6 +67,19 @@ Background async tasks can also be bridged to a caller-owned `EventBus`: `TaskMa
 
 The editor kernel is the single source of truth for document mutations. UI, AI, collaboration, and extensions must eventually submit changes through the same transaction API.
 
+## Packaging
+
+A minimal Windows packaging baseline lives in [`packaging/windows/`](packaging/windows/README.md). It does exactly two safe things and nothing more:
+
+1. builds the release binaries: `cargo build --release`
+2. stages the CLI and Desktop Shell executables under `dist/windows/`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
+```
+
+The script verifies the release build succeeds and that every expected executable exists before copying, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. Installer, signing, and a CI packaging job are later phases (see `STATUS.md`).
+
 ## CI
 
 GitHub Actions CI (`.github/workflows/ci.yml`) runs on a `windows-latest` runner, since the project targets Windows, and gates every push and pull request with the same three checks that are verified locally:
