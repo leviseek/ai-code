@@ -23,8 +23,8 @@ pub use commands::{
 };
 pub use event_loop::{EventLoop, HeadlessEventLoop};
 pub use git_status::{
-    marker_for, status_kind, summary, tree_statuses, DefaultGitStatusAdapter, GitStatusAdapter,
-    GitStatusSummary, StatusKind, TreeStatus,
+    marker_for, status_kind, summary, summary_text, tree_statuses, DefaultGitStatusAdapter,
+    GitStatusAdapter, GitStatusSummary, StatusKind, TreeStatus,
 };
 pub use input::{command_for_input, UiInput};
 pub use keymap::{command_for, KeyChord};
@@ -958,6 +958,31 @@ mod tests {
         let snapshot = shell.snapshot();
         assert_eq!(snapshot.visible_tree[0].status, StatusKind::Clean);
         assert_eq!(snapshot.git_summary, Some(GitStatusSummary::default()));
+    }
+
+    #[test]
+    fn git_status_text_accessor_projects_the_applied_summary() {
+        let mut shell = DesktopShell::new("NextIDE");
+        // No Git snapshot applied yet: no status-bar text at all.
+        assert_eq!(shell.snapshot().git_status_text(), None);
+
+        shell.update_git_status(status_snapshot(vec![status_entry("main.rs", "M ")]));
+        assert_eq!(
+            shell.snapshot().git_status_text().as_deref(),
+            Some("changed: staged=1 unstaged=0 untracked=0")
+        );
+
+        // A clean replacement keeps Git integration active and reports the
+        // clean text, not None.
+        shell.update_git_status(status_snapshot(Vec::new()));
+        assert_eq!(shell.snapshot().git_status_text().as_deref(), Some("clean"));
+
+        // Conflicts win the state word and keep their own bucket.
+        shell.update_git_status(status_snapshot(vec![status_entry("main.rs", "UU")]));
+        assert_eq!(
+            shell.snapshot().git_status_text().as_deref(),
+            Some("conflicted: conflicted=1 staged=0 unstaged=0 untracked=0")
+        );
     }
 
     #[test]

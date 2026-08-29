@@ -26,6 +26,12 @@
 //!   a two-sided entry counts toward both `staged` and `unstaged`, conflicts
 //!   form their own bucket, and untracked entries are separate. `total` is the
 //!   snapshot's entry count, so a clean snapshot is all zeros.
+//! - [`summary_text`] projects a [`GitStatusSummary`] into the stable
+//!   status-bar string (the function's docs give the exact format): `"clean"`
+//!   when nothing is pending, a `"changed: …"` line when changes exist without
+//!   conflicts, and a `"conflicted: …"` line when any entry is unmerged —
+//!   always the same keys, order and single-space separators, so the text is
+//!   parseable and never changes between releases.
 //! - [`marker_for`] looks up one path's marker for tree-row badges; paths are
 //!   matched as-is (snapshot paths are relative to the repository top level,
 //!   which equals the workspace root in the normal case).
@@ -169,6 +175,12 @@ impl GitStatusSummary {
     pub fn is_clean(&self) -> bool {
         self.total == 0
     }
+
+    /// Projects this summary into the stable status-bar text; see the free
+    /// [`summary_text`] function for the exact format.
+    pub fn summary_text(&self) -> String {
+        summary_text(self)
+    }
 }
 
 impl From<&GitStatusSnapshot> for GitStatusSummary {
@@ -236,6 +248,46 @@ pub fn summary(snapshot: &GitStatusSnapshot) -> GitStatusSummary {
     out
 }
 
+/// Projects a summary into the stable status-bar text.
+///
+/// The returned string is a fixed, parseable format that never changes
+/// between releases:
+///
+/// - `"clean"` — no pending changes at all (`conflicted`, `staged`,
+///   `unstaged` and `untracked` are all zero; this is the only state that
+///   does not carry counts).
+/// - `"changed: staged={n} unstaged={n} untracked={n}"` — changes exist but
+///   no entry is unmerged. Every key is always present, in this order.
+/// - `"conflicted: conflicted={n} staged={n} unstaged={n} untracked={n}"` —
+///   at least one unmerged entry. Conflicts outrank ordinary changes, and
+///   again every key is always present in this fixed order.
+///
+/// Counts use `Display`, keys are the lowercase [`StatusKind::as_str`] labels
+/// (plus the state words `clean`/`changed`/`conflicted`), and fields are
+/// separated by single spaces, so UIs can render the string as-is or parse it
+/// with `strip_prefix`/`split`. The projection is pure: it is derived solely
+/// from the summary's own counts, never from the snapshot, so a hand-built
+/// summary projects identically to one produced by [`summary`].
+pub fn summary_text(summary: &GitStatusSummary) -> String {
+    if summary.conflicted == 0
+        && summary.staged == 0
+        && summary.unstaged == 0
+        && summary.untracked == 0
+    {
+        "clean".to_string()
+    } else if summary.conflicted > 0 {
+        format!(
+            "conflicted: conflicted={} staged={} unstaged={} untracked={}",
+            summary.conflicted, summary.staged, summary.unstaged, summary.untracked
+        )
+    } else {
+        format!(
+            "changed: staged={} unstaged={} untracked={}",
+            summary.staged, summary.unstaged, summary.untracked
+        )
+    }
+}
+
 /// Looks up the marker for one tree path, if the snapshot reports it.
 ///
 /// Paths are matched as-is against the snapshot's entries, whose paths are
@@ -271,6 +323,11 @@ pub trait GitStatusAdapter {
     /// Derives the status-bar summary counts for a snapshot.
     fn summary(&self, snapshot: &GitStatusSnapshot) -> GitStatusSummary {
         summary(snapshot)
+    }
+
+    /// Projects a summary into the stable status-bar text.
+    fn summary_text(&self, summary: &GitStatusSummary) -> String {
+        summary_text(summary)
     }
 
     /// Looks up the marker for one tree path, if the snapshot reports it.
@@ -492,6 +549,136 @@ mod tests {
             }
         );
         assert!(tree_statuses(&snapshot(Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn summary_text_projects_clean_changed_and_conflicted() {
+        assert_eq!(GitStatusSummary::default().summary_text(), "clean");
+        assert_eq!(summary_text(&GitStatusSummary::default()), "clean");
+
+        let changed = GitStatusSummary {
+            total: 4,
+            staged: 1,
+            unstaged: 2,
+            untracked: 1,
+            conflicted: 0,
+        };
+        assert_eq!(
+            summary_text(&changed),
+            "changed: staged=1 unstaged=2 untracked=1"
+        );
+
+        let conflicted = GitStatusSummary {
+            total: 3,
+            staged: 1,
+            unstaged: 0,
+            untracked: 0,
+            conflicted: 2,
+        };
+        assert_eq!(
+            summary_text(&conflicted),
+            "conflicted: conflicted=2 staged=1 unstaged=0 untracked=0"
+        );
+    }
+
+    #[test]
+    fn summary_text_conflicts_outrank_ordinary_changes() {
+        let summary = GitStatusSummary {
+            total: 5,
+            staged: 3,
+            unstaged: 1,
+            untracked: 1,
+            conflicted: 1,
+        };
+        assert_eq!(
+            summary_text(&summary),
+            "conflicted: conflicted=1 staged=3 unstaged=1 untracked=1"
+        );
+    }
+
+    #[test]
+    fn summary_text_is_deterministic_for_any_counts() {
+        // Classification reads the buckets themselves, not `total`, so even a
+        // hand-built summary that disagrees with its own total projects
+        // deterministically: all-zero buckets are clean, and a zero-total
+        // summary with conflicts still reports them.
+        assert_eq!(
+            summary_text(&GitStatusSummary {
+                total: 0,
+                conflicted: 1,
+                ..GitStatusSummary::default()
+            }),
+            "conflicted: conflicted=1 staged=0 unstaged=0 untracked=0"
+        );
+        assert_eq!(
+            summary_text(&GitStatusSummary {
+                total: 1,
+                ..GitStatusSummary::default()
+            }),
+            "clean"
+        );
+    }
+
+    #[test]
+    fn summary_text_uses_fixed_keys_in_fixed_order() {
+        // The exact strings are the contract; re-assert the key order so a
+        // reformat can never silently reorder fields.
+        let changed = GitStatusSummary {
+            total: 6,
+            staged: 1,
+            unstaged: 2,
+            untracked: 3,
+            conflicted: 0,
+        };
+        let text = summary_text(&changed);
+        assert!(text.starts_with("changed: "));
+        let fields: Vec<&str> = text["changed: ".len()..].split(' ').collect();
+        assert_eq!(fields, vec!["staged=1", "unstaged=2", "untracked=3"]);
+
+        let conflicted = GitStatusSummary {
+            total: 6,
+            staged: 1,
+            unstaged: 2,
+            untracked: 3,
+            conflicted: 4,
+        };
+        let text = summary_text(&conflicted);
+        assert!(text.starts_with("conflicted: "));
+        let fields: Vec<&str> = text["conflicted: ".len()..].split(' ').collect();
+        assert_eq!(
+            fields,
+            vec!["conflicted=4", "staged=1", "unstaged=2", "untracked=3"]
+        );
+    }
+
+    #[test]
+    fn summary_text_projects_a_real_snapshot_summary() {
+        let snapshot = snapshot(vec![
+            entry("??", "untracked.txt", None),
+            entry("M ", "staged.rs", None),
+            entry(" M", "unstaged.rs", None),
+            entry("UU", "conflict.rs", None),
+        ]);
+        assert_eq!(
+            summary(&snapshot).summary_text(),
+            "conflicted: conflicted=1 staged=1 unstaged=1 untracked=1"
+        );
+    }
+
+    #[test]
+    fn summary_text_matches_the_model_method_and_the_adapter() {
+        let adapter = DefaultGitStatusAdapter;
+        let summary = GitStatusSummary {
+            total: 2,
+            staged: 1,
+            unstaged: 0,
+            untracked: 0,
+            conflicted: 1,
+        };
+        assert_eq!(summary.summary_text(), summary_text(&summary));
+        assert_eq!(adapter.summary_text(&summary), summary_text(&summary));
+        let clean = GitStatusSummary::default();
+        assert_eq!(clean.summary_text(), adapter.summary_text(&clean));
     }
 
     #[test]

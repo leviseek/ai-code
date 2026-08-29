@@ -96,4 +96,17 @@ impl ShellSnapshot {
             git_summary: None,
         }
     }
+
+    /// The stable status-bar text projected from the applied Git summary, if
+    /// any; see [`GitStatusSummary::summary_text`] for the exact format.
+    ///
+    /// `Some` exactly when [`git_summary`](Self::git_summary) is `Some`, so
+    /// `Some("clean")` means Git integration is active and the repository has
+    /// no pending changes, while `None` means no Git snapshot has been
+    /// applied to this shell yet.
+    pub fn git_status_text(&self) -> Option<String> {
+        self.git_summary
+            .as_ref()
+            .map(GitStatusSummary::summary_text)
+    }
 }
