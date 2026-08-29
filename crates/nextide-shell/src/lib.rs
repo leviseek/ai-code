@@ -40,8 +40,8 @@ pub use renderer::{
 pub use view_model::{ShellSnapshot, TreeItem};
 
 use nextide_kernel::{
-    ApplicationContext, HeadlessSurface, HeadlessWindowService, RenderSurface, SurfaceSize,
-    WindowHandle, WindowOptions, WindowService,
+    ApplicationContext, GitStatusSnapshot, HeadlessSurface, HeadlessWindowService, RenderSurface,
+    SurfaceSize, WindowHandle, WindowOptions, WindowService,
 };
 
 #[derive(Debug)]
@@ -59,6 +59,10 @@ pub struct DesktopShell {
     pub previous_tree_rows: Vec<TreeRenderRow>,
     pub last_tree_changes: Vec<TreeRowChange>,
     pub tree_change_frame: u64,
+    /// The externally supplied Git status snapshot, if any. Applied to
+    /// snapshots and render rows by [`DesktopShell::snapshot`]; the shell
+    /// never runs git itself, so `None` keeps every marker [`StatusKind::Clean`].
+    pub git_status: Option<GitStatusSnapshot>,
 }
 
 impl DesktopShell {
@@ -80,6 +84,7 @@ impl DesktopShell {
             previous_tree_rows: Vec::new(),
             last_tree_changes: Vec::new(),
             tree_change_frame: 0,
+            git_status: None,
         }
     }
 
@@ -432,14 +437,35 @@ impl DesktopShell {
         Ok(result)
     }
 
+    /// Applies an external Git status snapshot, making its markers visible in
+    /// the next [`snapshot`](Self::snapshot) and rendered tree rows.
+    ///
+    /// The snapshot comes from outside the shell (for example from
+    /// `nextide_kernel::git::status`); this method never runs git itself.
+    /// Paths are matched exactly, as in [`marker_for`]: an entry whose path
+    /// equals a visible tree node's path marks that node, everything else
+    /// stays [`StatusKind::Clean`], and the snapshot's [`summary`] is exposed
+    /// as [`ShellSnapshot::git_summary`] for the status bar. A later call
+    /// replaces the previous snapshot.
+    pub fn update_git_status(&mut self, snapshot: GitStatusSnapshot) {
+        self.git_status = Some(snapshot);
+    }
+
     pub fn snapshot(&self) -> ShellSnapshot {
-        ShellSnapshot::from_context(
+        let mut snapshot = ShellSnapshot::from_context(
             self.title.clone(),
             &self.app,
             &self.palette,
             &self.notifications,
             self.selected_tree.clone(),
-        )
+        );
+        if let Some(git) = self.git_status.as_ref() {
+            snapshot.git_summary = Some(summary(git));
+            for item in &mut snapshot.visible_tree {
+                item.status = marker_for(git, &item.path).unwrap_or(StatusKind::Clean);
+            }
+        }
+        snapshot
     }
 
     pub fn tree_changes(&self) -> &[TreeRowChange] {
@@ -473,6 +499,7 @@ impl DesktopShell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nextide_kernel::git::{GitFileState, GitStatusCode, GitStatusEntry};
     #[test]
     fn run_frame_processes_input_and_renders() {
         let mut shell = DesktopShell::new("NextIDE");
@@ -843,5 +870,129 @@ mod tests {
     fn shell_starts_with_bootstrapped_application() {
         let shell = DesktopShell::new("NextIDE");
         assert_eq!(shell.start(), "NextIDE ready (3 capabilities)");
+    }
+
+    /// Maps one porcelain byte to its kernel code (mirrors the kernel's
+    /// private parser so tests can build any XY combination without git).
+    fn code(byte: u8) -> GitStatusCode {
+        match byte {
+            b' ' => GitStatusCode::Unmodified,
+            b'M' => GitStatusCode::Modified,
+            b'A' => GitStatusCode::Added,
+            b'D' => GitStatusCode::Deleted,
+            b'?' => GitStatusCode::Untracked,
+            b'U' => GitStatusCode::Unmerged,
+            other => GitStatusCode::Unknown(other as char),
+        }
+    }
+
+    fn status_entry(path: &str, xy: &str) -> GitStatusEntry {
+        let bytes = xy.as_bytes();
+        assert_eq!(bytes.len(), 2, "XY code must be two bytes");
+        GitStatusEntry {
+            state: GitFileState::new(code(bytes[0]), code(bytes[1])),
+            path: path.to_string(),
+            original: None,
+        }
+    }
+
+    fn status_snapshot(entries: Vec<GitStatusEntry>) -> GitStatusSnapshot {
+        GitStatusSnapshot { entries }
+    }
+
+    #[test]
+    fn update_git_status_marks_snapshot_and_render_rows() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        shell
+            .app
+            .file_tree
+            .add("notes.md", nextide_kernel::FileNodeKind::File);
+        shell.update_git_status(status_snapshot(vec![
+            status_entry("main.rs", "M "),
+            status_entry("notes.md", "??"),
+        ]));
+
+        let snapshot = shell.snapshot();
+        assert_eq!(
+            snapshot.git_summary,
+            Some(GitStatusSummary {
+                total: 2,
+                staged: 1,
+                unstaged: 0,
+                untracked: 1,
+                conflicted: 0,
+            })
+        );
+        assert_eq!(snapshot.visible_tree[0].status, StatusKind::Staged);
+        assert_eq!(snapshot.visible_tree[1].status, StatusKind::Untracked);
+
+        let mut renderer = HeadlessRenderer::default();
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(renderer.tree_rows()[0].status, StatusKind::Staged);
+        assert_eq!(renderer.tree_rows()[1].status, StatusKind::Untracked);
+    }
+
+    #[test]
+    fn update_git_status_replaces_the_previous_snapshot() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        shell.update_git_status(status_snapshot(vec![status_entry("main.rs", "MM")]));
+        assert_eq!(
+            shell.snapshot().visible_tree[0].status,
+            StatusKind::StagedAndUnstaged
+        );
+
+        // A clean replacement clears the markers but keeps a (zero) summary:
+        // the snapshot exists, it just has no entries.
+        shell.update_git_status(status_snapshot(Vec::new()));
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.visible_tree[0].status, StatusKind::Clean);
+        assert_eq!(snapshot.git_summary, Some(GitStatusSummary::default()));
+    }
+
+    #[test]
+    fn git_status_is_optional_and_defaults_to_clean() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        assert!(shell.git_status.is_none());
+
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.git_summary, None);
+        assert_eq!(snapshot.visible_tree[0].status, StatusKind::Clean);
+
+        let mut renderer = HeadlessRenderer::default();
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(renderer.tree_rows()[0].status, StatusKind::Clean);
+    }
+
+    #[test]
+    fn marker_changes_surface_as_updated_rows() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell
+            .app
+            .file_tree
+            .add("main.rs", nextide_kernel::FileNodeKind::File);
+        let mut renderer = HeadlessRenderer::default();
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(shell.tree_changes().len(), 1);
+        assert!(matches!(&shell.tree_changes()[0], TreeRowChange::Added(_)));
+
+        shell.update_git_status(status_snapshot(vec![status_entry("main.rs", " M")]));
+        shell.render_ui(&mut renderer).unwrap();
+        assert_eq!(shell.tree_changes().len(), 1);
+        assert!(
+            matches!(&shell.tree_changes()[0], TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged)
+        );
+        assert_eq!(shell.tree_change_frame(), 2);
     }
 }

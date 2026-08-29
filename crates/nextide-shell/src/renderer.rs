@@ -1,4 +1,4 @@
-use crate::ShellSnapshot;
+use crate::{ShellSnapshot, StatusKind};
 use std::io;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9,6 +9,9 @@ pub struct TreeRenderRow {
     pub y: u32,
     pub selected: bool,
     pub icon: &'static str,
+    /// The Git status marker projected from [`crate::TreeItem::status`];
+    /// [`StatusKind::Clean`] when the item carries no pending change.
+    pub status: StatusKind,
 }
 
 impl TreeRenderRow {
@@ -37,6 +40,7 @@ pub fn tree_rows(snapshot: &ShellSnapshot) -> Vec<TreeRenderRow> {
             y: index as u32 * 24,
             selected: item.selected,
             icon: if item.directory { "folder" } else { "file" },
+            status: item.status,
         })
         .collect()
 }
@@ -123,6 +127,7 @@ pub trait UiRenderer {
                 y: index as u32 * 24,
                 selected: item.selected,
                 icon: if item.directory { "folder" } else { "file" },
+                status: item.status,
             })
             .collect())
     }
@@ -186,6 +191,7 @@ mod tests {
             y: 0,
             selected: false,
             icon: "file",
+            status: StatusKind::Clean,
         }];
         let current = vec![
             TreeRenderRow {
@@ -195,6 +201,7 @@ mod tests {
                 y: 0,
                 selected: true,
                 icon: "file",
+                status: StatusKind::Clean,
             },
             TreeRenderRow {
                 path: "new.rs".into(),
@@ -203,6 +210,7 @@ mod tests {
                 y: 24,
                 selected: false,
                 icon: "file",
+                status: StatusKind::Clean,
             },
         ];
         let changes = diff_tree_rows(&old, &current);
@@ -228,6 +236,7 @@ mod tests {
                 y: 0,
                 selected: false,
                 icon: "folder",
+                status: StatusKind::Clean,
             }),
             TreeRowChange::Updated(TreeRenderRow {
                 path: "src/main.rs".into(),
@@ -236,6 +245,7 @@ mod tests {
                 y: 24,
                 selected: true,
                 icon: "file",
+                status: StatusKind::Clean,
             }),
             TreeRowChange::Removed("old.rs".into()),
         ];
@@ -265,6 +275,7 @@ mod tests {
                     directory: true,
                     expanded: true,
                     selected: false,
+                    status: StatusKind::Clean,
                 },
                 crate::TreeItem {
                     path: "src/main.rs".into(),
@@ -274,12 +285,14 @@ mod tests {
                     directory: false,
                     expanded: false,
                     selected: true,
+                    status: StatusKind::Staged,
                 },
             ],
             selected_tree: Some("src/main.rs".into()),
             palette_open: false,
             palette_query: String::new(),
             notifications: 0,
+            git_summary: None,
         };
         let rows = tree_rows(&snapshot);
         assert_eq!(rows.len(), 2);
@@ -287,6 +300,7 @@ mod tests {
             (rows[1].x, rows[1].y, rows[1].icon, rows[1].selected),
             (16, 24, "file", true)
         );
+        assert_eq!(rows[1].status, StatusKind::Staged);
     }
 
     #[test]
@@ -298,6 +312,7 @@ mod tests {
             y: 24,
             selected: false,
             icon: "folder",
+            status: StatusKind::Clean,
         };
         assert!(row.toggle_hit(crate::Point { x: 8, y: 30 }));
         assert!(!row.toggle_hit(crate::Point { x: 20, y: 30 }));
@@ -317,6 +332,7 @@ mod tests {
             y: 24,
             selected: false,
             icon: "file",
+            status: StatusKind::Clean,
         };
         assert!(row.hit(crate::Point { x: 20, y: 30 }, 280));
         assert!(!row.hit(crate::Point { x: 10, y: 30 }, 280));
@@ -341,9 +357,82 @@ mod tests {
             palette_open: false,
             palette_query: String::new(),
             notifications: 0,
+            git_summary: None,
         };
         renderer.render(&snapshot).unwrap();
         assert_eq!(renderer.frames(), 1);
         assert_eq!(renderer.last_snapshot().unwrap().title, "NextIDE");
+    }
+
+    #[test]
+    fn tree_rows_project_git_status_markers() {
+        let snapshot = ShellSnapshot {
+            title: "NextIDE".into(),
+            open_files: 0,
+            tabs: 0,
+            editor_views: 0,
+            tree_nodes: 2,
+            tab_paths: vec![],
+            active_tab: None,
+            tree_paths: vec![],
+            visible_tree_paths: vec![],
+            visible_tree: vec![
+                crate::TreeItem {
+                    path: "main.rs".into(),
+                    name: "main.rs".into(),
+                    depth: 0,
+                    indent: 0,
+                    directory: false,
+                    expanded: false,
+                    selected: false,
+                    status: StatusKind::Staged,
+                },
+                crate::TreeItem {
+                    path: "notes.md".into(),
+                    name: "notes.md".into(),
+                    depth: 0,
+                    indent: 0,
+                    directory: false,
+                    expanded: false,
+                    selected: false,
+                    status: StatusKind::Untracked,
+                },
+            ],
+            selected_tree: None,
+            palette_open: false,
+            palette_query: String::new(),
+            notifications: 0,
+            git_summary: Some(crate::GitStatusSummary::default()),
+        };
+        let rows = tree_rows(&snapshot);
+        assert_eq!(rows[0].status, StatusKind::Staged);
+        assert_eq!(rows[1].status, StatusKind::Untracked);
+    }
+
+    #[test]
+    fn diff_tree_rows_reports_status_marker_changes_as_updated() {
+        let old = vec![TreeRenderRow {
+            path: "main.rs".into(),
+            label: "main.rs".into(),
+            x: 0,
+            y: 0,
+            selected: false,
+            icon: "file",
+            status: StatusKind::Clean,
+        }];
+        let current = vec![TreeRenderRow {
+            path: "main.rs".into(),
+            label: "main.rs".into(),
+            x: 0,
+            y: 0,
+            selected: false,
+            icon: "file",
+            status: StatusKind::Staged,
+        }];
+        let changes = diff_tree_rows(&old, &current);
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(&changes[0], TreeRowChange::Updated(row) if row.status == StatusKind::Staged)
+        );
     }
 }

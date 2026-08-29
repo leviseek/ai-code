@@ -1,4 +1,4 @@
-use crate::{CommandPalette, NotificationCenter};
+use crate::{CommandPalette, GitStatusSummary, NotificationCenter, StatusKind};
 use nextide_kernel::{ApplicationContext, FileNodeKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,6 +10,13 @@ pub struct TreeItem {
     pub directory: bool,
     pub expanded: bool,
     pub selected: bool,
+    /// The Git status marker for this path.
+    ///
+    /// [`StatusKind::Clean`] when the path has no pending change or when no
+    /// Git snapshot has been applied yet. Porcelain status names files, not
+    /// directories, so a directory without its own entry stays `Clean` even
+    /// when some of its children are marked.
+    pub status: StatusKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,9 +35,18 @@ pub struct ShellSnapshot {
     pub palette_open: bool,
     pub palette_query: String,
     pub notifications: usize,
+    /// The Git status-bar summary, when a Git snapshot has been applied to
+    /// the shell; `None` while no Git integration is active.
+    pub git_summary: Option<GitStatusSummary>,
 }
 
 impl ShellSnapshot {
+    /// Builds a snapshot from kernel/app state.
+    ///
+    /// Git status is deliberately not part of this constructor: markers
+    /// default to [`StatusKind::Clean`] and [`git_summary`](Self::git_summary)
+    /// to `None`. [`crate::DesktopShell::snapshot`] applies an externally
+    /// supplied Git snapshot on top afterwards.
     pub fn from_context(
         title: impl Into<String>,
         app: &ApplicationContext,
@@ -71,11 +87,13 @@ impl ShellSnapshot {
                     directory: node.kind == FileNodeKind::Directory,
                     expanded: node.expanded,
                     selected: selected_tree.as_ref() == Some(&node.path),
+                    status: StatusKind::Clean,
                 })
                 .collect(),
             palette_open: palette.is_open(),
             palette_query: palette.query().to_string(),
             notifications: notifications.items().len(),
+            git_summary: None,
         }
     }
 }
