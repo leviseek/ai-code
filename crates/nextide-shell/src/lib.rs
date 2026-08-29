@@ -1,6 +1,7 @@
 mod command_registry;
 mod commands;
 mod event_loop;
+mod git_diff;
 mod git_status;
 mod input;
 mod keymap;
@@ -22,6 +23,11 @@ pub use commands::{
     CommandOutcome, CommandResult, ShellCommand,
 };
 pub use event_loop::{EventLoop, HeadlessEventLoop};
+pub use git_diff::{
+    file_view_for, file_views, summary as diff_summary, summary_text as diff_summary_text,
+    DefaultGitDiffAdapter, DiffFileView, DiffHunkView, DiffLineKind, DiffLineView, DiffSummary,
+    GitDiffAdapter,
+};
 pub use git_status::{
     aggregate_directory_status, marker_for, status_kind, summary, summary_text, tree_statuses,
     DefaultGitStatusAdapter, GitStatusAdapter, GitStatusSummary, StatusKind, TreeStatus,
