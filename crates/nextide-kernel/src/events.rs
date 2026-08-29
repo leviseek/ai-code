@@ -1,5 +1,5 @@
-//! A tiny, dependency-free event hub with a legacy per-topic poll/drain API
-//! and per-subscriber subscriptions.
+//! A tiny, dependency-free event hub with a legacy per-topic poll/drain API,
+//! per-subscriber subscriptions, and a bounded in-memory event log.
 //!
 //! [`EventBus::publish`] appends an [`Event`] to the topic's pending queue —
 //! the legacy [`EventBus::pending`] / [`EventBus::drain`] API — and stamps it
@@ -17,6 +17,19 @@
 //! A pull never modifies the bus, so legacy `drain` consumers and every other
 //! subscriber observe exactly the same events: each subscriber receives the
 //! full stream independently of the others.
+//!
+//! [`EventBus::log`] and [`EventBus::events_since`] expose the bus's retained
+//! event log: a per-topic, bounded in-memory journal that every published
+//! event is appended to and that *no* consumer path ever removes from. Both
+//! return copies of events — [`EventBus::log`] the whole retained log for a
+//! topic, [`EventBus::events_since`] the retained events with `seq >= cursor`
+//! — without consuming the pending queue, so legacy `drain`, subscribers, and
+//! the log each observe the same events independently. Each topic's log holds
+//! at most [`EventBus::log_capacity`] events ([`EventBus::with_log_capacity`]
+//! configures it; the default is finite); when a publish would exceed the
+//! capacity the *oldest* retained events are dropped first, and
+//! [`EventBus::log_start`] reports the oldest retained sequence number so a
+//! cursor reader can detect that eviction happened.
 //!
 //! A subscriber is a plain owned value — it holds no reference into the bus,
 //! so there are no lifetimes to manage, no shared state between subscribers,
@@ -53,10 +66,13 @@ impl Event {
 /// [`EventBus::publish`] queues [`Event`]s per topic; the legacy
 /// [`EventBus::pending`] / [`EventBus::drain`] API polls and removes them.
 /// [`EventBus::subscribe`] creates a per-subscriber subscription that pulls
-/// its own copy of the stream.
-#[derive(Default, Debug)]
+/// its own copy of the stream, and [`EventBus::log`] / [`EventBus::events_since`]
+/// read the bus's bounded, non-consuming retained event log.
+#[derive(Debug)]
 pub struct EventBus {
     queues: BTreeMap<String, Vec<Event>>,
+    logs: BTreeMap<String, VecDeque<Event>>,
+    log_capacity: usize,
     next_seq: u64,
 }
 
@@ -64,15 +80,26 @@ impl EventBus {
     /// Queues `event` for its topic and assigns it the next sequence number.
     ///
     /// The event is delivered both to the topic's legacy pending queue (visible
-    /// to [`EventBus::pending`] / [`EventBus::drain`]) and, when they next pull,
-    /// to every [`EventSubscriber`] subscribed to the topic.
+    /// to [`EventBus::pending`] / [`EventBus::drain`]), when they next pull, to
+    /// every [`EventSubscriber`] subscribed to the topic, and — independently
+    /// of all consumer paths — to the topic's retained event log, readable via
+    /// [`EventBus::log`] / [`EventBus::events_since`]. If the log has reached
+    /// its [`EventBus::log_capacity`], the oldest retained event for the topic
+    /// is dropped to make room; the pending queue and subscribers are never
+    /// affected by log eviction.
     pub fn publish(&mut self, mut event: Event) {
         event.seq = self.next_seq;
         self.next_seq += 1;
+        let topic = event.topic.clone();
         self.queues
-            .entry(event.topic.clone())
+            .entry(topic.clone())
             .or_default()
-            .push(event);
+            .push(event.clone());
+        let log = self.logs.entry(topic).or_default();
+        log.push_back(event);
+        if log.len() > self.log_capacity {
+            log.pop_front();
+        }
     }
 
     /// Removes and returns every event pending for `topic`, in publish order.
@@ -94,6 +121,84 @@ impl EventBus {
         self.next_seq
     }
 
+    /// Creates an [`EventBus`] whose per-topic retained event log holds at
+    /// most `capacity` events per topic.
+    ///
+    /// A `capacity` of `0` disables retention: [`EventBus::log`] /
+    /// [`EventBus::events_since`] always return empty, while the legacy
+    /// pending queue and subscribers work exactly as usual.
+    pub fn with_log_capacity(capacity: usize) -> Self {
+        Self {
+            queues: BTreeMap::new(),
+            logs: BTreeMap::new(),
+            log_capacity: capacity,
+            next_seq: 0,
+        }
+    }
+
+    /// The maximum number of events each topic's retained log holds.
+    ///
+    /// [`EventBus::with_log_capacity`] sets it; [`EventBus::default`] uses a
+    /// finite default so the log is always bounded unless configured otherwise.
+    pub fn log_capacity(&self) -> usize {
+        self.log_capacity
+    }
+
+    /// The topic's full retained event log, oldest first, as copies.
+    ///
+    /// Returns every event published to `topic` that is still retained —
+    /// dropping nothing from the bus, so the legacy pending queue, subscribers
+    /// and later calls all observe the same events. The log is independent of
+    /// consumption: events removed by [`EventBus::drain`] or delivered to
+    /// subscribers remain readable here until capacity evicts them.
+    pub fn log(&self, topic: impl Into<String>) -> Vec<Event> {
+        self.logs
+            .get(&topic.into())
+            .map(|log| log.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The topic's retained events with `seq >= cursor`, oldest first, as
+    /// copies — a non-consuming, cursor-based read of the event log.
+    ///
+    /// Pass the sequence number of the *next* event you want (e.g. the last
+    /// consumed `seq + 1`) to resume a stream: every retained event whose
+    /// `seq` is at least `cursor` is returned, and nothing is removed from the
+    /// bus. If the log's oldest retained event has a `seq` greater than
+    /// `cursor`, events between the cursor and the log were evicted by
+    /// [`EventBus::log_capacity`]; [`EventBus::log_start`] reports the oldest
+    /// retained sequence number so such gaps are detectable.
+    pub fn events_since(&self, seq: u64, topic: impl Into<String>) -> Vec<Event> {
+        let topic = topic.into();
+        self.logs
+            .get(&topic)
+            .map(|log| {
+                log.iter()
+                    .filter(|event| event.seq >= seq)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// How many events are currently retained in `topic`'s log.
+    pub fn log_len(&self, topic: &str) -> usize {
+        self.logs.get(topic).map(VecDeque::len).unwrap_or(0)
+    }
+
+    /// The sequence number of `topic`'s oldest retained event, or `None` when
+    /// the topic's log is empty (nothing published, or capacity `0`).
+    ///
+    /// A cursor reader can compare this with its cursor: a `log_start` greater
+    /// than the cursor means events between the two were evicted by the log's
+    /// capacity.
+    pub fn log_start(&self, topic: &str) -> Option<u64> {
+        self.logs
+            .get(topic)
+            .and_then(|log| log.front())
+            .map(|event| event.seq)
+    }
+
     /// Creates a per-subscriber subscription to `topic`.
     ///
     /// The returned [`EventSubscriber`] owns an independent queue and starts
@@ -110,6 +215,19 @@ impl EventBus {
         }
     }
 }
+
+impl Default for EventBus {
+    /// The default bus retains the newest `DEFAULT_LOG_CAPACITY` events per
+    /// topic in its event log; the pending queue and subscription behaviour
+    /// are identical to [`EventBus::with_log_capacity`].
+    fn default() -> Self {
+        Self::with_log_capacity(DEFAULT_LOG_CAPACITY)
+    }
+}
+
+/// Default number of events each topic's retained log holds on a
+/// [`EventBus::default`] bus.
+const DEFAULT_LOG_CAPACITY: usize = 256;
 
 /// A per-subscriber subscription to one [`EventBus`] topic.
 ///
@@ -302,5 +420,233 @@ mod tests {
             all.iter().map(|event| event.seq).collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4, 5, 6]
         );
+    }
+
+    #[test]
+    fn log_returns_copies_without_consuming_the_queue() {
+        let mut bus = EventBus::default();
+        bus.publish(Event::new("document.changed", "revision=1"));
+        bus.publish(Event::new("document.changed", "revision=2"));
+        bus.publish(Event::new("document.changed", "revision=3"));
+
+        // The log is a non-consuming read: the legacy queue still sees every
+        // event, and the returned Vec holds copies in publish order.
+        assert_eq!(bus.pending("document.changed"), 3);
+        let log = bus.log("document.changed");
+        assert_eq!(
+            log.iter()
+                .map(|event| event.payload.as_str())
+                .collect::<Vec<_>>(),
+            vec!["revision=1", "revision=2", "revision=3"]
+        );
+        assert_eq!(
+            log.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(bus.pending("document.changed"), 3);
+
+        // The log outlives consumption: draining the legacy queue does not
+        // remove anything from the log.
+        assert_eq!(bus.drain("document.changed").len(), 3);
+        assert_eq!(bus.pending("document.changed"), 0);
+        assert_eq!(bus.log("document.changed").len(), 3);
+        // Unknown topics have an empty log.
+        assert!(bus.log("document.saved").is_empty());
+        assert_eq!(bus.log_len("document.saved"), 0);
+    }
+
+    #[test]
+    fn events_since_resumes_a_stream_from_a_cursor() {
+        let mut bus = EventBus::default();
+        for revision in 0..5 {
+            bus.publish(Event::new(
+                "document.changed",
+                format!("revision={revision}"),
+            ));
+        }
+
+        // Inclusive cursor: everything at or after the cursor is returned,
+        // and nothing is consumed.
+        let resumed = bus.events_since(2, "document.changed");
+        assert_eq!(
+            resumed.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(bus.pending("document.changed"), 5);
+
+        // Cursor at the end of the stream / beyond it is empty.
+        assert!(bus.events_since(5, "document.changed").is_empty());
+        assert!(bus.events_since(100, "document.changed").is_empty());
+        // Cursor 0 is the whole retained log.
+        assert_eq!(bus.events_since(0, "document.changed").len(), 5);
+    }
+
+    #[test]
+    fn events_since_filters_by_topic_across_interleaved_streams() {
+        let mut bus = EventBus::default();
+        bus.publish(Event::new("document.changed", "a=1"));
+        bus.publish(Event::new("document.saved", "s=1"));
+        bus.publish(Event::new("document.changed", "a=2"));
+        bus.publish(Event::new("task.output", "t=1"));
+        bus.publish(Event::new("document.changed", "a=3"));
+
+        // Each topic's log holds only its own events, in publish order, even
+        // though the bus-wide seq stream interleaves topics.
+        let changed = bus.log("document.changed");
+        assert_eq!(
+            changed.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            changed
+                .iter()
+                .map(|event| event.payload.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a=1", "a=2", "a=3"]
+        );
+        assert_eq!(bus.log_len("document.saved"), 1);
+        assert_eq!(bus.log_len("task.output"), 1);
+
+        // A cursor read on one topic never leaks another topic's events, and
+        // returns the topic's events with seq >= cursor in publish order.
+        let since = bus.events_since(2, "document.changed");
+        assert_eq!(
+            since.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+        assert_eq!(bus.events_since(0, "task.output").len(), 1);
+        assert_eq!(bus.events_since(0, "document.saved").len(), 1);
+    }
+
+    #[test]
+    fn log_capacity_evicts_the_oldest_events_only() {
+        let mut bus = EventBus::with_log_capacity(3);
+        for revision in 0..5 {
+            bus.publish(Event::new(
+                "document.changed",
+                format!("revision={revision}"),
+            ));
+        }
+
+        // Capacity 3 keeps exactly the newest 3; the oldest 2 are dropped.
+        assert_eq!(bus.log_capacity(), 3);
+        assert_eq!(bus.log_len("document.changed"), 3);
+        assert_eq!(
+            bus.log("document.changed")
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        // log_start reports the oldest retained seq, so the eviction of
+        // seqs 0..2 is observable.
+        assert_eq!(bus.log_start("document.changed"), Some(2));
+
+        // The cursor read reflects the same eviction: events_since(0) starts
+        // at the retained head (seq 2 > requested 0 = a detectable gap).
+        let since = bus.events_since(0, "document.changed");
+        assert_eq!(since[0].seq, 2);
+
+        // Eviction is confined to the log: the legacy queue and subscribers
+        // still see every published event.
+        assert_eq!(bus.pending("document.changed"), 5);
+        let mut subscriber = bus.subscribe("document.changed");
+        bus.publish(Event::new("document.changed", "revision=5"));
+        assert_eq!(subscriber.drain(&bus).len(), 1);
+        // The newest publish pushed the log to seqs 3, 4, 5.
+        assert_eq!(
+            bus.log("document.changed")
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(bus.log_start("document.changed"), Some(3));
+    }
+
+    #[test]
+    fn log_capacity_boundary_retains_exactly_capacity_events() {
+        let mut bus = EventBus::with_log_capacity(3);
+        for revision in 0..3 {
+            bus.publish(Event::new(
+                "document.changed",
+                format!("revision={revision}"),
+            ));
+        }
+        // Exactly at capacity: everything retained, nothing evicted.
+        assert_eq!(bus.log_len("document.changed"), 3);
+        assert_eq!(bus.log_start("document.changed"), Some(0));
+        assert_eq!(bus.log("document.changed").len(), 3);
+
+        // One more publish crosses the boundary: the oldest is evicted, the
+        // log stays at exactly capacity.
+        bus.publish(Event::new("document.changed", "revision=3"));
+        assert_eq!(bus.log_len("document.changed"), 3);
+        assert_eq!(bus.log_start("document.changed"), Some(1));
+        assert_eq!(
+            bus.log("document.changed")
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn zero_capacity_retains_nothing_but_legacy_api_keeps_working() {
+        let mut bus = EventBus::with_log_capacity(0);
+        bus.publish(Event::new("document.changed", "revision=1"));
+
+        // Retention is fully disabled...
+        assert_eq!(bus.log_capacity(), 0);
+        assert!(bus.log("document.changed").is_empty());
+        assert!(bus.events_since(0, "document.changed").is_empty());
+        assert_eq!(bus.log_len("document.changed"), 0);
+        assert_eq!(bus.log_start("document.changed"), None);
+
+        // ...while the legacy queue is entirely unaffected.
+        assert_eq!(bus.pending("document.changed"), 1);
+        assert_eq!(bus.drain("document.changed")[0].payload, "revision=1");
+    }
+
+    #[test]
+    fn default_bus_has_a_finite_log_capacity() {
+        let mut bus = EventBus::default();
+        assert_eq!(bus.log_capacity(), 256);
+        for seq in 0..300 {
+            bus.publish(Event::new("document.changed", format!("revision={seq}")));
+        }
+        // The default log is bounded: the oldest 300 - 256 = 44 events were
+        // evicted, the newest 256 are retained.
+        assert_eq!(bus.log_len("document.changed"), 256);
+        assert_eq!(bus.log_start("document.changed"), Some(44));
+        assert_eq!(bus.events_since(44, "document.changed").len(), 256);
+        assert_eq!(bus.pending("document.changed"), 300);
+    }
+
+    #[test]
+    fn event_log_coexists_with_subscribers_and_legacy_consumers() {
+        let mut bus = EventBus::default();
+        let mut subscriber = bus.subscribe("document.changed");
+        bus.publish(Event::new("document.changed", "revision=1"));
+        bus.publish(Event::new("document.changed", "revision=2"));
+
+        // The subscriber and the legacy consumer each consume independently,
+        // and the log observes the full stream either way.
+        assert_eq!(subscriber.drain(&bus).len(), 2);
+        assert_eq!(bus.drain("document.changed").len(), 2);
+        assert_eq!(bus.pending("document.changed"), 0);
+        assert_eq!(bus.log_len("document.changed"), 2);
+        assert_eq!(bus.log("document.changed").len(), 2);
+
+        // A later publish is visible to the log immediately, with a strictly
+        // increasing seq that continues the bus-wide order.
+        bus.publish(Event::new("document.changed", "revision=3"));
+        let log = bus.log("document.changed");
+        assert_eq!(
+            log.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(log.windows(2).all(|pair| pair[0].seq < pair[1].seq));
     }
 }
