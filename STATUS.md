@@ -14,7 +14,7 @@ Phase 0：技术基线与核心内核起步。
 - 增加 5 个内核单元测试。
 - 增加 CLI `smoke` 冒烟流程。
 - 通过 `cargo fmt --check`、`cargo test --workspace` 和 CLI 冒烟验证。
-- 当前工作区测试：208 passed，0 failed（内核 156 + shell 51 + doc-test 1）。
+- 当前工作区测试：559 passed，0 failed（内核 415 + shell 143 + doc-test 1）。
 - Editor Kernel 已支持 `document.changed` 与 `document.saved` 事件。
 - 原子保存成功后可通过 Event Bus 发布保存事件。
 - 增加 LocalRpcRouter/Typed RPC 基线。

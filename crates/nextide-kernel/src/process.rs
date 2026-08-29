@@ -543,8 +543,15 @@ fn spawn_reader<R: Read + Send + 'static>(
 #[cfg(windows)]
 fn kill_child_tree(child: &mut Child) -> io::Result<()> {
     let pid = child.id();
+    // Best-effort kill: the direct child may already have exited, in which
+    // case taskkill reports `ERROR: The process ... not found.` on stderr;
+    // that is expected here (the descendant walk below covers the dead-root
+    // case), so the probe runs silently and the noise never reaches callers
+    // or test output.
     let taskkill = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     if matches!(taskkill, Ok(status) if status.success()) {
         return Ok(());
