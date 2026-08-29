@@ -304,6 +304,7 @@ mod tests {
             palette_query: String::new(),
             notifications: 0,
             git_summary: None,
+            diff_summary: None,
         };
         let rows = tree_rows(&snapshot);
         assert_eq!(rows.len(), 2);
@@ -372,6 +373,7 @@ mod tests {
             palette_query: String::new(),
             notifications: 0,
             git_summary: None,
+            diff_summary: None,
         };
         renderer.render(&snapshot).unwrap();
         assert_eq!(renderer.frames(), 1);
@@ -417,6 +419,7 @@ mod tests {
             palette_query: String::new(),
             notifications: 0,
             git_summary: Some(crate::GitStatusSummary::default()),
+            diff_summary: None,
         };
         let rows = tree_rows(&snapshot);
         assert_eq!(rows[0].status, StatusKind::Staged);

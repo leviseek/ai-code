@@ -7,7 +7,13 @@ pub enum UiInput {
     ClickFile(PathBuf),
     ClickDirectory(PathBuf),
     ClickTab(PathBuf),
-    Resize { width: u32, height: u32 },
+    /// A click on one file row of the diff panel; toggles that file's
+    /// expansion.
+    ClickDiffFile(PathBuf),
+    Resize {
+        width: u32,
+        height: u32,
+    },
     Close,
 }
 
@@ -17,6 +23,7 @@ pub fn command_for_input(input: UiInput) -> Option<ShellCommand> {
         UiInput::ClickFile(path) => Some(ShellCommand::OpenFile(path)),
         UiInput::ClickDirectory(path) => Some(ShellCommand::ToggleDirectory(path)),
         UiInput::ClickTab(path) => Some(ShellCommand::OpenFile(path)),
+        UiInput::ClickDiffFile(path) => Some(ShellCommand::DiffToggleFile(path)),
         UiInput::Resize { .. } | UiInput::Close => None,
     }
 }
@@ -38,6 +45,10 @@ mod tests {
         assert_eq!(
             command_for_input(UiInput::ClickDirectory(PathBuf::from("src"))),
             Some(ShellCommand::ToggleDirectory(PathBuf::from("src")))
+        );
+        assert_eq!(
+            command_for_input(UiInput::ClickDiffFile(PathBuf::from("src/lib.rs"))),
+            Some(ShellCommand::DiffToggleFile(PathBuf::from("src/lib.rs")))
         );
         assert!(command_for_input(UiInput::Close).is_none());
     }

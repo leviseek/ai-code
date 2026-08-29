@@ -4,10 +4,23 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellCommand {
     OpenFile(PathBuf),
-    CloseFile { path: PathBuf, force: bool },
+    CloseFile {
+        path: PathBuf,
+        force: bool,
+    },
     SaveActive,
     ScanWorkspace(PathBuf),
     ToggleDirectory(PathBuf),
+    /// Toggles the expansion of one file of the diff panel.
+    ///
+    /// An empty path means "the currently selected tree path", resolved by
+    /// [`crate::DesktopShell::execute`] so key bindings can target the file
+    /// the user is looking at.
+    DiffToggleFile(PathBuf),
+    /// Moves the diff panel selection to the next visible line.
+    DiffNextLine,
+    /// Moves the diff panel selection to the previous visible line.
+    DiffPrevLine,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,6 +353,9 @@ pub fn from_id(id: &str, path: impl Into<PathBuf>) -> Option<ShellCommand> {
         "file.save" => Some(ShellCommand::SaveActive),
         "workspace.scan" => Some(ShellCommand::ScanWorkspace(path)),
         "workspace.toggle-directory" => Some(ShellCommand::ToggleDirectory(path)),
+        "diff.toggle-file" => Some(ShellCommand::DiffToggleFile(path)),
+        "diff.next-line" => Some(ShellCommand::DiffNextLine),
+        "diff.prev-line" => Some(ShellCommand::DiffPrevLine),
         _ => None,
     }
 }
@@ -350,6 +366,18 @@ mod tests {
     #[test]
     fn resolves_stable_command_ids() {
         assert_eq!(from_id("file.save", "."), Some(ShellCommand::SaveActive));
+        assert_eq!(
+            from_id("diff.toggle-file", "src/lib.rs"),
+            Some(ShellCommand::DiffToggleFile("src/lib.rs".into()))
+        );
+        assert_eq!(
+            from_id("diff.next-line", "."),
+            Some(ShellCommand::DiffNextLine)
+        );
+        assert_eq!(
+            from_id("diff.prev-line", "."),
+            Some(ShellCommand::DiffPrevLine)
+        );
         assert!(from_id("missing", ".").is_none());
     }
 

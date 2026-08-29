@@ -49,8 +49,9 @@ mod tests {
         let mut palette = CommandPalette::default();
         palette.open();
         palette.set_query("file");
-        assert_eq!(palette.results().len(), 3);
+        // file.open / file.save / file.close / diff.toggle-file.
+        assert_eq!(palette.results().len(), 4);
         palette.move_selection(-1);
-        assert_eq!(palette.selected().unwrap().id, "file.close");
+        assert_eq!(palette.selected().unwrap().id, "diff.toggle-file");
     }
 }

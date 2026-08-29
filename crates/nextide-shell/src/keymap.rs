@@ -14,6 +14,11 @@ pub fn command_for(chord: KeyChord) -> Option<ShellCommand> {
         return match chord.key.to_ascii_lowercase() {
             's' => Some(ShellCommand::SaveActive),
             'o' => Some(ShellCommand::OpenFile(PathBuf::new())),
+            // Diff panel navigation. The toggle command carries an empty path
+            // so the shell can resolve it to the selected tree path.
+            'j' => Some(ShellCommand::DiffNextLine),
+            'k' => Some(ShellCommand::DiffPrevLine),
+            't' => Some(ShellCommand::DiffToggleFile(PathBuf::new())),
             _ => None,
         };
     }
@@ -41,5 +46,30 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn maps_diff_panel_navigation_shortcuts() {
+        let next = command_for(KeyChord {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            key: 'j',
+        });
+        assert_eq!(next, Some(ShellCommand::DiffNextLine));
+        let prev = command_for(KeyChord {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            key: 'K',
+        });
+        assert_eq!(prev, Some(ShellCommand::DiffPrevLine));
+        let toggle = command_for(KeyChord {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            key: 't',
+        });
+        assert_eq!(toggle, Some(ShellCommand::DiffToggleFile(PathBuf::new())));
     }
 }

@@ -48,8 +48,8 @@ pub use renderer::{
 pub use view_model::{ShellSnapshot, TreeItem};
 
 use nextide_kernel::{
-    ApplicationContext, GitStatusSnapshot, HeadlessSurface, HeadlessWindowService, RenderSurface,
-    SurfaceSize, WindowHandle, WindowOptions, WindowService,
+    ApplicationContext, GitDiffSnapshot, GitStatusSnapshot, HeadlessSurface, HeadlessWindowService,
+    RenderSurface, SurfaceSize, WindowHandle, WindowOptions, WindowService,
 };
 
 #[derive(Debug)]
@@ -71,6 +71,12 @@ pub struct DesktopShell {
     /// snapshots and render rows by [`DesktopShell::snapshot`]; the shell
     /// never runs git itself, so `None` keeps every marker [`StatusKind::Clean`].
     pub git_status: Option<GitStatusSnapshot>,
+    /// The externally supplied diff panel snapshot, if any. Toggled and
+    /// navigated by the pure state interface ([`DesktopShell::toggle_diff_file`],
+    /// [`DesktopShell::diff_next_line`], [`DesktopShell::diff_prev_line`]) and
+    /// by the `diff.*` commands; the shell never runs git itself, so `None`
+    /// keeps every diff command a no-op.
+    pub diff_panel: Option<DiffPanelSnapshot>,
 }
 
 impl DesktopShell {
@@ -93,6 +99,7 @@ impl DesktopShell {
             last_tree_changes: Vec::new(),
             tree_change_frame: 0,
             git_status: None,
+            diff_panel: None,
         }
     }
 
@@ -441,8 +448,70 @@ impl DesktopShell {
                     CommandResult::Noop
                 }
             }
+            ShellCommand::DiffToggleFile(path) => {
+                // An empty path (key binding) targets the selected tree path.
+                let target = if path.as_os_str().is_empty() {
+                    match &self.selected_tree {
+                        Some(selected) => selected.clone(),
+                        None => return Ok(CommandResult::Noop),
+                    }
+                } else {
+                    path
+                };
+                if self.toggle_diff_file(&target) {
+                    let expanded = self
+                        .diff_panel
+                        .as_ref()
+                        .expect("toggle_diff_file just succeeded")
+                        .is_expanded(&target);
+                    self.events.publish(nextide_kernel::Event::new(
+                        "diff.panel.changed",
+                        format!(
+                            "action=toggle,file={},expanded={}",
+                            target.to_string_lossy(),
+                            expanded
+                        ),
+                    ));
+                    CommandResult::Applied
+                } else {
+                    CommandResult::Noop
+                }
+            }
+            ShellCommand::DiffNextLine => {
+                if self.diff_next_line() {
+                    self.publish_diff_selection_event();
+                    CommandResult::Applied
+                } else {
+                    CommandResult::Noop
+                }
+            }
+            ShellCommand::DiffPrevLine => {
+                if self.diff_prev_line() {
+                    self.publish_diff_selection_event();
+                    CommandResult::Applied
+                } else {
+                    CommandResult::Noop
+                }
+            }
         };
         Ok(result)
+    }
+
+    /// Publishes a stable `diff.panel.changed` event for a selection move:
+    /// `action=select,index=<n>` when a visible line is selected, or
+    /// `action=select,index=none` when the panel has no selection. Called only
+    /// after a selection move that actually changed the panel.
+    fn publish_diff_selection_event(&mut self) {
+        let payload = match self
+            .diff_panel
+            .as_ref()
+            .and_then(|panel| panel.selected_index())
+        {
+            Some(index) => format!("action=select,index={index}"),
+            None => "action=select,index=none".to_string(),
+        };
+        self.events
+            .publish(nextide_kernel::Event::new("diff.panel.changed", payload));
     }
 
     /// Applies an external Git status snapshot, making its markers visible in
@@ -459,6 +528,65 @@ impl DesktopShell {
         self.git_status = Some(snapshot);
     }
 
+    /// Applies an external diff snapshot, replacing the current diff panel.
+    ///
+    /// The snapshot comes from outside the shell (for example from
+    /// `nextide_kernel::git::diff`); this method never runs git itself. The
+    /// panel starts with every file expanded and nothing selected, per
+    /// [`DiffPanelSnapshot::from_snapshot`], and its summary is exposed as
+    /// [`ShellSnapshot::diff_summary`] for the status bar. A later call
+    /// replaces the previous panel.
+    pub fn update_diff_panel(&mut self, snapshot: GitDiffSnapshot) {
+        self.diff_panel = Some(DiffPanelSnapshot::from_snapshot(&snapshot));
+    }
+
+    /// The current diff panel, if one has been applied.
+    pub fn diff_panel_ref(&self) -> Option<&DiffPanelSnapshot> {
+        self.diff_panel.as_ref()
+    }
+
+    /// Toggles the expansion of one diff panel file, returning whether the
+    /// panel state changed.
+    ///
+    /// Pure state interface: `false` when no panel is active or the panel
+    /// does not report `path` (matching [`DiffPanelSnapshot::toggle_file`]).
+    pub fn toggle_diff_file(&mut self, path: &std::path::Path) -> bool {
+        let Some(panel) = self.diff_panel.as_mut() else {
+            return false;
+        };
+        panel.toggle_file(path)
+    }
+
+    /// Moves the diff panel selection to the next visible line, returning
+    /// whether the selection actually moved.
+    ///
+    /// Pure state interface: `false` when no panel is active, when nothing is
+    /// visible, or when the selection is already clamped at the last visible
+    /// line. From no selection it selects the first visible line.
+    pub fn diff_next_line(&mut self) -> bool {
+        let Some(panel) = self.diff_panel.as_mut() else {
+            return false;
+        };
+        let before = panel.selected_index();
+        panel.select_next();
+        panel.selected_index() != before
+    }
+
+    /// Moves the diff panel selection to the previous visible line, returning
+    /// whether the selection actually moved.
+    ///
+    /// Pure state interface: `false` when no panel is active, when nothing is
+    /// visible, or when the selection is already clamped at the first visible
+    /// line. From no selection it selects the last visible line.
+    pub fn diff_prev_line(&mut self) -> bool {
+        let Some(panel) = self.diff_panel.as_mut() else {
+            return false;
+        };
+        let before = panel.selected_index();
+        panel.select_prev();
+        panel.selected_index() != before
+    }
+
     pub fn snapshot(&self) -> ShellSnapshot {
         let mut snapshot = ShellSnapshot::from_context(
             self.title.clone(),
@@ -472,6 +600,9 @@ impl DesktopShell {
             for item in &mut snapshot.visible_tree {
                 item.status = marker_for(git, &item.path).unwrap_or(StatusKind::Clean);
             }
+        }
+        if let Some(panel) = self.diff_panel.as_ref() {
+            snapshot.diff_summary = Some(panel.summary());
         }
         snapshot
     }
@@ -1030,5 +1161,384 @@ mod tests {
             matches!(&shell.tree_changes()[0], TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged && row.status_marker == "U")
         );
         assert_eq!(shell.tree_change_frame(), 2);
+    }
+
+    // Diff panel helpers: build kernel diff snapshots without git.
+
+    fn diff_line(
+        kind: nextide_kernel::GitDiffLineKind,
+        old: Option<u32>,
+        new: Option<u32>,
+        text: &str,
+    ) -> nextide_kernel::GitDiffLine {
+        nextide_kernel::GitDiffLine {
+            kind,
+            old_line: old,
+            new_line: new,
+            text: text.to_string(),
+        }
+    }
+
+    fn diff_hunk(
+        header: &str,
+        lines: Vec<nextide_kernel::GitDiffLine>,
+    ) -> nextide_kernel::GitDiffHunk {
+        nextide_kernel::GitDiffHunk {
+            header: header.to_string(),
+            lines,
+        }
+    }
+
+    fn diff_file(
+        path: &str,
+        binary: bool,
+        hunks: Vec<nextide_kernel::GitDiffHunk>,
+    ) -> nextide_kernel::GitDiffFile {
+        nextide_kernel::GitDiffFile {
+            path: path.to_string(),
+            binary,
+            hunks,
+        }
+    }
+
+    fn diff_snapshot(files: Vec<nextide_kernel::GitDiffFile>) -> nextide_kernel::GitDiffSnapshot {
+        nextide_kernel::GitDiffSnapshot { files }
+    }
+
+    /// One small two-file diff: `docs/notes.md` (2 lines) and `src/lib.rs`
+    /// (3 lines), plus a binary `assets/logo.png` with no lines.
+    fn sample_diff() -> nextide_kernel::GitDiffSnapshot {
+        diff_snapshot(vec![
+            diff_file(
+                "docs/notes.md",
+                false,
+                vec![diff_hunk(
+                    "@@ -1,2 +1,1 @@",
+                    vec![
+                        diff_line(
+                            nextide_kernel::GitDiffLineKind::Context,
+                            Some(1),
+                            Some(1),
+                            "title",
+                        ),
+                        diff_line(
+                            nextide_kernel::GitDiffLineKind::Removed,
+                            Some(2),
+                            None,
+                            "obsolete line",
+                        ),
+                    ],
+                )],
+            ),
+            diff_file(
+                "src/lib.rs",
+                false,
+                vec![diff_hunk(
+                    "@@ -1,3 +1,3 @@",
+                    vec![
+                        diff_line(
+                            nextide_kernel::GitDiffLineKind::Context,
+                            Some(1),
+                            Some(1),
+                            "use std::io;",
+                        ),
+                        diff_line(
+                            nextide_kernel::GitDiffLineKind::Added,
+                            None,
+                            Some(2),
+                            "let x = 2;",
+                        ),
+                        diff_line(
+                            nextide_kernel::GitDiffLineKind::Removed,
+                            Some(2),
+                            None,
+                            "let x = 1;",
+                        ),
+                    ],
+                )],
+            ),
+            diff_file("assets/logo.png", true, Vec::new()),
+        ])
+    }
+
+    fn key(ctrl: bool, key: char) -> UiInput {
+        UiInput::Key(KeyChord {
+            ctrl,
+            shift: false,
+            alt: false,
+            key,
+        })
+    }
+
+    #[test]
+    fn diff_panel_is_optional_and_defaults_to_none() {
+        let mut shell = DesktopShell::new("NextIDE");
+        assert!(shell.diff_panel.is_none());
+        assert_eq!(shell.diff_panel_ref(), None);
+
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.diff_summary, None);
+        assert_eq!(snapshot.diff_status_text(), None);
+
+        // Every pure state interface method is a no-op without a panel.
+        assert!(!shell.toggle_diff_file(std::path::Path::new("src/lib.rs")));
+        assert!(!shell.diff_next_line());
+        assert!(!shell.diff_prev_line());
+
+        // And every diff command reports Noop.
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffToggleFile("src/lib.rs".into()))
+                .unwrap(),
+            CommandResult::Noop
+        );
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffNextLine)
+                .unwrap(),
+            CommandResult::Noop
+        );
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffPrevLine)
+                .unwrap(),
+            CommandResult::Noop
+        );
+    }
+
+    #[test]
+    fn update_diff_panel_exposes_summary_in_snapshot() {
+        let mut shell = DesktopShell::new("NextIDE");
+        let diff = sample_diff();
+        shell.update_diff_panel(diff.clone());
+
+        let panel = shell.diff_panel_ref().expect("panel should be applied");
+        assert_eq!(panel.file_count(), 3);
+        assert!(panel.is_expanded(std::path::Path::new("src/lib.rs")));
+        assert_eq!(panel.visible_line_count(), 5);
+        assert_eq!(panel.selected_index(), None);
+        assert_eq!(panel.summary(), diff_summary(&diff));
+
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.diff_summary, Some(panel.summary()));
+        assert_eq!(
+            snapshot.diff_status_text().as_deref(),
+            Some("changed: files=3 added=1 removed=2 context=2 binary_files=1")
+        );
+    }
+
+    #[test]
+    fn update_diff_panel_replaces_the_previous_panel() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell.update_diff_panel(sample_diff());
+        assert_eq!(shell.diff_panel_ref().unwrap().visible_line_count(), 5);
+
+        // A clean replacement keeps the panel active with no lines.
+        shell.update_diff_panel(diff_snapshot(Vec::new()));
+        let panel = shell.diff_panel_ref().unwrap();
+        assert_eq!(panel.file_count(), 0);
+        assert_eq!(panel.visible_line_count(), 0);
+        assert_eq!(panel.selected_index(), None);
+        assert_eq!(
+            shell.snapshot().diff_status_text().as_deref(),
+            Some("clean")
+        );
+    }
+
+    #[test]
+    fn diff_toggle_file_command_toggles_and_publishes_events() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell.update_diff_panel(sample_diff());
+
+        let path = std::path::PathBuf::from("src/lib.rs");
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffToggleFile(path.clone()))
+                .unwrap(),
+            CommandResult::Applied
+        );
+        assert!(!shell.diff_panel_ref().unwrap().is_expanded(&path));
+        assert_eq!(shell.diff_panel_ref().unwrap().visible_line_count(), 2);
+        assert_eq!(
+            shell.events.drain("diff.panel.changed")[0].payload,
+            "action=toggle,file=src/lib.rs,expanded=false"
+        );
+
+        // Toggling back restores the lines.
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffToggleFile(path.clone()))
+                .unwrap(),
+            CommandResult::Applied
+        );
+        assert!(shell.diff_panel_ref().unwrap().is_expanded(&path));
+        assert_eq!(
+            shell.events.drain("diff.panel.changed")[0].payload,
+            "action=toggle,file=src/lib.rs,expanded=true"
+        );
+
+        // Unknown paths are Noop and publish nothing.
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffToggleFile("Cargo.toml".into()))
+                .unwrap(),
+            CommandResult::Noop
+        );
+        assert_eq!(shell.events.pending("diff.panel.changed"), 0);
+    }
+
+    #[test]
+    fn diff_line_commands_move_selection_and_publish_events() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell.update_diff_panel(sample_diff());
+        let panel = shell.diff_panel_ref().unwrap();
+        assert_eq!(panel.visible_line_count(), 5);
+
+        // Next from no selection picks the first visible line.
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffNextLine)
+                .unwrap(),
+            CommandResult::Applied
+        );
+        assert_eq!(shell.diff_panel_ref().unwrap().selected_index(), Some(0));
+        assert_eq!(
+            shell.events.drain("diff.panel.changed")[0].payload,
+            "action=select,index=0"
+        );
+
+        // Walk to the end; the last next clamps and reports Noop.
+        for expected in 1..5 {
+            assert_eq!(
+                shell
+                    .execute_checked(&NoopFs, ShellCommand::DiffNextLine)
+                    .unwrap(),
+                CommandResult::Applied
+            );
+            assert_eq!(
+                shell.diff_panel_ref().unwrap().selected_index(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffNextLine)
+                .unwrap(),
+            CommandResult::Noop
+        );
+        assert_eq!(shell.diff_panel_ref().unwrap().selected_index(), Some(4));
+        // Each applied move published exactly one event; the clamped Noop
+        // published none. (The initial select event was drained above.)
+        assert_eq!(shell.events.drain("diff.panel.changed").len(), 4);
+
+        // Prev walks back and clamps at the first line.
+        for expected in (0..4).rev() {
+            assert_eq!(
+                shell
+                    .execute_checked(&NoopFs, ShellCommand::DiffPrevLine)
+                    .unwrap(),
+                CommandResult::Applied
+            );
+            assert_eq!(
+                shell.diff_panel_ref().unwrap().selected_index(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            shell
+                .execute_checked(&NoopFs, ShellCommand::DiffPrevLine)
+                .unwrap(),
+            CommandResult::Noop
+        );
+        assert_eq!(shell.diff_panel_ref().unwrap().selected_index(), Some(0));
+    }
+
+    #[test]
+    fn diff_key_bindings_route_through_input() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell.update_diff_panel(sample_diff());
+
+        // Ctrl+J next / Ctrl+K prev.
+        assert_eq!(
+            shell.handle_input(&NoopFs, key(true, 'j')).unwrap(),
+            CommandResult::Applied
+        );
+        assert_eq!(shell.diff_panel_ref().unwrap().selected_index(), Some(0));
+        // Uppercase K is normalized to the same prev binding.
+        assert_eq!(
+            shell.handle_input(&NoopFs, key(true, 'K')).unwrap(),
+            CommandResult::Noop
+        );
+        assert_eq!(
+            shell.handle_input(&NoopFs, key(true, 'j')).unwrap(),
+            CommandResult::Applied
+        );
+        assert_eq!(shell.diff_panel_ref().unwrap().selected_index(), Some(1));
+        assert_eq!(
+            shell.handle_input(&NoopFs, key(true, 'k')).unwrap(),
+            CommandResult::Applied
+        );
+        assert_eq!(shell.diff_panel_ref().unwrap().selected_index(), Some(0));
+
+        // Ctrl+T with nothing selected in the tree is a Noop.
+        assert_eq!(
+            shell.handle_input(&NoopFs, key(true, 't')).unwrap(),
+            CommandResult::Noop
+        );
+
+        // With a tree selection, Ctrl+T toggles that file's expansion.
+        shell
+            .app
+            .file_tree
+            .add("src/lib.rs", nextide_kernel::FileNodeKind::File);
+        let _ = shell.tree_input_at(Point { x: 10, y: 0 });
+        assert_eq!(
+            shell.handle_input(&NoopFs, key(true, 't')).unwrap(),
+            CommandResult::Applied
+        );
+        assert!(!shell
+            .diff_panel_ref()
+            .unwrap()
+            .is_expanded(std::path::Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn diff_click_input_maps_to_toggle_command() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell.update_diff_panel(sample_diff());
+        assert_eq!(
+            shell
+                .handle_input(&NoopFs, UiInput::ClickDiffFile("docs/notes.md".into()))
+                .unwrap(),
+            CommandResult::Applied
+        );
+        assert!(!shell
+            .diff_panel_ref()
+            .unwrap()
+            .is_expanded(std::path::Path::new("docs/notes.md")));
+    }
+
+    #[test]
+    fn diff_commands_observe_the_typed_execution_path() {
+        let mut shell = DesktopShell::new("NextIDE");
+        shell.update_diff_panel(sample_diff());
+        let result = shell.execute_observed(&NoopFs, ShellCommand::DiffNextLine);
+        assert!(result.is_applied());
+        assert_eq!(result.command_id(), "diff.next-line");
+        assert_eq!(shell.events.pending("shell.command.executed"), 1);
+        assert_eq!(
+            shell.events.drain("shell.command.executed")[0].payload,
+            "id=diff.next-line,outcome=applied"
+        );
+
+        // Without a panel the same command runs as a benign no-op.
+        let mut shell = DesktopShell::new("NextIDE");
+        let result = shell.execute_observed(&NoopFs, ShellCommand::DiffPrevLine);
+        assert!(result.is_noop());
+        assert_eq!(result.command_id(), "diff.prev-line");
+        assert_eq!(
+            shell.events.drain("shell.command.executed")[0].payload,
+            "id=diff.prev-line,outcome=noop"
+        );
     }
 }

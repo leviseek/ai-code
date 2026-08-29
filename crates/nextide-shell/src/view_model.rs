@@ -1,4 +1,4 @@
-use crate::{CommandPalette, GitStatusSummary, NotificationCenter, StatusKind};
+use crate::{CommandPalette, DiffSummary, GitStatusSummary, NotificationCenter, StatusKind};
 use nextide_kernel::{ApplicationContext, FileNodeKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,15 +38,19 @@ pub struct ShellSnapshot {
     /// The Git status-bar summary, when a Git snapshot has been applied to
     /// the shell; `None` while no Git integration is active.
     pub git_summary: Option<GitStatusSummary>,
+    /// The diff status-bar summary, when a diff panel snapshot has been
+    /// applied to the shell; `None` while no diff panel is active.
+    pub diff_summary: Option<DiffSummary>,
 }
 
 impl ShellSnapshot {
     /// Builds a snapshot from kernel/app state.
     ///
-    /// Git status is deliberately not part of this constructor: markers
-    /// default to [`StatusKind::Clean`] and [`git_summary`](Self::git_summary)
-    /// to `None`. [`crate::DesktopShell::snapshot`] applies an externally
-    /// supplied Git snapshot on top afterwards.
+    /// Git and diff status are deliberately not part of this constructor:
+    /// markers default to [`StatusKind::Clean`], [`git_summary`](Self::git_summary)
+    /// and [`diff_summary`](Self::diff_summary) to `None`.
+    /// [`crate::DesktopShell::snapshot`] applies externally supplied Git and
+    /// diff snapshots on top afterwards.
     pub fn from_context(
         title: impl Into<String>,
         app: &ApplicationContext,
@@ -94,6 +98,7 @@ impl ShellSnapshot {
             palette_query: palette.query().to_string(),
             notifications: notifications.items().len(),
             git_summary: None,
+            diff_summary: None,
         }
     }
 
@@ -108,5 +113,15 @@ impl ShellSnapshot {
         self.git_summary
             .as_ref()
             .map(GitStatusSummary::summary_text)
+    }
+
+    /// The stable status-bar text projected from the applied diff summary, if
+    /// any; see [`DiffSummary::summary_text`] for the exact format.
+    ///
+    /// `Some` exactly when [`diff_summary`](Self::diff_summary) is `Some`, so
+    /// `Some("clean")` means a diff panel is active with no changes, while
+    /// `None` means no diff snapshot has been applied to this shell yet.
+    pub fn diff_status_text(&self) -> Option<String> {
+        self.diff_summary.as_ref().map(DiffSummary::summary_text)
     }
 }

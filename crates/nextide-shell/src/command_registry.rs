@@ -53,6 +53,21 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         title: "Scan Workspace",
         keywords: &["workspace", "refresh"],
     },
+    CommandDescriptor {
+        id: "diff.toggle-file",
+        title: "Toggle Diff File",
+        keywords: &["diff", "toggle", "expand", "collapse"],
+    },
+    CommandDescriptor {
+        id: "diff.next-line",
+        title: "Next Diff Line",
+        keywords: &["diff", "next", "line", "down"],
+    },
+    CommandDescriptor {
+        id: "diff.prev-line",
+        title: "Previous Diff Line",
+        keywords: &["diff", "previous", "prev", "line", "up"],
+    },
 ];
 
 pub fn search(query: &str) -> Vec<&'static CommandDescriptor> {
@@ -77,6 +92,9 @@ pub fn command_id(command: &ShellCommand) -> &'static str {
         ShellCommand::SaveActive => "file.save",
         ShellCommand::ScanWorkspace(_) => "workspace.scan",
         ShellCommand::ToggleDirectory(_) => "workspace.toggle-directory",
+        ShellCommand::DiffToggleFile(_) => "diff.toggle-file",
+        ShellCommand::DiffNextLine => "diff.next-line",
+        ShellCommand::DiffPrevLine => "diff.prev-line",
     }
 }
 
@@ -135,6 +153,8 @@ mod tests {
     fn searches_commands_by_title_and_keyword() {
         assert_eq!(search("save")[0].id, "file.save");
         assert_eq!(search("refresh")[0].id, "workspace.scan");
+        assert_eq!(search("diff")[0].id, "diff.toggle-file");
+        assert_eq!(search("previous")[0].id, "diff.prev-line");
         assert_eq!(search("").len(), COMMANDS.len());
     }
 
@@ -143,7 +163,15 @@ mod tests {
         let ids: Vec<&str> = command_ids().collect();
         assert_eq!(
             ids,
-            ["file.open", "file.save", "file.close", "workspace.scan"]
+            [
+                "file.open",
+                "file.save",
+                "file.close",
+                "workspace.scan",
+                "diff.toggle-file",
+                "diff.next-line",
+                "diff.prev-line",
+            ]
         );
         assert_eq!(ids.len(), COMMANDS.len());
     }
