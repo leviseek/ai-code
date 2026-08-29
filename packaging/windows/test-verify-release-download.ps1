@@ -62,6 +62,8 @@
      25. manifest-declared checksum file name that is not a plain,
          URL-safe file name ('.. ' / '.. .' Windows-normalize like
          '..', ':ads', control character, space)               -> fails, nothing downloaded
+     26. leading-zero version tags (v01.2.3 / v1.02.3 / v1.2.03) rejected
+         by the semver rule before any download               -> fails, nothing created
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -478,7 +480,30 @@ Invoke-Test -Name 'invalid tags (main / v0.1 / v0.1.0.1) are rejected before any
 }
 
 # ---------------------------------------------------------------------------
-# 4. Tag/version consistency: the release's manifest version must equal the
+# 4. Leading-zero version tags are not semver: the tag rule is the same one
+#    the CI release job enforces (numeric segments without leading zeros), so
+#    'v01.2.3' / 'v1.02.3' / 'v1.2.03' are refused up front — the same shape
+#    rule, not the later tag-vs-manifest version link.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'leading-zero version tags (v01.2.3 / v1.02.3 / v1.2.03) are rejected before any download' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root
+        foreach ($BadTag in @('v01.2.3', 'v1.02.3', 'v1.2.03', 'v0.0.01')) {
+            $Result = Invoke-DownloadScript -Release $Release -Tag $BadTag
+            Assert ($Result.ExitCode -ne 0) "tag '$BadTag': expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+            Assert ($Result.Output -match 'not a v-prefixed semver tag') "tag '$BadTag': expected the tag-rule message: $($Result.Output)"
+            Assert (-not (Test-Path -LiteralPath $Release.OutDir)) "tag '$BadTag': no download folder may be created"
+            Assert (-not (Test-Path -LiteralPath $Release.MetadataDir)) "tag '$BadTag': no metadata folder may be created"
+        }
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 5. Tag/version consistency: the release's manifest version must equal the
 #    tag version — the final consistency link, checked on the consumer side.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'tag disagreeing with the release manifest version is rejected' -Body {
@@ -495,7 +520,7 @@ Invoke-Test -Name 'tag disagreeing with the release manifest version is rejected
 }
 
 # ---------------------------------------------------------------------------
-# 5. Corrupt manifest.json.
+# 6. Corrupt manifest.json.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'corrupt manifest.json is rejected' -Body {
     $Root = New-Sandbox
@@ -511,7 +536,7 @@ Invoke-Test -Name 'corrupt manifest.json is rejected' -Body {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Missing manifest.json.
+# 7. Missing manifest.json.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'missing manifest.json is rejected' -Body {
     $Root = New-Sandbox
@@ -527,7 +552,7 @@ Invoke-Test -Name 'missing manifest.json is rejected' -Body {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Missing release asset (nextide-shell.exe).
+# 8. Missing release asset (nextide-shell.exe).
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'missing release asset (nextide-shell.exe) is rejected' -Body {
     $Root = New-Sandbox
@@ -543,7 +568,7 @@ Invoke-Test -Name 'missing release asset (nextide-shell.exe) is rejected' -Body 
 }
 
 # ---------------------------------------------------------------------------
-# 8. Tampered binary: the served bytes differ from the checksum manifest, so
+# 9. Tampered binary: the served bytes differ from the checksum manifest, so
 #    the consumer verifier rejects the download — and the smoke step never
 #    runs on unverified bytes.
 # ---------------------------------------------------------------------------
@@ -562,7 +587,7 @@ Invoke-Test -Name 'tampered binary fails checksum verification and never reaches
 }
 
 # ---------------------------------------------------------------------------
-# 9. Renamed checksum file: the name flows from the release's own
+# 10. Renamed checksum file: the name flows from the release's own
 #    manifest.json (stage.checksum_file), never a hardcoded default.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'renamed checksum file (CHECKSUMS.txt) is resolved from the release manifest' -Body {
@@ -581,7 +606,7 @@ Invoke-Test -Name 'renamed checksum file (CHECKSUMS.txt) is resolved from the re
 }
 
 # ---------------------------------------------------------------------------
-# 10. Missing declared checksum asset.
+# 11. Missing declared checksum asset.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'missing declared checksum asset is rejected' -Body {
     $Root = New-Sandbox
@@ -597,7 +622,7 @@ Invoke-Test -Name 'missing declared checksum asset is rejected' -Body {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Missing consumer verifier in the raw tree.
+# 12. Missing consumer verifier in the raw tree.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'missing consumer verifier script is rejected' -Body {
     $Root = New-Sandbox
@@ -613,7 +638,7 @@ Invoke-Test -Name 'missing consumer verifier script is rejected' -Body {
 }
 
 # ---------------------------------------------------------------------------
-# 12. Stale extra file in a pre-existing OutDir: the exact-match contract of
+# 13. Stale extra file in a pre-existing OutDir: the exact-match contract of
 #     the consumer verifier rejects it — the clean-folder contract working.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'stale extra file in the download folder fails the exact-match contract' -Body {
@@ -630,7 +655,7 @@ Invoke-Test -Name 'stale extra file in the download folder fails the exact-match
 }
 
 # ---------------------------------------------------------------------------
-# 13. Zero-byte CLI asset: the checksum manifest still matches (the empty
+# 14. Zero-byte CLI asset: the checksum manifest still matches (the empty
 #     file hashes consistently), but the non-empty assertion — the release
 #     job's own checklist rule — closes the gap before any smoke.
 # ---------------------------------------------------------------------------
@@ -648,7 +673,7 @@ Invoke-Test -Name 'zero-byte CLI asset is rejected by the non-empty assertion' -
 }
 
 # ---------------------------------------------------------------------------
-# 14. Non-runnable CLI: checksums pass (the stub's bytes match the manifest),
+# 15. Non-runnable CLI: checksums pass (the stub's bytes match the manifest),
 #     the smoke gate fails, the verification exits non-zero.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'non-runnable CLI fails the smoke gate' -Body {
@@ -666,7 +691,7 @@ Invoke-Test -Name 'non-runnable CLI fails the smoke gate' -Body {
 }
 
 # ---------------------------------------------------------------------------
-# 15. Folder-shape validation (read-only, before anything is created or
+# 16. Folder-shape validation (read-only, before anything is created or
 #     downloaded): -OutDir and -MetadataDir must be two distinct folders.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name '-OutDir and -MetadataDir resolving to the same folder are rejected' -Body {
@@ -686,7 +711,7 @@ Invoke-Test -Name '-OutDir and -MetadataDir resolving to the same folder are rej
 }
 
 # ---------------------------------------------------------------------------
-# 16. Metadata folder nested inside the verified folder: the consumer verifier
+# 17. Metadata folder nested inside the verified folder: the consumer verifier
 #     lists only top-level files, so the metadata would sit inside the
 #     verified tree and silently bypass the exact-match contract — rejected
 #     up front, before any download.
@@ -708,7 +733,7 @@ Invoke-Test -Name 'metadata folder nested inside the verified folder is rejected
 }
 
 # ---------------------------------------------------------------------------
-# 17. Symmetric nesting: the verified folder inside the metadata folder.
+# 18. Symmetric nesting: the verified folder inside the metadata folder.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'verified folder nested inside the metadata folder is rejected' -Body {
     $Root = New-Sandbox
@@ -727,7 +752,7 @@ Invoke-Test -Name 'verified folder nested inside the metadata folder is rejected
 }
 
 # ---------------------------------------------------------------------------
-# 18. The documented 'never into the repository' rule, enforced: -OutDir
+# 19. The documented 'never into the repository' rule, enforced: -OutDir
 #     resolving to the repository root is refused. The script under test
 #     derives the repo root from its own location, so -OutDir <real repo
 #     root> must fail read-only, before anything is created or downloaded —
@@ -750,7 +775,7 @@ Invoke-Test -Name '-OutDir resolving to the repository root is rejected (nothing
 }
 
 # ---------------------------------------------------------------------------
-# 19. Same rule for the repository's staging folder: -OutDir resolving inside
+# 20. Same rule for the repository's staging folder: -OutDir resolving inside
 #     dist/ (where the release artifacts are staged) is refused.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name '-OutDir resolving inside the repository staging folder (dist/) is rejected' -Body {
@@ -769,7 +794,7 @@ Invoke-Test -Name '-OutDir resolving inside the repository staging folder (dist/
 }
 
 # ---------------------------------------------------------------------------
-# 20. Download URL scheme gate: only https and file are allowed; http/ftp and
+# 21. Download URL scheme gate: only https and file are allowed; http/ftp and
 #     any other scheme (and non-absolute URLs) are refused read-only, before
 #     anything is created or downloaded. The binaries, the checksum manifest
 #     and the consumer verifier all travel over these URLs, so an
@@ -800,7 +825,7 @@ Invoke-Test -Name 'release asset URL with an http/ftp/other scheme or no scheme 
 }
 
 # ---------------------------------------------------------------------------
-# 21. Same scheme gate for the consumer verifier URL: the verifier script is
+# 22. Same scheme gate for the consumer verifier URL: the verifier script is
 #     fetched over the same integrity channel, so http is refused there too.
 # ---------------------------------------------------------------------------
 Invoke-Test -Name 'consumer verifier URL with an http scheme is rejected before any download' -Body {
@@ -819,7 +844,7 @@ Invoke-Test -Name 'consumer verifier URL with an http scheme is rejected before 
 }
 
 # ---------------------------------------------------------------------------
-# 22. Explicit -RepositoryRoot: the repository path protection follows the
+# 23. Explicit -RepositoryRoot: the repository path protection follows the
 #     stated root — a custom root, not the one derived from this script's own
 #     location — and the stated root is normalized like -OutDir/-MetadataDir,
 #     so '..' components and a trailing separator cannot dodge the check.
@@ -850,7 +875,7 @@ Invoke-Test -Name 'explicit -RepositoryRoot protects the stated root (normalized
 }
 
 # ---------------------------------------------------------------------------
-# 23. Explicit -RepositoryRoot that does not exist: the protection must never
+# 24. Explicit -RepositoryRoot that does not exist: the protection must never
 #     silently guard a path that does not exist (a typo would disable the
 #     guarantee), so it fails read-only with guidance, before anything is
 #     created or downloaded.
@@ -872,7 +897,7 @@ Invoke-Test -Name 'explicit -RepositoryRoot that does not exist is rejected read
 }
 
 # ---------------------------------------------------------------------------
-# 24. Derived-root fail-safe: the repository root defaults to a derivation
+# 25. Derived-root fail-safe: the repository root defaults to a derivation
 #     from this script's own location (packaging\windows under the checkout)
 #     and is only trusted when that layout is real. A copy of the script run
 #     from elsewhere must fail with guidance and must never silently protect
@@ -902,7 +927,7 @@ Invoke-Test -Name 'copied script outside the repository layout fails safely and 
 }
 
 # ---------------------------------------------------------------------------
-# 25. Manifest-declared checksum file name safety: the name flows into a
+# 26. Manifest-declared checksum file name safety: the name flows into a
 #     download URL and a local write inside OutDir, so it must be a plain,
 #     URL-safe file name. The consumer verifier's own leaf-name rule (no path
 #     separators, no '.'/'..', no control characters) is the baseline; the

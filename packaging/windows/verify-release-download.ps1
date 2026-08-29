@@ -22,7 +22,9 @@
     release that renamed its checksum file keeps verifying instead of breaking.
 
     Flow:
-      1. validate -Tag (must be exactly v<semver>), -Repo (owner/name) and the
+      1. validate -Tag (must be exactly v<semver> — numeric version segments
+         with no leading zeros, e.g. v0.1.0 but never v01.2.3 — the same rule
+         the CI release job enforces), -Repo (owner/name) and the
          -BaseReleaseUrl/-VerifyScriptUrl schemes (each must be an absolute
          https:// or file:// URL — http and any other scheme are refused);
       2. resolve -OutDir/-MetadataDir to full paths and validate their shape
@@ -81,7 +83,9 @@
 
 .PARAMETER Tag
     The GitHub Release tag to verify, e.g. v0.1.0. Must be exactly
-    v<semver> — the same rule the CI release job enforces.
+    v<semver> — the same rule the CI release job enforces, including the
+    semver rule that numeric version segments must not have leading zeros
+    (v01.2.3, v1.02.3 and v1.2.03 are refused).
 
 .PARAMETER Repo
     The GitHub repository as "owner/name". Defaults to leviseek/ai-code.
@@ -202,9 +206,11 @@ function Download-File {
 }
 
 # 1. Validate the tag and the repository shape before anything is created or
-#    downloaded — same tag rule the CI release job enforces.
-if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
-    Fail "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0)"
+#    downloaded — same tag rule the CI release job enforces. The numeric
+#    version segments follow the semver spec: no leading zeros ('v01.2.3',
+#    'v1.02.3', 'v1.2.03' are not semver, even though 'v0.1.0' is).
+if ($Tag -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+    Fail "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0; numeric version segments must not have leading zeros)"
 }
 if ($Repo -notmatch '^[^\s/]+/[^\s/]+$') {
     Fail "Repo '$Repo' must be 'owner/name' without spaces or slashes"

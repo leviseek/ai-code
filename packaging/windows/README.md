@@ -386,13 +386,14 @@ The only thing the suite ever deletes is its own sandboxes:
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
 ```
 
-Covered scenarios (25 tests):
+Covered scenarios (26 tests):
 
 | Scenario | Expected result |
 | --- | --- |
 | Happy path (download + checksum verify + CLI smoke, via a runnable CLI stub; verified folder holds exactly the two binaries + the checksum file, metadata folder holds `manifest.json` + `verify-checksums.ps1`) | pass |
 | Happy path with `-SkipSmoke` (a non-runnable CLI stub proves the smoke gate is really skipped) | pass |
 | Invalid tags (`main`, `v0.1`, `v0.1.0.1`, `0.1.0`) rejected before anything is created or downloaded | fail |
+| Leading-zero version tags (`v01.2.3`, `v1.02.3`, `v1.2.03`, `v0.0.01`) — not semver (numeric segments without leading zeros), rejected by the same shape rule the CI release job enforces, before anything is created or downloaded | fail |
 | Tag disagrees with the release's manifest `product.version` (final consistency link, consumer side) | fail |
 | Corrupt `manifest.json` (invalid JSON) | fail |
 | Missing `manifest.json` | fail |
@@ -437,7 +438,7 @@ suite implements them as plain functions and proves them:
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-release-sim.ps1
 ```
 
-Covered scenarios (26 tests):
+Covered scenarios (27 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -445,8 +446,9 @@ Covered scenarios (26 tests):
 | Tag/version resolution: `beta` channel (valid channel) | resolves |
 | Tag/version resolution: non-v tag (`main`) | rejected |
 | Tag/version resolution: malformed semver tag (`v0.1`, `v0.1.0.1`, trailing space) | rejected |
+| Tag/version resolution: leading-zero semver tag (`v01.2.3`, `v1.02.3`, `v1.2.03`, `v0.0.01`; `v01.0.0` no longer reaches the version link — the shape rule rejects it) | rejected |
 | Tag/version resolution: pre-release tag (`v0.1.0-beta`) | rejected |
-| Tag/version resolution: tag disagreeing with `product.version` (`v9.9.9`; `v01.0.0` passes the shape but fails the version link) | rejected |
+| Tag/version resolution: tag disagreeing with `product.version` (`v9.9.9`) | rejected |
 | Tag/version resolution: invalid release channel (`alpha`) | rejected |
 | Tag/version resolution: blank `product.version` | rejected |
 | Tag/version resolution: missing `release` block (channel rule fires) | rejected |
@@ -585,7 +587,7 @@ A third `release` job completes the chain on version-tag pushes (`refs/tags/v*`)
 only (it never runs for branches or pull requests, and it runs only after
 `packaging-windows`, via `needs:`). Right after checkout it first runs the
 sandboxed release-job simulation gate (`packaging/windows/test-release-sim.ps1`,
-26 cases — see [Testing](#testing)), which proves the tag/version rejection
+27 cases — see [Testing](#testing)), which proves the tag/version rejection
 rules, the four-file release manifest and the publish step's attachment
 naming against throwaway `%TEMP%` sandboxes
 (no network access, no GitHub Release ever created, the repository never
@@ -594,7 +596,8 @@ published. It then downloads the same run's
 `nextide-windows-dist-<channel>` and `nextide-windows-manifest-<channel>`
 artifacts and, with no rebuild, no re-staging and no recomputed checksums:
 
-1. asserts the pushed tag is exactly `v<product.version>` from the committed
+1. asserts the pushed tag is exactly `v<product.version>` — v-prefixed semver
+   with no leading zeros in any numeric segment — from the committed
    manifest (read-only `ConvertFrom-Json`, same `stable`/`beta` rule) — the
    final consistency link of the chain, since `product.version` was already
    proven equal to the `[workspace.package]` Cargo version by `build.ps1`;
@@ -682,7 +685,8 @@ consumer verifier `verify-checksums.ps1` — fetched from the **same tag** —
 into a sibling metadata folder (default `.\nextide-download-metadata`). It
 resolves the checksum file name from the release's own `manifest.json`
 (`stage.checksum_file`, never a hardcoded default), asserts the tag is exactly
-`v<product.version>` (the same final consistency link CI enforces), runs the
+`v<product.version>` (v-prefixed semver without leading zeros — the same
+final consistency link CI enforces), runs the
 downloaded verifier read-only against the verified folder (the exact-match
 contract is why the verifier and `manifest.json` live outside it), and finally
 runs `nextide-cli.exe smoke` — the same two gates the CI `release` job runs

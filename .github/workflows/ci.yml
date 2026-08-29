@@ -40,7 +40,7 @@ jobs:
     # release_channel) — twice, with no duplicated logic: first the sandboxed
     # self-test gates (test-build.ps1, 26 cases, plus
     # test-verify-checksums.ps1, 14 cases, for the consumer-side checksum
-    # verifier, and test-verify-release-download.ps1, 25 cases, for the
+    # verifier, and test-verify-release-download.ps1, 26 cases, for the
     # end-user one-command release download verifier) prove the scripts
     # reject every violation, then build.ps1
     # -SkipBuild re-runs the same read-only
@@ -159,7 +159,7 @@ jobs:
       - name: Verify end-user release download script (test-verify-release-download.ps1 gate)
         # Pre-packaging self-test gate for the end-user one-command release
         # download verifier (packaging/windows/verify-release-download.ps1).
-        # The sandboxed suite (25 cases, zero framework) proves the whole
+        # The sandboxed suite (26 cases, zero framework) proves the whole
         # consumer flow — download the release's two binaries, manifest.json
         # and checksum manifest, resolve the checksum file name from the
         # release's own manifest.json (stage.checksum_file, never a hardcoded
@@ -167,7 +167,8 @@ jobs:
         # ':' (alternate data streams), control characters, spaces and a
         # trailing dot/space that Windows normalizes to '.'/'..' are all
         # refused before any binary is downloaded), assert the tag is exactly
-        # v<product.version>, run the downloaded verify-checksums.ps1
+        # v<product.version> (v-prefixed semver, numeric segments without
+        # leading zeros), run the downloaded verify-checksums.ps1
         # read-only against the download folder, and smoke-test the downloaded
         # CLI — against throwaway
         # %TEMP% sandboxes over file:// URLs (no network access, the real
@@ -388,12 +389,13 @@ jobs:
     # consumers use), so the files attached to the release are proven
     # byte-for-byte consistent with the checksum manifest that ships with
     # them. Tag/version consistency is enforced here as the final link of
-    # the chain: the pushed tag must be `v<semver>` (e.g. `v0.1.0`) and its
+    # the chain: the pushed tag must be `v<semver>` (e.g. `v0.1.0`, with no
+    # leading zeros in any numeric segment — v01.2.3 is not semver) and its
     # version must equal `product.version` in the committed manifest, which
     # the packaging job already proved equals the [workspace.package] version
     # in the root Cargo.toml — so the release is always tagged with exactly
     # the version the artifacts claim. The job's own gate rules are proven
-    # first by a sandboxed simulation suite (test-release-sim.ps1, 26 cases,
+    # first by a sandboxed simulation suite (test-release-sim.ps1, 27 cases,
     # zero framework) that runs right after checkout, before anything is
     # downloaded or published: it exercises the tag/version rejection rules,
     # the four-file release file manifest and the publish step's attachment
@@ -420,14 +422,15 @@ jobs:
       - name: Verify release job simulation (test-release-sim.ps1 gate)
         # Pre-publish self-test gate for this job's own rules, run in a
         # sandbox before anything is downloaded or published. The zero-framework
-        # suite (26 cases) proves, in its three gate rule sets, exactly what
+        # suite (27 cases) proves, in its three gate rule sets, exactly what
         # this job gates:
         #   - tag/version rejection rules (the "Resolve release metadata from
         #     manifest (channel + version + checksum file vs tag)" logic):
         #     channel must be exactly stable or beta, product.version must be
         #     non-blank, stage.checksum_file must be non-blank, the pushed tag
         #     must be exactly v<product.version> — non-v tags, malformed
-        #     semver (v0.1, v0.1.0.1), pre-release tags (v0.1.0-beta), tags
+        #     semver (v0.1, v0.1.0.1), leading-zero version segments
+        #     (v01.2.3, v1.02.3), pre-release tags (v0.1.0-beta), tags
         #     that disagree with the manifest version, invalid channels, blank
         #     versions or checksum files, invalid JSON and missing manifests
         #     are all rejected; the committed manifest resolves with its
@@ -501,8 +504,8 @@ jobs:
             throw 'Manifest stage.checksum_file is missing or blank'
           }
           $Tag = $env:REF_NAME
-          if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
-            throw "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0)"
+          if ($Tag -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0; numeric version segments must not have leading zeros)"
           }
           if ($Tag.Substring(1) -ne $Version) {
             throw "Release tag '$Tag' does not match manifest product.version '$Version' (tag must be v<product.version>)"

@@ -26,7 +26,9 @@
         not hardcoded anywhere in the chain — it flows from the committed
         manifest, so the verify gates and the publish step attach exactly the
         file build.ps1 generates)
-      - the pushed tag must match '^v[0-9]+\.[0-9]+\.[0-9]+$'
+      - the pushed tag must match the semver shape
+        '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' (numeric
+        version segments must not have leading zeros)
       - the tag minus its leading 'v' must equal product.version
     Every violation is rejected; the committed manifest resolves with the
     matching v<version> tag.
@@ -59,33 +61,34 @@
     release-creation command invocations (it can never touch the network and
     can never create a Release).
 
-    Covered scenarios (26 tests):
+    Covered scenarios (27 tests):
       1.  committed manifest + matching v<version> tag resolves
       2.  beta channel (valid channel) resolves
       3.  non-v tag (e.g. 'main') is rejected
       4.  malformed semver tag (e.g. 'v0.1') is rejected
-      5.  pre-release tag (e.g. 'v0.1.0-beta') is rejected
-      6.  tag disagreeing with manifest product.version is rejected
-      7.  invalid release channel (e.g. 'alpha') is rejected
-      8.  blank product.version is rejected
-      9.  missing release block is rejected
-     10.  invalid manifest JSON is rejected
-     11.  missing manifest is rejected
-     12.  blank stage.checksum_file is rejected
-     13.  complete, consistent release file manifest passes
-     14.  missing nextide-cli.exe fails
-     15.  missing nextide-shell.exe fails
-     16.  missing checksum manifest (the stage.checksum_file name) fails
-     17.  missing release-metadata/manifest.json fails
-     18.  tampered binary fails consumer verification
-     19.  extra unlisted file in dist fails consumer verification
-     20.  checksum entries not matching the manifest artifact list fail
-     21.  release-metadata manifest not byte-identical to the committed one fails
-     22.  zero-byte CLI binary fails (smoke-gate simulation)
-     23.  renamed stage.checksum_file is honored by the checklist (byte-identity still enforced)
-     24.  publish attachment list uses the resolved checksum file name (never hardcoded)
-     25.  renamed stage.checksum_file flows through resolve -> verify -> checklist -> attachment list
-     26.  self-audit: no network or release-creation commands in the source
+      5.  leading-zero semver tag (e.g. 'v01.2.3', 'v1.02.3') is rejected
+      6.  pre-release tag (e.g. 'v0.1.0-beta') is rejected
+      7.  tag disagreeing with manifest product.version is rejected
+      8.  invalid release channel (e.g. 'alpha') is rejected
+      9.  blank product.version is rejected
+     10.  missing release block is rejected
+     11.  invalid manifest JSON is rejected
+     12.  missing manifest is rejected
+     13.  blank stage.checksum_file is rejected
+     14.  complete, consistent release file manifest passes
+     15.  missing nextide-cli.exe fails
+     16.  missing nextide-shell.exe fails
+     17.  missing checksum manifest (the stage.checksum_file name) fails
+     18.  missing release-metadata/manifest.json fails
+     19.  tampered binary fails consumer verification
+     20.  extra unlisted file in dist fails consumer verification
+     21.  checksum entries not matching the manifest artifact list fail
+     22.  release-metadata manifest not byte-identical to the committed one fails
+     23.  zero-byte CLI binary fails (smoke-gate simulation)
+     24.  renamed stage.checksum_file is honored by the checklist (byte-identity still enforced)
+     25.  publish attachment list uses the resolved checksum file name (never hardcoded)
+     26.  renamed stage.checksum_file flows through resolve -> verify -> checklist -> attachment list
+     27.  self-audit: no network or release-creation commands in the source
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -355,8 +358,8 @@ function Resolve-ReleaseMeta {
     if ([string]::IsNullOrWhiteSpace($ChecksumFile)) {
         return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = ''; Error = 'Manifest stage.checksum_file is missing or blank' }
     }
-    if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
-        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = $ChecksumFile; Error = "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0)" }
+    if ($Tag -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = $ChecksumFile; Error = "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0; numeric version segments must not have leading zeros)" }
     }
     if ($Tag.Substring(1) -ne $Version) {
         return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = $ChecksumFile; Error = "Release tag '$Tag' does not match manifest product.version '$Version' (tag must be v<product.version>)" }
@@ -645,18 +648,40 @@ Invoke-Test -Name 'release-meta: malformed semver tag is rejected' -Body {
             Assert (-not $Result.Ok) "expected tag '$BadTag' to be rejected"
             Assert ($Result.Error -match 'not a v-prefixed semver') "expected semver rejection for '$BadTag', got: $($Result.Error)"
         }
-        # 'v01.0.0' passes the shape but its version differs from the manifest
-        # (leading zero), so it is still rejected — by the version link.
+        # 'v01.0.0' also fails the shape: the semver rule rejects leading zeros
+        # in numeric segments, so the leading-zero rejection fires here (not the
+        # version link).
         $Result = Resolve-ReleaseMeta -ManifestPath $ManifestPath -Tag 'v01.0.0'
         Assert (-not $Result.Ok) 'expected tag v01.0.0 to be rejected'
-        Assert ($Result.Error -match 'does not match manifest product.version') "expected version-mismatch rejection for 'v01.0.0', got: $($Result.Error)"
+        Assert ($Result.Error -match 'not a v-prefixed semver') "expected semver rejection for 'v01.0.0', got: $($Result.Error)"
     }
     finally {
         Remove-Sandbox $Root
     }
 }
 
-# 5. A pre-release tag (e.g. v0.1.0-beta) is rejected: the release job only
+# 5. A leading-zero version segment is not semver: the release job only
+#    accepts exactly v<major>.<minor>.<patch> with no leading zeros in any
+#    numeric segment, so 'v01.2.3' / 'v1.02.3' / 'v1.2.03' are rejected by the
+#    shape rule (the same rule verify-release-download.ps1 enforces
+#    consumer-side).
+Invoke-Test -Name 'release-meta: leading-zero version segments are rejected' -Body {
+    $Root = New-Sandbox
+    try {
+        Copy-GoldenManifest $Root
+        $ManifestPath = Join-Path $Root 'packaging\windows\manifest.json'
+        foreach ($BadTag in @('v01.2.3', 'v1.02.3', 'v1.2.03', 'v0.0.01', 'v00.0.0')) {
+            $Result = Resolve-ReleaseMeta -ManifestPath $ManifestPath -Tag $BadTag
+            Assert (-not $Result.Ok) "expected tag '$BadTag' to be rejected"
+            Assert ($Result.Error -match 'not a v-prefixed semver') "expected semver rejection for '$BadTag', got: $($Result.Error)"
+        }
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# 6. A pre-release tag (e.g. v0.1.0-beta) is rejected: the release job only
 #    accepts exactly v<major>.<minor>.<patch>.
 Invoke-Test -Name 'release-meta: pre-release tag is rejected' -Body {
     $Root = New-Sandbox
@@ -671,7 +696,7 @@ Invoke-Test -Name 'release-meta: pre-release tag is rejected' -Body {
     }
 }
 
-# 6. A tag that disagrees with the manifest product.version is rejected (the
+# 7. A tag that disagrees with the manifest product.version is rejected (the
 #    final consistency link: tag must be v<product.version>).
 Invoke-Test -Name 'release-meta: tag disagreeing with manifest version is rejected' -Body {
     $Root = New-Sandbox
@@ -687,7 +712,7 @@ Invoke-Test -Name 'release-meta: tag disagreeing with manifest version is reject
     }
 }
 
-# 7. A channel other than stable/beta is rejected.
+# 8. A channel other than stable/beta is rejected.
 Invoke-Test -Name 'release-meta: invalid release channel is rejected' -Body {
     $Root = New-Sandbox
     try {
@@ -702,7 +727,7 @@ Invoke-Test -Name 'release-meta: invalid release channel is rejected' -Body {
     }
 }
 
-# 8. A blank product.version is rejected.
+# 9. A blank product.version is rejected.
 Invoke-Test -Name 'release-meta: blank product.version is rejected' -Body {
     $Root = New-Sandbox
     try {
@@ -716,7 +741,7 @@ Invoke-Test -Name 'release-meta: blank product.version is rejected' -Body {
     }
 }
 
-# 9. A missing release block is rejected (the channel rule fires, as in the
+# 10. A missing release block is rejected (the channel rule fires, as in the
 #    workflow where a missing release block yields a null channel).
 Invoke-Test -Name 'release-meta: missing release block is rejected' -Body {
     $Root = New-Sandbox
@@ -731,7 +756,7 @@ Invoke-Test -Name 'release-meta: missing release block is rejected' -Body {
     }
 }
 
-# 10. An invalid-JSON manifest is rejected.
+# 11. An invalid-JSON manifest is rejected.
 Invoke-Test -Name 'release-meta: invalid manifest JSON is rejected' -Body {
     $Root = New-Sandbox
     try {
@@ -745,7 +770,7 @@ Invoke-Test -Name 'release-meta: invalid manifest JSON is rejected' -Body {
     }
 }
 
-# 11. A missing manifest is rejected.
+# 12. A missing manifest is rejected.
 Invoke-Test -Name 'release-meta: missing manifest is rejected' -Body {
     $Root = New-Sandbox
     try {
@@ -758,7 +783,7 @@ Invoke-Test -Name 'release-meta: missing manifest is rejected' -Body {
     }
 }
 
-# 12. A blank stage.checksum_file is rejected: the checksum manifest name is
+# 13. A blank stage.checksum_file is rejected: the checksum manifest name is
 #     not hardcoded anywhere in the chain, so the release job refuses to
 #     proceed without a declared name (the packaging job already proved the
 #     full leaf-name validation; this is the "I need the value" assertion,
@@ -782,7 +807,7 @@ Invoke-Test -Name 'release-meta: blank stage.checksum_file is rejected' -Body {
 # Part 2 — release file manifest.
 # ---------------------------------------------------------------------------
 
-# 13. A complete, consistent release file manifest passes every gate,
+# 14. A complete, consistent release file manifest passes every gate,
 #     including the real consumer verifier against the sandbox dist.
 Invoke-Test -Name 'release checklist: complete consistent release passes' -Body {
     $Root = New-ReleaseSandbox
@@ -799,7 +824,7 @@ Invoke-Test -Name 'release checklist: complete consistent release passes' -Body 
     }
 }
 
-# 14. Missing nextide-cli.exe fails.
+# 15. Missing nextide-cli.exe fails.
 Invoke-Test -Name 'release checklist: missing nextide-cli.exe fails' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -814,7 +839,7 @@ Invoke-Test -Name 'release checklist: missing nextide-cli.exe fails' -Body {
     }
 }
 
-# 15. Missing nextide-shell.exe fails.
+# 16. Missing nextide-shell.exe fails.
 Invoke-Test -Name 'release checklist: missing nextide-shell.exe fails' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -828,7 +853,7 @@ Invoke-Test -Name 'release checklist: missing nextide-shell.exe fails' -Body {
     }
 }
 
-# 16. Missing checksum manifest (the stage.checksum_file name) fails.
+# 17. Missing checksum manifest (the stage.checksum_file name) fails.
 Invoke-Test -Name 'release checklist: missing checksum manifest fails' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -842,7 +867,7 @@ Invoke-Test -Name 'release checklist: missing checksum manifest fails' -Body {
     }
 }
 
-# 17. Missing release-metadata/manifest.json fails.
+# 18. Missing release-metadata/manifest.json fails.
 Invoke-Test -Name 'release checklist: missing release-metadata/manifest.json fails' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -856,7 +881,7 @@ Invoke-Test -Name 'release checklist: missing release-metadata/manifest.json fai
     }
 }
 
-# 18. A tampered binary is caught by the consumer verifier (hash mismatch).
+# 19. A tampered binary is caught by the consumer verifier (hash mismatch).
 Invoke-Test -Name 'release checklist: tampered binary fails consumer verification' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -871,7 +896,7 @@ Invoke-Test -Name 'release checklist: tampered binary fails consumer verificatio
     }
 }
 
-# 19. An extra unlisted file in dist fails the consumer verifier's exact-match
+# 20. An extra unlisted file in dist fails the consumer verifier's exact-match
 #     contract.
 Invoke-Test -Name 'release checklist: extra unlisted file in dist fails' -Body {
     $Root = New-ReleaseSandbox
@@ -886,7 +911,7 @@ Invoke-Test -Name 'release checklist: extra unlisted file in dist fails' -Body {
     }
 }
 
-# 20. A checksum manifest whose entry set does not match the manifest artifact
+# 21. A checksum manifest whose entry set does not match the manifest artifact
 #     list fails — even though every listed file exists and hashes match (the
 #     release would attach checksums for files the manifest never declared).
 Invoke-Test -Name 'release checklist: checksum entries not matching the artifact list fail' -Body {
@@ -914,7 +939,7 @@ Invoke-Test -Name 'release checklist: checksum entries not matching the artifact
     }
 }
 
-# 21. A release-metadata manifest that is not byte-identical to the committed
+# 22. A release-metadata manifest that is not byte-identical to the committed
 #     manifest fails (the job's SHA-256 compare before publishing).
 Invoke-Test -Name 'release checklist: metadata manifest not byte-identical fails' -Body {
     $Root = New-ReleaseSandbox
@@ -932,7 +957,7 @@ Invoke-Test -Name 'release checklist: metadata manifest not byte-identical fails
     }
 }
 
-# 22. A zero-byte CLI binary fails the non-empty (smoke-gate simulation)
+# 23. A zero-byte CLI binary fails the non-empty (smoke-gate simulation)
 #     assertion — the job would attach a binary that could not run.
 Invoke-Test -Name 'release checklist: zero-byte CLI binary fails (smoke-gate simulation)' -Body {
     $Root = New-ReleaseSandbox
@@ -957,7 +982,7 @@ Invoke-Test -Name 'release checklist: zero-byte CLI binary fails (smoke-gate sim
     }
 }
 
-# 23. A renamed stage.checksum_file is honored by the checklist: the
+# 24. A renamed stage.checksum_file is honored by the checklist: the
 #     attachment list, the consumer verifier and the entry-set cross-check all
 #     resolve the declared name (the pipeline's single source of truth), so
 #     the only thing that rejects a modified metadata manifest is the
@@ -990,7 +1015,7 @@ Invoke-Test -Name 'release checklist: renamed stage.checksum_file is honored (by
     }
 }
 
-# 24. The publish step's attachment list is built from the resolved
+# 25. The publish step's attachment list is built from the resolved
 #     stage.checksum_file — never a hardcoded default. The list mirrors the
 #     exact four file paths the workflow hands to the GitHub CLI, with the
 #     checksum entry named by the manifest; a renamed declaration changes the
@@ -1026,7 +1051,7 @@ Invoke-Test -Name 'release publish: attachment list uses the resolved checksum f
     }
 }
 
-# 25. A renamed stage.checksum_file in the committed-style manifest flows
+# 26. A renamed stage.checksum_file in the committed-style manifest flows
 #     through the whole simulated publish chain coherently: the resolve step
 #     returns the declared name, the dist is staged under it, the checklist
 #     (with the sandbox manifest as its byte-identity golden) passes in full,
@@ -1093,7 +1118,7 @@ Invoke-Test -Name 'release publish: renamed stage.checksum_file flows through re
 # Part 3 — self-audit.
 # ---------------------------------------------------------------------------
 
-# 26. The script's own source must not contain any network or release-creation
+# 27. The script's own source must not contain any network or release-creation
 #     command invocation: this suite can never touch the network and can never
 #     create a GitHub Release, by construction. The only child process it ever
 #     launches is the repository's consumer-side verifier against sandbox
