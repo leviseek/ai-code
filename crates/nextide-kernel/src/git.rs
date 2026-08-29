@@ -204,6 +204,26 @@
 //! `root` is not inside a Git repository) is [`io::ErrorKind::Other`] with
 //! git's stderr in the message.
 //!
+//! [`tag(root, name)`](tag) creates a *lightweight* tag with
+//! `git -C <root> tag -- <name>` and returns the fresh [`GitTagSnapshot`]
+//! from [`tags`]; [`delete_tag(root, name)`](delete_tag) deletes a tag with
+//! `git -C <root> tag --delete <name>` and returns the fresh snapshot the
+//! same way. No shell is involved and every name travels as a single
+//! argument; the `--` separator shields `tag` from option parsing, and the
+//! name is validated before git is spawned regardless — non-empty, free of
+//! NUL bytes, not `-`-prefixed, relative and free of `..` and empty
+//! components (no leading, trailing or doubled `/`), and free of control
+//! characters, whitespace and git's other ref-forbidden characters (`~`,
+//! `^`, `:`, `?`, `*`, `[`, `\`, `@{`, leading-dot components,
+//! `.lock`-suffixed components, and trailing dots) — mirroring
+//! `git check-ref-format` while allowing one-level names such as `v1.2`
+//! (the tag lives under `refs/tags/`, so the usual "must contain a slash"
+//! rule is waived). Anything else is [`io::ErrorKind::InvalidInput`] before
+//! git is spawned. Both operations are local to the repository — the
+//! worktree and the index are never touched — and a tag that already exists
+//! (for `tag`) or does not exist (for `delete_tag`) surfaces as
+//! [`io::ErrorKind::Other`] with git's message.
+//!
 //! # Remotes
 //!
 //! [`remotes(root)`](remotes) lists the repository's configured remotes with
@@ -1946,6 +1966,201 @@ fn parse_tag_line(line: &str) -> io::Result<GitTag> {
         name: name.to_string(),
         object: object.to_string(),
     })
+}
+
+/// Creates a lightweight tag and returns the resulting [`GitTagSnapshot`]
+/// from [`tags`].
+///
+/// Runs `git -C <root> tag -- <name>`: no shell, the name is a single
+/// argument, and the `--` separator shields it from option parsing. The
+/// name is validated before git is spawned with the strict rules of
+/// [`check_tag_name`], so a name that passes validation is always a legal
+/// ref under `refs/tags/`. The operation is local to the repository: the
+/// worktree and the index are never touched.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `name` fails [`check_tag_name`].
+/// - [`io::ErrorKind::Other`] if `git tag` exits non-zero (for example the
+///   tag already exists, `root` is not inside a Git repository, or HEAD is
+///   unborn); git's message is included.
+/// - [`io::ErrorKind::InvalidData`] if the fresh [`tags`] output cannot be
+///   parsed or reports an object or a name that fails validation.
+pub fn tag(root: &Path, name: &str) -> io::Result<GitTagSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_tag_name(name)?;
+    run_git_tag("git", root, name)?;
+    tags(root)
+}
+
+/// Runs `program -C root tag -- <name>`; split out so tests can exercise the
+/// spawn-failure path with a program that does not exist.
+fn run_git_tag(program: &str, root: &Path, name: &str) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .args(["tag", "--"])
+        .arg(name)
+        .output()?;
+    ensure_git_success(&output, "tag")
+}
+
+/// Deletes a tag and returns the resulting [`GitTagSnapshot`] from [`tags`].
+///
+/// Runs `git -C <root> tag --delete <name>`: no shell, and the name is a
+/// single argument — validated with [`check_tag_name`] before git is
+/// spawned, so it can never be parsed as an option. The operation is local
+/// to the repository and never touches the worktree or the index.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `name` fails [`check_tag_name`].
+/// - [`io::ErrorKind::Other`] if `git tag --delete` exits non-zero (for
+///   example the tag does not exist or `root` is not inside a Git
+///   repository); git's message is included.
+/// - [`io::ErrorKind::InvalidData`] if the fresh [`tags`] output cannot be
+///   parsed or reports an object or a name that fails validation.
+pub fn delete_tag(root: &Path, name: &str) -> io::Result<GitTagSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_tag_name(name)?;
+    run_git_delete_tag("git", root, name)?;
+    tags(root)
+}
+
+/// Runs `program -C root tag --delete <name>`; split out so tests can
+/// exercise the spawn-failure path with a program that does not exist.
+fn run_git_delete_tag(program: &str, root: &Path, name: &str) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("tag")
+        .arg("--delete")
+        .arg(name)
+        .output()?;
+    ensure_git_success(&output, "tag --delete")
+}
+
+/// Validates a caller-supplied tag name before git is spawned: it must be
+/// non-empty, free of NUL bytes, not `-`-prefixed (so git never parses it as
+/// an option), and relative — no leading `/`, `\` or drive prefix, and no
+/// `..` anywhere — with no empty slash-separated components. It must also be
+/// free of ASCII control characters (including space and DEL) and of git's
+/// other ref-forbidden characters (`~`, `^`, `:`, `?`, `*`, `[`, `\`,
+/// `@{`), and no component may start with `.` or end with `.lock`, mirroring
+/// `git check-ref-format`. One-level names such as `v1.2` are allowed: the
+/// tag lives under `refs/tags/`, so the "must contain a slash" rule does not
+/// apply.
+fn check_tag_name(name: &str) -> io::Result<()> {
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tag name must not be empty",
+        ));
+    }
+    if name.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tag name must not contain NUL bytes",
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tag name must not start with '-': {name:?}"),
+        ));
+    }
+    let bytes = name.as_bytes();
+    let looks_absolute = bytes[0] == b'/'
+        || bytes[0] == b'\\'
+        || bytes.starts_with(b"//")
+        || (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic());
+    let escapes = Path::new(name).is_absolute()
+        || looks_absolute
+        || Path::new(name)
+            .components()
+            .any(|component| matches!(component, Component::ParentDir));
+    if escapes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tag name must be relative and free of '..': {name:?}"),
+        ));
+    }
+    for &byte in bytes {
+        if byte <= b' ' || byte == 0x7F {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tag name must not contain control characters or whitespace: {name:?}"),
+            ));
+        }
+        if matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tag name must not contain git-ref-forbidden character '{}': {name:?}",
+                    byte as char
+                ),
+            ));
+        }
+    }
+    if name.contains("..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tag name must not contain '..': {name:?}"),
+        ));
+    }
+    if name == "@" || name.contains("@{") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tag name must not be '@' or contain '@{{': {name:?}"),
+        ));
+    }
+    for component in name.split('/') {
+        if component.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tag name must not contain empty components: {name:?}"),
+            ));
+        }
+        if component.starts_with('.') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tag name components must not start with '.': {name:?}"),
+            ));
+        }
+        if component.ends_with(".lock") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tag name components must not end with '.lock': {name:?}"),
+            ));
+        }
+    }
+    if name.ends_with('.') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tag name must not end with '.': {name:?}"),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -6515,6 +6730,345 @@ mod tests {
             return;
         }
         let error = tags(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- tag() / delete_tag() name validation (no git binary needed) ----
+
+    #[test]
+    fn tag_accepts_valid_tag_names() {
+        for name in [
+            "v1.2",
+            "v1.0.0",
+            "v1.2-rc.1",
+            "release-1.0",
+            "build_42",
+            "feature/release",
+            "feature/v1.2",
+            "release/2026-08",
+            "a.b/c.d",
+        ] {
+            assert!(
+                check_tag_name(name).is_ok(),
+                "tag name {name:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_rejects_unsafe_tag_names() {
+        let root = temp_dir("tagbad");
+        for name in [
+            "",
+            "\0",
+            "-f",
+            "--delete",
+            "/abs/name",
+            "\\server\\share\\x",
+            "C:/windows/x",
+            "C:\\windows\\x",
+            "..",
+            "../outside",
+            "a/../../outside",
+            "a..b",
+            "foo//bar",
+            "foo/",
+            "/foo",
+            "foo bar",
+            "foo\tbar",
+            "foo\nbar",
+            "foo\rbar",
+            "foo\x01bar",
+            "foo\x7fbar",
+            "foo~bar",
+            "foo^bar",
+            "foo:bar",
+            "foo?bar",
+            "foo*bar",
+            "foo[bar",
+            "foo\\bar",
+            "foo@{bar",
+            "@",
+            ".hidden",
+            "foo/.hidden",
+            "foo.lock",
+            "foo/bar.lock",
+            "foo.",
+            "v1.0.0.",
+        ] {
+            let error = tag(&root, name).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "tag name {name:?} should be rejected"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- tag() / delete_tag() root validation (no git binary needed) ----
+
+    #[test]
+    fn tag_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-tag-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            tag(&missing, "v1.0").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn tag_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-tag-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            tag(&file, "v1.0").unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn delete_tag_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-delete-tag-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            delete_tag(&missing, "v1.0").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn delete_tag_file_root_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "nextide-delete-tag-notdir-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            delete_tag(&file, "v1.0").unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_git_binary_for_tag_surfaces_as_not_found() {
+        let root = temp_dir("tagnobinary");
+        let error = run_git_tag("nextide-no-such-git-binary", &root, "v1.0").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_delete_tag_surfaces_as_not_found() {
+        let root = temp_dir("deletetagnobinary");
+        let error = run_git_delete_tag("nextide-no-such-git-binary", &root, "v1.0").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- tag() / delete_tag() integration (requires a git binary) ----
+
+    #[test]
+    fn tag_creates_lightweight_tag_and_returns_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagcreate", &[("a.txt", "a")]);
+        let head = rev_hash(&root, "HEAD");
+        let snapshot = tag(&root, "v1.2").unwrap();
+        assert_eq!(snapshot.tags.len(), 1);
+        assert_eq!(snapshot.tags[0].name, "v1.2");
+        assert_eq!(snapshot.tags[0].object, head);
+        // The tag is lightweight: it resolves directly to the commit.
+        assert_eq!(rev_hash(&root, "v1.2"), head);
+        // The worktree and index are untouched.
+        assert!(status(&root).unwrap().is_clean());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tag_creates_slash_names_and_keeps_existing_tags() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagslash", &[("a.txt", "a")]);
+        let head = rev_hash(&root, "HEAD");
+        let snapshot = tag(&root, "v1.2").unwrap();
+        assert_eq!(snapshot.tags.len(), 1);
+        let snapshot = tag(&root, "feature/v1.2").unwrap();
+        assert_eq!(snapshot.tags.len(), 2);
+        let names: Vec<&str> = snapshot.tags.iter().map(|tag| tag.name.as_str()).collect();
+        assert_eq!(names, ["feature/v1.2", "v1.2"]);
+        assert!(snapshot.tags.iter().all(|tag| tag.object == head));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tag_existing_name_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagexists", &[("a.txt", "a")]);
+        tag(&root, "v1.0").unwrap();
+        let error = tag(&root, "v1.0").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(message.contains("already exists"), "message was: {message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tag_in_repository_without_commits_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("tagnocommit");
+        run_git(&root, &["init", "-q"]);
+        let error = tag(&root, "v1.0").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(message.contains("HEAD"), "message was: {message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_tag_removes_tag_and_returns_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagdelete", &[("a.txt", "a")]);
+        let head = rev_hash(&root, "HEAD");
+        tag(&root, "v1.2").unwrap();
+        tag(&root, "v1.3").unwrap();
+        let snapshot = delete_tag(&root, "v1.2").unwrap();
+        assert_eq!(snapshot.tags.len(), 1);
+        assert_eq!(snapshot.tags[0].name, "v1.3");
+        assert_eq!(snapshot.tags[0].object, head);
+        assert_eq!(tags(&root).unwrap().tags.len(), 1);
+        // The worktree and index are untouched.
+        assert!(status(&root).unwrap().is_clean());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_tag_removes_annotated_tags_too() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagdeleteannotated", &[("a.txt", "a")]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                "-a",
+                "annotated",
+                "-m",
+                "annotation",
+            ],
+        );
+        let snapshot = delete_tag(&root, "annotated").unwrap();
+        assert!(snapshot.is_empty());
+        assert!(tags(&root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_tag_unknown_name_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagnotfound", &[("a.txt", "a")]);
+        let error = delete_tag(&root, "nope").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(message.contains("not found"), "message was: {message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tag_from_nested_root_applies_to_the_whole_repository() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagnested", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        let snapshot = tag(&root.join("sub"), "v1.0").unwrap();
+        assert_eq!(snapshot.tags.len(), 1);
+        assert_eq!(snapshot.tags[0].name, "v1.0");
+        assert_eq!(rev_hash(&root, "v1.0"), rev_hash(&root, "HEAD"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_tag_from_nested_root_deletes_the_whole_repository_tag() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("deletetagnested", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        tag(&root, "v1.0").unwrap();
+        let snapshot = delete_tag(&root.join("sub"), "v1.0").unwrap();
+        assert!(snapshot.is_empty());
+        assert!(tags(&root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tag_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("tagnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = tag(&root, "v1.0").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_tag_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("deletetagnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = delete_tag(&root, "v1.0").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
