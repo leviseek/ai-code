@@ -136,6 +136,58 @@
 //! [`io::ErrorKind::Other`] with git's message. Root and git-binary error
 //! behaviour matches [`status`] and [`stage`]: `NotFound` for a missing root
 //! or missing `git`, `NotADirectory` for a non-directory root.
+//!
+//! # Restore and stash
+//!
+//! [`restore(root, paths)`](restore) discards the named paths' *worktree*
+//! changes with `git -C <root> restore -- <paths>` and returns the fresh
+//! [`GitStatusSnapshot`] from [`status`]. The default source of `git restore`
+//! is the index, so only the worktree is rewritten: staged changes are kept,
+//! and untracked files are never deleted (a pathspec that matches an
+//! untracked file is a git error, surfaced as [`io::ErrorKind::Other`]).
+//! Every path is validated before git is spawned with the same rules as
+//! [`stage`] and [`unstage`]: non-empty, rooted at `root` (relative, free of
+//! parent, root and drive components), not `:`-prefixed (git pathspec magic),
+//! and passed as its own argument after the `--` separator — so option-like
+//! names such as `--help` or `-f` are restored literally — while an empty
+//! `paths` slice is rejected with [`io::ErrorKind::InvalidInput`].
+//!
+//! ## Dangerous-operation boundary (restore)
+//!
+//! `restore` is destructive and irreversible: worktree edits to the named
+//! paths are overwritten from the index and cannot be recovered (unless they
+//! were stashed or committed first). In particular:
+//!
+//! - A `.` pathspec restores every tracked path under `root` — it discards
+//!   *all* unstaged changes under `root` in one call (and, from a nested
+//!   `root`, nothing outside it).
+//! - A path deleted in the worktree (an unstaged deletion) is re-created from
+//!   the index; content that only exists in the worktree (untracked files) is
+//!   never affected by this call.
+//! - Staged changes are never discarded: the worktree is rewritten from the
+//!   index, so a path with staged modifications keeps them.
+//!
+//! [`stash_push(root, message)`](stash_push) moves the repository's tracked
+//! changes (staged and unstaged) into a new stash entry with
+//! `git -C <root> stash push [--message=<message>]` and returns the fresh
+//! [`GitStatusSnapshot`] from [`status`]. The optional message follows the
+//! [`commit`] rules — non-empty after trimming and free of NUL bytes,
+//! otherwise [`io::ErrorKind::InvalidInput`] before git is spawned — and
+//! travels as a single `--message=<message>` argument, so it can never be
+//! parsed as an option even when it looks like one. `git stash push` with
+//! nothing to stash is a no-op that exits 0 ("No local changes to save"), so
+//! the returned snapshot simply reflects the unchanged repository.
+//!
+//! ## Dangerous-operation boundary (stash)
+//!
+//! `stash_push` rewrites the worktree of the *whole repository*, not just
+//! `root`: `git stash push` without pathspecs stashes every tracked change
+//! wherever it lives relative to the repository top level, so calling it from
+//! a nested `root` also stashes changes outside `root`. Untracked files are
+//! never stashed (no `-u`/`-a`), so a repository with only untracked changes
+//! is a no-op too. Stash entries are recoverable with `git stash pop`/`apply`
+//! — this module deliberately offers no pop/apply yet — but the worktree is
+//! rewritten by the push, and dropping entries is out of scope.
 
 use std::io;
 use std::path::{Component, Path};
@@ -1109,22 +1161,35 @@ fn ensure_git_success(output: &std::process::Output, subcommand: &str) -> io::Re
     )))
 }
 
-/// Rejects empty or whitespace-only commit messages and messages containing
-/// NUL bytes (which cannot be passed as an argument) before git is spawned.
-fn check_commit_message(message: &str) -> io::Result<()> {
+/// Rejects empty or whitespace-only messages and messages containing NUL
+/// bytes (which cannot be passed as an argument) before git is spawned.
+/// `what` names the operation in error messages.
+fn check_message(message: &str, what: &str) -> io::Result<()> {
     if message.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "commit message must not be empty",
+            format!("{what} must not be empty"),
         ));
     }
     if message.contains('\0') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "commit message must not contain NUL bytes",
+            format!("{what} must not contain NUL bytes"),
         ));
     }
     Ok(())
+}
+
+/// Rejects empty or whitespace-only commit messages and messages containing
+/// NUL bytes (which cannot be passed as an argument) before git is spawned.
+fn check_commit_message(message: &str) -> io::Result<()> {
+    check_message(message, "commit message")
+}
+
+/// Rejects empty or whitespace-only stash messages and messages containing
+/// NUL bytes (which cannot be passed as an argument) before git is spawned.
+fn check_stash_message(message: &str) -> io::Result<()> {
+    check_message(message, "stash message")
 }
 
 /// Validates a caller-supplied path that git will see after the `--`
@@ -1359,6 +1424,133 @@ fn check_branch_name(branch: &str) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Git restore and stash
+// ---------------------------------------------------------------------------
+
+/// Discards the given paths' worktree changes and returns the resulting
+/// [`GitStatusSnapshot`] from [`status`].
+///
+/// Runs `git -C <root> restore -- <paths>`: no shell, and every path is
+/// passed as its own argument after the `--` separator, so option-like names
+/// such as `--help` or `-f` are restored literally. Paths are validated
+/// before git is spawned with the same rules as [`stage`] and [`unstage`]:
+/// non-empty, rooted at `root` (relative and free of parent, root and drive
+/// components) and not `:`-prefixed (git pathspec magic); an empty `paths`
+/// slice is rejected the same way.
+///
+/// `git restore` writes the *worktree* from the index by default: staged
+/// changes are kept, and untracked files are never deleted — see the
+/// "Dangerous-operation boundary (restore)" section in the module docs.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `paths` is empty or contains a path
+///   that is not rooted at `root` or starts with `:`.
+/// - [`io::ErrorKind::Other`] if `git restore` exits non-zero (for example a
+///   pathspec that matches no tracked file — such as an untracked or
+///   non-existent path — or an unmerged path); git's message is included.
+/// - [`io::ErrorKind::InvalidData`] if the fresh [`status`] output cannot be
+///   parsed or reports a path that escapes the repository root.
+pub fn restore(root: &Path, paths: &[&Path]) -> io::Result<GitStatusSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    if paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one path must be restored",
+        ));
+    }
+    for path in paths {
+        check_restore_path(path)?;
+    }
+    run_git_restore("git", root, paths)?;
+    status(root)
+}
+
+/// Runs `program -C root restore -- <paths>`; split out so tests can
+/// exercise the spawn-failure path with a program that does not exist.
+fn run_git_restore(program: &str, root: &Path, paths: &[&Path]) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("restore")
+        .arg("--")
+        .args(paths)
+        .output()?;
+    ensure_git_success(&output, "restore")
+}
+
+/// Validates a caller-supplied restore path: see [`check_index_path`].
+fn check_restore_path(path: &Path) -> io::Result<()> {
+    check_index_path(path, "restore path")
+}
+
+/// Stashes the repository's tracked changes and returns the resulting
+/// [`GitStatusSnapshot`] from [`status`].
+///
+/// Runs `git -C <root> stash push [--message=<message>]`: no shell. The
+/// optional message is a single `--message=<message>` argument, so it can
+/// never be parsed as an option even when it looks like one; it must be
+/// non-empty after trimming and free of NUL bytes, or the call fails with
+/// [`io::ErrorKind::InvalidInput`] before git is spawned. Untracked files are
+/// never stashed, and a repository with no tracked changes is a no-op (git
+/// exits 0 with "No local changes to save"), so the returned snapshot always
+/// reflects the resulting state.
+///
+/// The stash is scoped to the whole repository, not to `root` — see the
+/// "Dangerous-operation boundary (stash)" section in the module docs.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `message` is empty or whitespace-only
+///   or contains a NUL byte.
+/// - [`io::ErrorKind::Other`] if `git stash push` exits non-zero (for example
+///   `root` is not inside a Git repository, or the repository has no commits
+///   yet); git's message is included.
+/// - [`io::ErrorKind::InvalidData`] if the fresh [`status`] output cannot be
+///   parsed or reports a path that escapes the repository root.
+pub fn stash_push(root: &Path, message: Option<&str>) -> io::Result<GitStatusSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    if let Some(message) = message {
+        check_stash_message(message)?;
+    }
+    run_git_stash_push("git", root, message)?;
+    status(root)
+}
+
+/// Runs `program -C root stash push [--message=<message>]`; split out so
+/// tests can exercise the spawn-failure path with a program that does not
+/// exist.
+fn run_git_stash_push(program: &str, root: &Path, message: Option<&str>) -> io::Result<()> {
+    let mut command = Command::new(program);
+    command.arg("-C").arg(root).arg("stash").arg("push");
+    if let Some(message) = message {
+        command.arg(format!("--message={message}"));
+    }
+    let output = command.output()?;
+    ensure_git_success(&output, "stash push")
 }
 
 #[cfg(test)]
@@ -3333,6 +3525,476 @@ mod tests {
             return;
         }
         let error = checkout(&root, "main").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- restore() argument safety (no git binary needed) ----
+
+    #[test]
+    fn restore_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-restore-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            restore(&missing, &[Path::new("a.txt")]).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn restore_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-restore-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            restore(&file, &[Path::new("a.txt")]).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn restore_empty_paths_is_invalid_input() {
+        let root = temp_dir("restoreempty");
+        let error = restore(&root, &[]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_rejects_unrooted_and_magic_paths() {
+        let root = temp_dir("restorebad");
+        for path in [
+            Path::new(""),
+            Path::new("/etc/passwd"),
+            Path::new("..\\outside.txt"),
+            Path::new("a/../../outside.txt"),
+            Path::new("C:\\windows\\file.txt"),
+            Path::new("C:drive-relative.txt"),
+            Path::new("\\\\server\\share\\file.txt"),
+            Path::new(":(top)etc"),
+            Path::new(":(exclude)secret"),
+        ] {
+            let error = restore(&root, &[path]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "path {path:?} should be rejected"
+            );
+        }
+        // `.` (restore everything under root) passes validation.
+        check_restore_path(Path::new(".")).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_restore_surfaces_as_not_found() {
+        let root = temp_dir("restorenobinary");
+        let error = run_git_restore("nextide-no-such-git-binary", &root, &[Path::new("a.txt")])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- restore() integration (requires a git binary) ----
+
+    #[test]
+    fn restore_discards_worktree_modifications() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restoremod", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+        let snapshot = restore(&root, &[Path::new("a.txt")]).unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "base");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_keeps_staged_changes() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorestage", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "staged").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+
+        // The worktree returns to the staged content; the staged change
+        // itself survives (restore only rewrites the worktree, from the
+        // index).
+        let snapshot = restore(&root, &[Path::new("a.txt")]).unwrap();
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "staged");
+        let entry = find(&snapshot, "a.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Modified, GitStatusCode::Unmodified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_recreates_unstaged_deleted_files() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restoredel", &[("a.txt", "base")]);
+        fs::remove_file(root.join("a.txt")).unwrap();
+        let snapshot = restore(&root, &[Path::new("a.txt")]).unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "base");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_leaves_untracked_files_alone() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restoreuntracked", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+        fs::write(root.join("new.txt"), "untracked").unwrap();
+        let snapshot = restore(&root, &[Path::new("a.txt")]).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("new.txt")).unwrap(),
+            "untracked"
+        );
+        let entry = find(&snapshot, "new.txt");
+        assert!(entry.state.is_untracked());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_handles_option_like_quoted_and_whitespace_paths() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo(
+            "restoreopt",
+            &[("--help", "help"), ("with space 中文.txt", "w")],
+        );
+        fs::write(root.join("--help"), "dirty-help").unwrap();
+        fs::write(root.join("with space 中文.txt"), "dirty-w").unwrap();
+        let snapshot = restore(
+            &root,
+            &[Path::new("--help"), Path::new("with space 中文.txt")],
+        )
+        .unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(fs::read_to_string(root.join("--help")).unwrap(), "help");
+        assert_eq!(
+            fs::read_to_string(root.join("with space 中文.txt")).unwrap(),
+            "w"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_with_dot_restores_the_whole_root() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restoredot", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("sub/b.txt"), "B").unwrap();
+        let snapshot = restore(&root, &[Path::new(".")]).unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(root.join("sub/b.txt")).unwrap(), "b");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_from_nested_root_resolves_paths_relative_to_root() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorenested", &[("sub/a.txt", "a"), ("sub/b.txt", "b")]);
+        fs::write(root.join("sub/a.txt"), "A").unwrap();
+        fs::write(root.join("sub/b.txt"), "B").unwrap();
+
+        // The pathspec is resolved relative to `root` (the nested directory).
+        let snapshot = restore(&root.join("sub"), &[Path::new("a.txt")]).unwrap();
+        assert_eq!(fs::read_to_string(root.join("sub/a.txt")).unwrap(), "a");
+        // The sibling change was not restored and still reports relative to
+        // the repository top level.
+        let b = find(&snapshot, "sub/b.txt");
+        assert_eq!(
+            b.state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_nonexistent_path_propagates_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restoremiss", &[("a.txt", "a")]);
+        let error = restore(&root, &[Path::new("no-such-file.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("did not match any file(s)"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_untracked_path_propagates_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restoreut", &[("a.txt", "a")]);
+        fs::write(root.join("new.txt"), "untracked").unwrap();
+        // An untracked path is not "known to git" for a restore, so git
+        // fails; the file itself is untouched.
+        let error = restore(&root, &[Path::new("new.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("did not match any file(s)"),
+            "message was: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("new.txt")).unwrap(),
+            "untracked"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("restorenonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = restore(&root, &[Path::new("a.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- stash_push() argument safety (no git binary needed) ----
+
+    #[test]
+    fn stash_push_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-stash-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            stash_push(&missing, None).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn stash_push_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-stash-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            stash_push(&file, None).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn stash_push_rejects_bad_messages() {
+        let root = temp_dir("stashbadmsg");
+        for message in ["", "   ", "\n\n", "\t", "has\0nul"] {
+            let error = stash_push(&root, Some(message)).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "message {message:?} should be rejected"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_stash_push_surfaces_as_not_found() {
+        let root = temp_dir("stashnobinary");
+        let error = run_git_stash_push("nextide-no-such-git-binary", &root, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- stash_push() integration (requires a git binary) ----
+
+    /// The number of stash entries, i.e. `git stash list` lines.
+    fn stash_count(root: &Path) -> usize {
+        let bytes = run_git_capture("git", root, &["stash", "list"]).unwrap();
+        String::from_utf8(bytes).unwrap().lines().count()
+    }
+
+    #[test]
+    fn stash_push_moves_tracked_changes_and_keeps_untracked_files() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashpush", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+        fs::write(root.join("new.txt"), "untracked").unwrap();
+        assert_eq!(stash_count(&root), 0);
+
+        let snapshot = stash_push(&root, None).unwrap();
+        // The tracked change was stashed away; the untracked file stays.
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "base");
+        assert_eq!(
+            fs::read_to_string(root.join("new.txt")).unwrap(),
+            "untracked"
+        );
+        let untracked = find(&snapshot, "new.txt");
+        assert!(untracked.state.is_untracked());
+        assert_eq!(stash_count(&root), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_push_records_the_message() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashmsg", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+        stash_push(&root, Some("wip feature x")).unwrap();
+        let list = run_git_capture("git", &root, &["stash", "list"]).unwrap();
+        let list = String::from_utf8(list).unwrap();
+        assert!(list.contains("wip feature x"), "stash list was: {list:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_push_treats_option_like_messages_as_message_text() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashopt", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+        // An option-like message is recorded verbatim via --message=<msg>,
+        // never parsed as a git option.
+        stash_push(&root, Some("--amend")).unwrap();
+        let list = run_git_capture("git", &root, &["stash", "list"]).unwrap();
+        let list = String::from_utf8(list).unwrap();
+        assert!(list.contains("--amend"), "stash list was: {list:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_push_stashes_staged_changes_too() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashstaged", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "staged").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        let snapshot = stash_push(&root, None).unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "base");
+        assert_eq!(stash_count(&root), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_push_with_nothing_to_stash_is_a_noop() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashclean", &[("a.txt", "base")]);
+        // No tracked changes: git exits 0 with "No local changes to save"
+        // and creates no entry, so the call succeeds and returns the clean
+        // status.
+        let snapshot = stash_push(&root, None).unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(stash_count(&root), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_push_with_only_untracked_files_is_a_noop() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashut", &[("a.txt", "base")]);
+        fs::write(root.join("new.txt"), "untracked").unwrap();
+        // Untracked files are never stashed (no -u/-a), so there is nothing
+        // to save and no entry is created.
+        let snapshot = stash_push(&root, None).unwrap();
+        let untracked = find(&snapshot, "new.txt");
+        assert!(untracked.state.is_untracked());
+        assert_eq!(stash_count(&root), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_push_from_nested_root_stashes_the_whole_repository() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stashnested", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        fs::write(root.join("a.txt"), "dirty-root").unwrap();
+        fs::write(root.join("sub/b.txt"), "dirty-sub").unwrap();
+        // `git stash push` without pathspecs stashes every tracked change in
+        // the repository, including changes outside the nested root.
+        let snapshot = stash_push(&root.join("sub"), None).unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(root.join("sub/b.txt")).unwrap(), "b");
+        assert_eq!(stash_count(&root), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stash_push_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("stashnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = stash_push(&root, None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
