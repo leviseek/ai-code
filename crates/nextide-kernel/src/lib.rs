@@ -32,7 +32,7 @@ pub use application::ApplicationContext;
 pub use async_task::{AsyncTaskEvent, AsyncTaskHandle, AsyncTaskSnapshot, AsyncTaskStatus};
 pub use capability::{CapabilityDescriptor, CapabilityRegistry, CapabilitySummary, RegistryError};
 pub use editor_view::EditorViewState;
-pub use events::{Event, EventBus};
+pub use events::{Event, EventBus, EventSubscriber};
 pub use file_tree::{FileNode, FileNodeKind, FileTreeModel};
 pub use git::{
     add_remote, amend, branches, checkout, commit, delete_tag, diff, log, remote_exists,
