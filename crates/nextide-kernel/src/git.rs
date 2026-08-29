@@ -65,6 +65,38 @@
 //! changed lines are replaced with U+FFFD (git only quotes paths, never line
 //! content), while every parsed path still passes the same safety check as
 //! `status`.
+//!
+//! # Stage and commit
+//!
+//! [`stage(root, paths)`](stage) stages paths into the index with
+//! `git -C <root> add -- <paths>` and returns the fresh
+//! [`GitStatusSnapshot`] from [`status`]. No shell is involved and every
+//! path is passed to git as its own argument after the `--` separator, so a
+//! path such as `--help` or `-f` is treated literally. Every path must be
+//! rooted at `root` (relative, non-empty, free of parent, root and drive
+//! components) and must not start with `:` — git would interpret a `:`
+//! prefix as pathspec magic (for example `:(top)` or `:(exclude)`) — or the
+//! call fails with [`io::ErrorKind::InvalidInput`] before git is spawned;
+//! an empty `paths` slice is rejected the same way.
+//!
+//! [`commit(root, message)`](commit) creates a commit from the staged
+//! changes with `git -C <root> commit --message=<message>`, where the
+//! message travels as a single argument — never through a shell — so it
+//! cannot be parsed as an option even when it looks like one (for example
+//! `--amend`). An empty or whitespace-only message, or one containing a NUL
+//! byte, is rejected with [`io::ErrorKind::InvalidInput`] before git is
+//! spawned. On success it returns [`GitCommitResult`] with the full
+//! 40-character hash of the new commit (read back with `git rev-parse
+//! HEAD`) and its subject as git defines it (`git log -1 --format=%s`: the
+//! first paragraph, with line breaks collapsed to spaces).
+//!
+//! Error behaviour matches [`status`] and [`diff`]: a missing `root` or
+//! `git` is [`io::ErrorKind::NotFound`], a non-directory `root` is
+//! [`io::ErrorKind::NotADirectory`], and a non-zero git exit (for example a
+//! pathspec that matches nothing, an unconfigured identity, or "nothing to
+//! commit") is [`io::ErrorKind::Other`] with git's message — taken from
+//! stderr, or from stdout when stderr is empty, because `git commit` prints
+//! some failures (such as "nothing to commit") on stdout.
 
 use std::io;
 use std::path::{Component, Path};
@@ -784,10 +816,18 @@ impl DiffFileBuilder {
 /// Validates a caller-supplied diff path: it must be non-empty, relative and
 /// free of parent, root and drive components, i.e. rooted at `root`.
 fn check_rooted_path(path: &Path) -> io::Result<()> {
+    check_rooted_path_named(path, "diff path")
+}
+
+/// Shared rooted-path validation for caller-supplied paths (the `diff`
+/// pathspec and the `stage` paths): the path must be non-empty, relative and
+/// free of parent, root and drive components, i.e. rooted at `root`. `what`
+/// names the operation in error messages.
+fn check_rooted_path_named(path: &Path, what: &str) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "diff path must not be empty",
+            format!("{what} must not be empty"),
         ));
     }
     let unsafe_component = path.components().any(|component| match component {
@@ -798,7 +838,211 @@ fn check_rooted_path(path: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "diff path must be rooted at the repository root: {}",
+                "{what} must be rooted at the repository root: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Git stage and commit
+// ---------------------------------------------------------------------------
+
+/// The result of a successful [`commit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitResult {
+    /// The full 40-character object id of the new commit, read back with
+    /// `git rev-parse HEAD`.
+    pub hash: String,
+    /// The commit's subject as git defines it (`git log -1 --format=%s`):
+    /// the first paragraph of the message, with line breaks collapsed to
+    /// spaces.
+    pub summary: String,
+}
+
+/// Stages the given paths into the index and returns the resulting
+/// [`GitStatusSnapshot`] from [`status`].
+///
+/// Runs `git -C <root> add -- <paths>`: no shell, and every path is passed
+/// as its own argument after the `--` separator, so option-like names such
+/// as `--help` or `-f` are staged literally. A `:`-leading path (git
+/// pathspec magic) and any path that is empty, absolute, or contains a
+/// parent, root or drive component is rejected with
+/// [`io::ErrorKind::InvalidInput`] before git is spawned; an empty `paths`
+/// slice is rejected the same way.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `paths` is empty or contains a path
+///   that is not rooted at `root` or starts with `:`.
+/// - [`io::ErrorKind::Other`] if `git add` exits non-zero (for example a
+///   pathspec that matches no file); git's message is included.
+pub fn stage(root: &Path, paths: &[&Path]) -> io::Result<GitStatusSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    if paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one path must be staged",
+        ));
+    }
+    for path in paths {
+        check_stage_path(path)?;
+    }
+    run_git_add("git", root, paths)?;
+    status(root)
+}
+
+/// Runs `program -C root add -- <paths>`; split out so tests can exercise
+/// the spawn-failure path with a program that does not exist.
+fn run_git_add(program: &str, root: &Path, paths: &[&Path]) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("add")
+        .arg("--")
+        .args(paths)
+        .output()?;
+    ensure_git_success(&output, "add")
+}
+
+/// Creates a commit from the staged changes and returns its hash and
+/// summary.
+///
+/// Runs `git -C <root> commit --message=<message>`, where the message is a
+/// single argument — never interpreted by a shell — so it cannot be parsed
+/// as an option even when it looks like one. The commit's configuration
+/// (identity, GPG signing, hooks) is git's own.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `message` is empty or whitespace-only
+///   or contains a NUL byte.
+/// - [`io::ErrorKind::Other`] if `git commit` exits non-zero (for example an
+///   unconfigured identity or an empty index with "nothing to commit"); git's
+///   message is included.
+pub fn commit(root: &Path, message: &str) -> io::Result<GitCommitResult> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_commit_message(message)?;
+    run_git_commit("git", root, message)?;
+    let hash = run_git_capture("git", root, &["rev-parse", "HEAD"])?;
+    let hash = String::from_utf8(hash).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git rev-parse output is not valid UTF-8",
+        )
+    })?;
+    let summary = run_git_capture("git", root, &["log", "-1", "--format=%s"])?;
+    let summary = String::from_utf8(summary).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git log output is not valid UTF-8",
+        )
+    })?;
+    Ok(GitCommitResult {
+        hash: hash.trim_end().to_string(),
+        summary: summary.trim_end().to_string(),
+    })
+}
+
+/// Runs `program -C root commit --message=<message>`; split out so tests can
+/// exercise the spawn-failure path with a program that does not exist.
+fn run_git_commit(program: &str, root: &Path, message: &str) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("commit")
+        .arg(format!("--message={message}"))
+        .output()?;
+    ensure_git_success(&output, "commit")
+}
+
+/// Runs `program -C root <args>` and returns stdout; a non-zero exit is an
+/// [`io::ErrorKind::Other`] error carrying git's message.
+fn run_git_capture(program: &str, root: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()?;
+    ensure_git_success(&output, args.first().copied().unwrap_or("subcommand"))?;
+    Ok(output.stdout)
+}
+
+/// Maps a non-zero git exit to an [`io::ErrorKind::Other`] error. The
+/// message is git's stderr, falling back to stdout when stderr is empty,
+/// because `git commit` prints some failures (such as "nothing to commit")
+/// on stdout.
+fn ensure_git_success(output: &std::process::Output, subcommand: &str) -> io::Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = match output.status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(io::Error::other(format!(
+        "git {subcommand} failed ({code}): {detail}"
+    )))
+}
+
+/// Rejects empty or whitespace-only commit messages and messages containing
+/// NUL bytes (which cannot be passed as an argument) before git is spawned.
+fn check_commit_message(message: &str) -> io::Result<()> {
+    if message.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "commit message must not be empty",
+        ));
+    }
+    if message.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "commit message must not contain NUL bytes",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a caller-supplied stage path: it must be rooted at `root` and
+/// must not start with `:` — after the `--` separator git still interprets a
+/// `:` prefix as pathspec magic (for example `:(top)` or `:(exclude)`), so
+/// such paths are rejected before git is spawned.
+fn check_stage_path(path: &Path) -> io::Result<()> {
+    check_rooted_path_named(path, "stage path")?;
+    if path.to_string_lossy().starts_with(':') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "stage path must not start with ':' (git pathspec magic): {}",
                 path.display()
             ),
         ));
@@ -1828,6 +2072,398 @@ mod tests {
         assert!(
             texts.iter().any(|text| text.contains('\u{FFFD}')),
             "expected a replacement character in {texts:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- stage() argument safety (no git binary needed) ----
+
+    #[test]
+    fn stage_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-stage-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            stage(&missing, &[Path::new("a.txt")]).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn stage_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-stage-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            stage(&file, &[Path::new("a.txt")]).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn stage_empty_paths_is_invalid_input() {
+        let root = temp_dir("stageempty");
+        let error = stage(&root, &[]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_rejects_unrooted_and_magic_paths() {
+        let root = temp_dir("stagebad");
+        for path in [
+            Path::new(""),
+            Path::new("/etc/passwd"),
+            Path::new("..\\outside.txt"),
+            Path::new("a/../../outside.txt"),
+            Path::new("C:\\windows\\file.txt"),
+            Path::new("C:drive-relative.txt"),
+            Path::new("\\\\server\\share\\file.txt"),
+            Path::new(":(top)etc"),
+            Path::new(":(exclude)secret"),
+        ] {
+            let error = stage(&root, &[path]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "path {path:?} should be rejected"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_stage_surfaces_as_not_found() {
+        let root = temp_dir("stagenobinary");
+        let error =
+            run_git_add("nextide-no-such-git-binary", &root, &[Path::new("a.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- stage() integration (requires a git binary) ----
+
+    #[test]
+    fn stage_adds_paths_to_the_index_and_returns_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stageadd", &[("a.txt", "a"), ("b.txt", "b")]);
+        fs::write(root.join("a.txt"), "CHANGED").unwrap();
+        fs::write(root.join("new.txt"), "untracked").unwrap();
+
+        let snapshot = stage(&root, &[Path::new("a.txt"), Path::new("new.txt")]).unwrap();
+
+        let staged = find(&snapshot, "a.txt");
+        assert_eq!(
+            staged.state,
+            GitFileState::new(GitStatusCode::Modified, GitStatusCode::Unmodified)
+        );
+        let added = find(&snapshot, "new.txt");
+        assert_eq!(
+            added.state,
+            GitFileState::new(GitStatusCode::Added, GitStatusCode::Unmodified)
+        );
+        // b.txt was not requested and must not be staged.
+        assert!(!snapshot.entries.iter().any(|entry| entry.path == "b.txt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_handles_option_like_quoted_and_whitespace_paths() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stageopt", &[("plain.txt", "p")]);
+        fs::write(root.join("--help"), "x").unwrap();
+        fs::write(root.join("-f"), "z").unwrap();
+        fs::write(root.join("with space 中文.txt"), "y").unwrap();
+
+        let snapshot = stage(
+            &root,
+            &[
+                Path::new("--help"),
+                Path::new("-f"),
+                Path::new("with space 中文.txt"),
+            ],
+        )
+        .unwrap();
+        for path in ["--help", "-f", "with space 中文.txt"] {
+            let entry = find(&snapshot, path);
+            assert_eq!(
+                entry.state,
+                GitFileState::new(GitStatusCode::Added, GitStatusCode::Unmodified)
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_with_dot_path_stages_the_whole_root() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stagedot", &[("a.txt", "a")]);
+        fs::write(root.join("untracked.txt"), "u").unwrap();
+        let snapshot = stage(&root, &[Path::new(".")]).unwrap();
+        let entry = find(&snapshot, "untracked.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Added, GitStatusCode::Unmodified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_records_deleted_files() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stagedel", &[("gone.txt", "x")]);
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        let snapshot = stage(&root, &[Path::new("gone.txt")]).unwrap();
+        let entry = find(&snapshot, "gone.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Deleted, GitStatusCode::Unmodified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_nonexistent_path_propagates_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stagemiss", &[("a.txt", "a")]);
+        let error = stage(&root, &[Path::new("no-such-file.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("did not match any files"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_from_nested_root_resolves_paths_relative_to_root() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("stagenested", &[("sub/a.txt", "a")]);
+        fs::write(root.join("sub/b.txt"), "b").unwrap();
+        let snapshot = stage(&root.join("sub"), &[Path::new("b.txt")]).unwrap();
+        // status reports paths relative to the repository top level.
+        let entry = find(&snapshot, "sub/b.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Added, GitStatusCode::Unmodified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- commit() argument safety (no git binary needed) ----
+
+    #[test]
+    fn commit_empty_message_is_invalid_input() {
+        let root = temp_dir("commitempty");
+        for message in ["", "   ", "\n\n", "\t"] {
+            let error = commit(&root, message).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "message {message:?} should be rejected"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_message_with_nul_is_invalid_input() {
+        let root = temp_dir("commitnul");
+        let error = commit(&root, "subject\0nul").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-commit-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            commit(&missing, "message").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn commit_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-commit-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            commit(&file, "message").unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_git_binary_for_commit_surfaces_as_not_found() {
+        let root = temp_dir("commitnobinary");
+        let error = run_git_commit("nextide-no-such-git-binary", &root, "message").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- commit() integration (requires a git binary) ----
+
+    /// Like [`init_repo`], plus a repo-local setting that disables GPG
+    /// signing so commit tests are immune to the host's global signing
+    /// configuration.
+    fn commit_repo(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let root = init_repo(tag, files);
+        run_git(&root, &["config", "commit.gpgsign", "false"]);
+        root
+    }
+
+    /// A fresh, configured repository with no commits yet.
+    fn init_clean_repo(tag: &str) -> PathBuf {
+        let root = temp_dir(tag);
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "nextide-tests"]);
+        run_git(
+            &root,
+            &["config", "user.email", "nextide-tests@example.com"],
+        );
+        run_git(&root, &["config", "commit.gpgsign", "false"]);
+        root
+    }
+
+    #[test]
+    fn commit_creates_commit_and_reports_hash_and_summary() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("commitok", &[("a.txt", "a\n")]);
+        fs::write(root.join("a.txt"), "CHANGED\n").unwrap();
+        let snapshot = stage(&root, &[Path::new("a.txt")]).unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+
+        let result = commit(&root, "update a.txt").unwrap();
+        assert_eq!(result.summary, "update a.txt");
+        assert_eq!(result.hash.len(), 40);
+        assert!(result.hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The recorded hash is the actual HEAD commit.
+        let recorded = run_git_capture("git", &root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(String::from_utf8(recorded).unwrap().trim_end(), result.hash);
+
+        // The worktree is clean afterwards.
+        assert!(status(&root).unwrap().is_clean());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_works_for_the_root_commit_of_a_new_repository() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_clean_repo("commitroot");
+        fs::write(root.join("first.txt"), "hello").unwrap();
+        stage(&root, &[Path::new("first.txt")]).unwrap();
+        let result = commit(&root, "first commit").unwrap();
+        assert_eq!(result.summary, "first commit");
+        assert_eq!(result.hash.len(), 40);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_preserves_multiline_message_and_reports_git_subject() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("commitmulti", &[("a.txt", "a")]);
+        fs::write(root.join("a.txt"), "b").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        let result = commit(&root, "subject line\n\nbody line\nmore body").unwrap();
+        assert_eq!(result.summary, "subject line");
+        // The full message is stored verbatim (git appends a trailing
+        // newline; `%B` emits the raw body).
+        let body = run_git_capture("git", &root, &["log", "-1", "--format=%B"]).unwrap();
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.starts_with("subject line\n\nbody line\nmore body\n"),
+            "body was: {body:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_treats_option_like_messages_as_message_text() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("commitopt", &[("a.txt", "a")]);
+        fs::write(root.join("a.txt"), "b").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        // An option-like message is committed verbatim, never parsed as a
+        // git option (for example --amend).
+        let result = commit(&root, "--amend").unwrap();
+        assert_eq!(result.summary, "--amend");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_with_nothing_staged_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = commit_repo("commitnothing", &[("a.txt", "a")]);
+        // No staged changes: git exits non-zero and prints "nothing to
+        // commit" on stdout, which the error must surface.
+        let error = commit(&root, "no-op").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("nothing to commit"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("commitnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = commit(&root, "message").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
         );
         let _ = fs::remove_dir_all(root);
     }
