@@ -183,6 +183,27 @@
 //! behaviour matches [`status`] and [`stage`]: `NotFound` for a missing root
 //! or missing `git`, `NotADirectory` for a non-directory root.
 //!
+//! # Tags
+//!
+//! [`tags(root)`](tags) lists the repository's tags with
+//! `git -C <root> for-each-ref --format=%(objectname)%00%(refname:short)
+//! refs/tags` and returns a stably sorted [`GitTagSnapshot`]. Every
+//! [`GitTag`] carries the tag's short name (the part after `refs/tags/`)
+//! and the `object` id git reports for it. The format is git's own
+//! machine-oriented output — NUL-separated fields with newline-terminated
+//! records — so no human-format parsing is involved. For a *lightweight*
+//! tag `object` is the full id of the object the tag names (typically a
+//! commit); for an *annotated* tag it is the id of the tag object itself,
+//! recorded without expanding the tag to its target — the snapshot never
+//! peels an annotated tag. Every parsed object must be non-empty
+//! hexadecimal and every name must pass the same escape-rejecting check as
+//! status paths; anything else is [`io::ErrorKind::InvalidData`]. Error
+//! behaviour matches [`branches`]: a missing `root` or `git` is
+//! [`io::ErrorKind::NotFound`], a non-directory `root` is
+//! [`io::ErrorKind::NotADirectory`], and a non-zero git exit (for example
+//! `root` is not inside a Git repository) is [`io::ErrorKind::Other`] with
+//! git's stderr in the message.
+//!
 //! # Restore and stash
 //!
 //! [`restore(root, paths)`](restore) discards the named paths' *worktree*
@@ -1770,6 +1791,136 @@ fn check_branch_name(branch: &str) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Git tags
+// ---------------------------------------------------------------------------
+
+/// One tag of a repository, as `git for-each-ref refs/tags` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitTag {
+    /// The tag's short name — the part after `refs/tags/`, for example
+    /// `v1.0.0`.
+    pub name: String,
+    /// The full object id git reports for the tag. For a lightweight tag
+    /// this is the id of the object the tag names (typically a commit); for
+    /// an annotated tag it is the id of the tag object itself — recorded
+    /// without expanding the tag to its target.
+    pub object: String,
+}
+
+/// The parsed result of [`tags`]: every tag of the repository, stably sorted
+/// by name.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GitTagSnapshot {
+    /// The tags, stably sorted by [`GitTag::name`] in byte-wise order. An
+    /// empty vec means the repository has no tags.
+    pub tags: Vec<GitTag>,
+}
+
+impl GitTagSnapshot {
+    /// The number of tags.
+    pub fn len(&self) -> usize {
+        self.tags.len()
+    }
+
+    /// Whether the repository has no tags.
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+    }
+}
+
+/// Lists the repository's tags and returns the stably sorted snapshot.
+///
+/// Runs `git -C <root> for-each-ref --format=%(objectname)%00%(refname:short)
+/// refs/tags`: no shell, and the format is git's own machine-oriented output
+/// — NUL-separated fields with newline-terminated records — so no
+/// human-format parsing is involved. A lightweight tag carries the id of the
+/// object it names; an annotated tag is recorded with the id of the tag
+/// object itself and is never expanded to its target.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::Other`] if `git` exits non-zero (for example `root` is
+///   not inside a Git repository); git's stderr is included in the message.
+/// - [`io::ErrorKind::InvalidData`] if git's output is not valid UTF-8,
+///   cannot be parsed, or reports an object or a name that fails validation.
+pub fn tags(root: &Path) -> io::Result<GitTagSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    run_tags("git", root)
+}
+
+/// Runs `program -C root for-each-ref --format=%(objectname)%00%(refname:short)
+/// refs/tags`; split out so tests can exercise the spawn-failure path with a
+/// program that does not exist.
+fn run_tags(program: &str, root: &Path) -> io::Result<GitTagSnapshot> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .args([
+            "for-each-ref",
+            "--format=%(objectname)%00%(refname:short)",
+            "refs/tags",
+        ])
+        .output()?;
+    ensure_git_success(&output, "for-each-ref")?;
+    parse_tags_bytes(output.stdout)
+}
+
+/// Converts `git for-each-ref` stdout to UTF-8 and parses it; split out so
+/// the non-UTF-8 path is testable without spawning git.
+fn parse_tags_bytes(stdout: Vec<u8>) -> io::Result<GitTagSnapshot> {
+    let stdout = String::from_utf8(stdout).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git for-each-ref output is not valid UTF-8",
+        )
+    })?;
+    parse_tags(&stdout)
+}
+
+/// Parses `object\0name` lines into a snapshot, stably sorted by name.
+fn parse_tags(output: &str) -> io::Result<GitTagSnapshot> {
+    let mut tags = Vec::new();
+    for line in output.lines() {
+        // Defensive CRLF tolerance; git itself always emits `\n`.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        tags.push(parse_tag_line(line)?);
+    }
+    tags.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(GitTagSnapshot { tags })
+}
+
+/// Parses one `object\0name` record into a [`GitTag`]: the object must be a
+/// non-empty hexadecimal id and the name must be non-empty and safe.
+fn parse_tag_line(line: &str) -> io::Result<GitTag> {
+    let mut fields = line.split('\0');
+    let object = fields
+        .next()
+        .ok_or_else(|| malformed("tag record missing object"))?;
+    let name = fields
+        .next()
+        .ok_or_else(|| malformed("tag record missing name"))?;
+    if fields.next().is_some() {
+        return Err(malformed("tag record has more than two fields"));
+    }
+    check_hash(object, "tag object")?;
+    check_safe_path(name)?;
+    Ok(GitTag {
+        name: name.to_string(),
+        object: object.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5892,6 +6043,247 @@ mod tests {
             return;
         }
         let error = log(&root, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- tags parsing ----
+
+    const TAG_OBJECT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TAG_OBJECT_2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn parses_tag_lines_with_objects() {
+        let snapshot = parse_tags(&format!(
+            "{TAG_OBJECT}\0lightweight\n{TAG_OBJECT_2}\0annotated\n"
+        ))
+        .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.tags[0].name, "annotated");
+        assert_eq!(snapshot.tags[0].object, TAG_OBJECT_2);
+        assert_eq!(snapshot.tags[1].name, "lightweight");
+        assert_eq!(snapshot.tags[1].object, TAG_OBJECT);
+    }
+
+    #[test]
+    fn parses_tag_names_with_slashes() {
+        // Tag names may contain `/`; only escape-rejecting checks apply.
+        let snapshot = parse_tags(&format!("{TAG_OBJECT}\0v1.0/release\n")).unwrap();
+        assert_eq!(snapshot.tags[0].name, "v1.0/release");
+    }
+
+    #[test]
+    fn tag_snapshot_is_sorted_by_name() {
+        let output = format!("{TAG_OBJECT}\0zeta\n{TAG_OBJECT_2}\0alpha\n{TAG_OBJECT}\0mid\n");
+        let snapshot = parse_tags(&output).unwrap();
+        let names: Vec<&str> = snapshot.tags.iter().map(|tag| tag.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn tag_sort_is_stable_for_equal_names() {
+        // for-each-ref never emits two lines for one tag, but the snapshot
+        // must still preserve input order when sort keys tie.
+        let snapshot = parse_tags(&format!("{TAG_OBJECT}\0dup\n{TAG_OBJECT_2}\0dup\n")).unwrap();
+        assert_eq!(snapshot.tags[0].object, TAG_OBJECT);
+        assert_eq!(snapshot.tags[1].object, TAG_OBJECT_2);
+    }
+
+    #[test]
+    fn parses_empty_tag_list_as_empty_snapshot() {
+        let snapshot = parse_tags("").unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.len(), 0);
+        assert!(snapshot.tags.is_empty());
+    }
+
+    #[test]
+    fn parses_tag_lines_with_crlf_line_endings() {
+        let snapshot = parse_tags(&format!("{TAG_OBJECT}\0v1.0\r\n")).unwrap();
+        assert_eq!(snapshot.tags[0].name, "v1.0");
+    }
+
+    #[test]
+    fn rejects_malformed_tag_lines() {
+        for line in [
+            "not-hex\0name".to_string(),
+            TAG_OBJECT.to_string(),
+            format!("{TAG_OBJECT}\0"),
+            "\0name".to_string(),
+            format!("{TAG_OBJECT}\0name\0extra"),
+        ] {
+            let error = parse_tags(&line).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "line {line:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_tag_names_that_escape_the_repository() {
+        for line in [
+            format!("{TAG_OBJECT}\0/etc/passwd"),
+            format!("{TAG_OBJECT}\0\\\\server\\share\\x"),
+            format!("{TAG_OBJECT}\0C:/windows/x"),
+            format!("{TAG_OBJECT}\0../outside"),
+            format!("{TAG_OBJECT}\0a/../../outside"),
+        ] {
+            let error = parse_tags(&line).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "line {line:?} should be rejected as unsafe"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_utf8_tag_output() {
+        let error = parse_tags_bytes(vec![b'a', b'0', 0xff]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ---- tags() root validation (no git binary needed) ----
+
+    #[test]
+    fn tags_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-tags-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(tags(&missing).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn tags_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-tags-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            tags(&file).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_git_binary_for_tags_surfaces_as_not_found() {
+        let root = temp_dir("tagsnobinary");
+        let error = run_tags("nextide-no-such-git-binary", &root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- tags() integration (requires a git binary) ----
+
+    #[test]
+    fn tags_lists_lightweight_and_annotated_tags() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tags", &[("a.txt", "a")]);
+        let head = rev_hash(&root, "HEAD");
+        run_git(&root, &["tag", "lightweight"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                "-a",
+                "annotated",
+                "-m",
+                "annotation",
+            ],
+        );
+        // More commits after tagging, so the tags keep pointing at the
+        // original commit and the snapshot must not be confused by HEAD.
+        fs::write(root.join("a.txt"), "b").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "second"],
+        );
+        run_git(&root, &["tag", "zeta"]);
+
+        let snapshot = tags(&root).unwrap();
+        let names: Vec<&str> = snapshot.tags.iter().map(|tag| tag.name.as_str()).collect();
+        assert_eq!(names, ["annotated", "lightweight", "zeta"]);
+
+        // A lightweight tag's object is the object it names — here the
+        // commit it was created on, regardless of later HEAD moves.
+        let lightweight = snapshot
+            .tags
+            .iter()
+            .find(|tag| tag.name == "lightweight")
+            .unwrap();
+        assert_eq!(lightweight.object, head);
+        assert_eq!(lightweight.object, rev_hash(&root, "lightweight"));
+        let zeta = snapshot.tags.iter().find(|tag| tag.name == "zeta").unwrap();
+        assert_eq!(zeta.object, rev_hash(&root, "zeta"));
+
+        // An annotated tag's object is the tag object itself — `rev-parse`
+        // of the tag name (no peeling) — never the commit it points at,
+        // proving the snapshot records the tag without expanding it.
+        let annotated = snapshot
+            .tags
+            .iter()
+            .find(|tag| tag.name == "annotated")
+            .unwrap();
+        assert_eq!(annotated.object, rev_hash(&root, "annotated"));
+        assert_ne!(annotated.object, head);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tags_empty_repository_returns_empty_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagsempty", &[("a.txt", "a")]);
+        let snapshot = tags(&root).unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.len(), 0);
+        assert!(snapshot.tags.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tags_from_nested_root_queries_the_whole_repository() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("tagsnested", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        run_git(&root, &["tag", "v1.0"]);
+        let snapshot = tags(&root.join("sub")).unwrap();
+        assert_eq!(snapshot.tags.len(), 1);
+        assert_eq!(snapshot.tags[0].name, "v1.0");
+        assert_eq!(snapshot.tags[0].object, rev_hash(&root, "v1.0"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tags_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("tagsnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = tags(&root).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
