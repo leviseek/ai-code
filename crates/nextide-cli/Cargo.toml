@@ -3,6 +3,7 @@ name = "nextide-cli"
 version.workspace = true
 edition = "2021"
 license = "MIT"
+description = "Minimal CLI smoke and verification entry point for NextIDE"
 
 [dependencies]
 nextide-kernel = { path = "../nextide-kernel" }
