@@ -386,7 +386,7 @@ The only thing the suite ever deletes is its own sandboxes:
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
 ```
 
-Covered scenarios (21 tests):
+Covered scenarios (24 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -411,6 +411,9 @@ Covered scenarios (21 tests):
 | `-OutDir` resolving inside the repository's staging folder (`dist/`) — refused read-only | fail |
 | `-BaseReleaseUrl` with an `http`/`ftp`/other scheme or no scheme (`javascript:`, plain text) — refused read-only before anything is created or downloaded | fail |
 | `-VerifyScriptUrl` with an `http` scheme — refused read-only before anything is created or downloaded | fail |
+| Explicit `-RepositoryRoot` protects the stated root — a custom root, not the one derived from the script's own location — and its `dist/` subtree; the stated root is normalized (`..` and a trailing separator cannot dodge the check) | fail |
+| Explicit `-RepositoryRoot` that does not exist — a typo must never silently disable the protection | fail |
+| Copied script outside the repository layout — the derived root is only trusted when the script really sits in `packaging\windows` of that checkout; the copy fails safely and asks for `-RepositoryRoot` | fail |
 
 The suite runs under both Windows PowerShell 5.1 and PowerShell 7 and exits
 `0` when every test passes, `1` otherwise. Useful switches:
@@ -691,19 +694,28 @@ before anything is created or downloaded: the two folders must be distinct and
 neither may be inside the other (a nested metadata folder would sit inside the
 verified tree and silently bypass the exact-match contract), and the
 repository root and its staging folder (`dist/`) are refused as targets, so
-the "never into the repository" rule is enforced. The defaults resolve under
+the "never into the repository" rule is enforced. The protected repository
+root is configurable: it defaults to the root derived from this script's own
+location (`packaging\windows` under the checkout) and may be stated
+explicitly with `-RepositoryRoot` (normalized to a full path, must be an
+existing directory). The derived default is only trusted when that layout is
+real — the script's sibling `verify-checksums.ps1` is present — so a copy of
+the script run from elsewhere fails and asks for `-RepositoryRoot` instead of
+silently protecting a guessed root. The defaults resolve under
 the current directory, so running from the repository root places the download
 folder inside the checkout — run from a scratch/download directory, or pass
 `-OutDir` / `-MetadataDir`, to keep the repository untouched. Useful switches:
 `-SkipSmoke` (skip only the smoke gate), `-OutDir` / `-MetadataDir` (pick the
 folders — `-OutDir` must be clean, the exact-match contract rejects stale
-extra files), `-Repo` (a fork), and `-BaseReleaseUrl` / `-VerifyScriptUrl`
+extra files), `-Repo` (a fork), `-RepositoryRoot` (state the repository
+checkout to protect — needed when running a copy of the script), and
+`-BaseReleaseUrl` / `-VerifyScriptUrl`
 (mirrors / the sandboxed self-test; `https://` or `file://` URLs only — `http`
 and any other scheme are refused, since the checksum manifest and the consumer
 verifier travel over the same URLs and an unauthenticated transport would let
 a network attacker substitute the binaries and their manifest together). Its
 sandboxed self-test suite is
-[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (21
+[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (24
 cases over `file://` URLs — no network, the repository never touched, the
 seeded consumer verifier is this repository's own `verify-checksums.ps1`; see
 [Testing](#testing)).

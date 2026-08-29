@@ -52,6 +52,13 @@
      20. -BaseReleaseUrl with an http/ftp/other scheme or no
          scheme (javascript:, plain text)                      -> fails, nothing created/downloaded
      21. -VerifyScriptUrl with an http scheme                   -> fails, nothing created/downloaded
+     22. explicit -RepositoryRoot protects the stated root (a
+         custom root, not the derived one) and its dist/ — the
+         stated root is normalized (.. and trailing separator)  -> fails, nothing created/downloaded
+     23. explicit -RepositoryRoot that does not exist           -> fails, nothing created/downloaded
+     24. copied script outside the repository layout fails
+         safely and asks for -RepositoryRoot (the derived root
+         is only trusted when the layout is real)               -> fails, nothing created/downloaded
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -344,14 +351,22 @@ function Invoke-DownloadScript {
         # under test (defaults: the sandbox's file:// URLs). Needed by the
         # URL-scheme cases, which probe http/ftp/other schemes instead.
         [string]$BaseUrlOverride = '',
-        [string]$VerifyUrlOverride = ''
+        [string]$VerifyUrlOverride = '',
+        # Override the -RepositoryRoot handed to the script under test
+        # (default: unset — the script derives it from its own location).
+        # Needed by the repository-protection cases, which probe explicit
+        # roots. -DownloadScriptOverride runs a copy of the script under test
+        # instead (the derived-root fail-safe case).
+        [string]$RepositoryRootOverride = '',
+        [string]$DownloadScriptOverride = ''
     )
     $ChildOut = if ($OutDirOverride)      { $OutDirOverride }      else { $Release.OutDir }
     $ChildMeta = if ($MetadataDirOverride) { $MetadataDirOverride } else { $Release.MetadataDir }
     $ChildBase = if ($BaseUrlOverride)     { $BaseUrlOverride }     else { $Release.BaseUrl }
     $ChildRaw  = if ($VerifyUrlOverride)   { $VerifyUrlOverride }   else { $Release.RawUrl }
+    $ChildScript = if ($DownloadScriptOverride) { $DownloadScriptOverride } else { $DownloadScript }
     $ChildArgs = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $DownloadScript,
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ChildScript,
         '-Tag', $Tag,
         '-Repo', $Repo,
         '-OutDir', $ChildOut,
@@ -359,6 +374,7 @@ function Invoke-DownloadScript {
         '-BaseReleaseUrl', $ChildBase,
         '-VerifyScriptUrl', $ChildRaw
     )
+    if ($RepositoryRootOverride) { $ChildArgs += @('-RepositoryRoot', $RepositoryRootOverride) }
     if ($SkipSmoke) { $ChildArgs += '-SkipSmoke' }
     # Under Windows PowerShell 5.1 a native stderr line becomes an error
     # record, and with EAP=Stop the merged 2>&1 pipeline aborts on the first
@@ -791,6 +807,89 @@ Invoke-Test -Name 'consumer verifier URL with an http scheme is rejected before 
         $Result = Invoke-DownloadScript -Release $Release -VerifyUrlOverride 'http://mirror.example.com/ai-code/raw/v0.1.0/packaging/windows/verify-checksums.ps1'
         Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
         Assert ($Result.Output -match 'https:// or file://') "expected the scheme-gate message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath $Release.OutDir)) 'no download folder may be created'
+        Assert (-not (Test-Path -LiteralPath $Release.MetadataDir)) 'no metadata folder may be created'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 22. Explicit -RepositoryRoot: the repository path protection follows the
+#     stated root — a custom root, not the one derived from this script's own
+#     location — and the stated root is normalized like -OutDir/-MetadataDir,
+#     so '..' components and a trailing separator cannot dodge the check.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'explicit -RepositoryRoot protects the stated root (normalized) and its staging folder' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $Repo = Join-Path $Root 'repo'
+        $null = New-Item -ItemType Directory -Force -Path $Repo
+        # (1) -OutDir equal to the stated root is refused. The stated root is
+        # written with '..' and a trailing separator to prove normalization.
+        $RepoSlashDotDot = Join-Path $Root 'repo\..\repo\'
+        $Result = Invoke-DownloadScript -Release $Release -RepositoryRootOverride $RepoSlashDotDot -OutDirOverride $Repo -MetadataDirOverride (Join-Path $Root 'meta')
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'Refusing to write into the repository') "expected the repo-refusal message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Repo 'nextide-cli.exe'))) 'no binary may be downloaded into the stated repository root'
+        # (2) a folder inside the stated root's staging folder (dist/) is
+        # refused too — the same rule that guards the real checkout.
+        $Result = Invoke-DownloadScript -Release $Release -RepositoryRootOverride $Repo -OutDirOverride (Join-Path $Repo 'dist\windows') -MetadataDirOverride (Join-Path $Root 'meta')
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'Refusing to write into the repository') "expected the repo-refusal message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Repo 'dist'))) 'no folder may be created inside the stated repository root'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 23. Explicit -RepositoryRoot that does not exist: the protection must never
+#     silently guard a path that does not exist (a typo would disable the
+#     guarantee), so it fails read-only with guidance, before anything is
+#     created or downloaded.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'explicit -RepositoryRoot that does not exist is rejected read-only' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $Missing = Join-Path $Root 'no-such-repo'
+        $Result = Invoke-DownloadScript -Release $Release -RepositoryRootOverride $Missing
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'must be an existing directory') "expected the nonexistent-root message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath $Release.OutDir)) 'no download folder may be created'
+        Assert (-not (Test-Path -LiteralPath $Release.MetadataDir)) 'no metadata folder may be created'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 24. Derived-root fail-safe: the repository root defaults to a derivation
+#     from this script's own location (packaging\windows under the checkout)
+#     and is only trusted when that layout is real. A copy of the script run
+#     from elsewhere must fail with guidance and must never silently protect
+#     a guessed root — the default is safe by construction.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'copied script outside the repository layout fails safely and asks for -RepositoryRoot' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $CopyDir = Join-Path $Root 'tools\bin'
+        $null = New-Item -ItemType Directory -Force -Path $CopyDir
+        $Copy = Join-Path $CopyDir 'verify-release-download.ps1'
+        Copy-Item -LiteralPath $DownloadScript -Destination $Copy
+        # The copy's derived root is the sandbox (its own location is
+        # <sandbox>\tools\bin, two parents up is <sandbox>), which has no
+        # packaging\windows layout — the fail-safe must fire before anything
+        # is downloaded.
+        $Result = Invoke-DownloadScript -Release $Release -DownloadScriptOverride $Copy
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'pass -RepositoryRoot') "expected the -RepositoryRoot guidance message: $($Result.Output)"
         Assert (-not (Test-Path -LiteralPath $Release.OutDir)) 'no download folder may be created'
         Assert (-not (Test-Path -LiteralPath $Release.MetadataDir)) 'no metadata folder may be created'
     }

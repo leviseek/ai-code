@@ -109,10 +109,16 @@ bytes it publishes; any failure exits non-zero and says not to run the
 binaries. Downloads are restricted to `https://` and `file://` URLs only —
 `http` and any other scheme are refused (the checksum manifest and the
 consumer verifier travel over the same URLs, so an unauthenticated transport
-would let a network attacker substitute binaries and manifest together). Its
+would let a network attacker substitute binaries and manifest together). The
+"never write into the repository" rule refuses download folders that resolve
+to the repository root or its staging folder (`dist/`); the protected root is
+derived from the script's own location by default (only trusted when the
+script really sits in `packaging/windows` of that checkout, otherwise the
+script fails and asks for it) and can be stated explicitly with
+`-RepositoryRoot` — e.g. when running a copy of the script. Its
 sandboxed self-test suite is
 [`packaging/windows/test-verify-release-download.ps1`](packaging/windows/test-verify-release-download.ps1)
-(21 cases over `file://` URLs — no network, never touches the repository),
+(24 cases over `file://` URLs — no network, never touches the repository),
 and CI runs it as a pre-packaging gate. See the
 [packaging README](packaging/windows/README.md) for the full end-user guide.
 

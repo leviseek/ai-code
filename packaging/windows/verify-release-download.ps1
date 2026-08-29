@@ -30,8 +30,10 @@
          other (the metadata must stay OUTSIDE the verified folder: a nested
          metadata folder would sit inside the verified tree and silently
          bypass the verifier's exact-match contract) and neither inside the
-         repository (the repository root and its staging folder dist/ are
-         refused) — nothing is created or downloaded yet;
+         repository (the repository root — derived from this script's own
+         location, or stated explicitly with -RepositoryRoot — and its
+         staging folder dist/ are refused) — nothing is created or downloaded
+         yet;
       3. create -OutDir (the verified folder) and -MetadataDir (its sibling
          by default, '<OutDir>-metadata');
       4. download the release's manifest.json into MetadataDir and parse it
@@ -57,7 +59,13 @@
     repository: it refuses -OutDir/-MetadataDir that resolve to the
     repository root or to its staging folder (dist/), and it keeps the
     metadata folder out of the verified folder by refusing equal or nested
-    folder pairs. The defaults resolve under the current directory
+    folder pairs. The repository root is derived from this script's own
+    location (packaging\windows under the checkout) and may be stated
+    explicitly with -RepositoryRoot; the derived default is only trusted
+    when that layout is real (the script's sibling verify-checksums.ps1 is
+    present) — a copy of the script run from elsewhere fails and asks for
+    -RepositoryRoot instead of silently protecting a guessed root. The
+    defaults resolve under the current directory
     (.\nextide-download / .\nextide-download-metadata), so running from the
     repository root places the download folder inside the checkout — run from
     a scratch/download directory, or pass -OutDir and -MetadataDir, to keep
@@ -119,11 +127,27 @@
     be an absolute https:// or file:// URL — http and any other scheme are
     refused.
 
+.PARAMETER RepositoryRoot
+    The repository checkout that must never be written into: -OutDir/
+    -MetadataDir resolving to this root or to its staging folder (dist/) are
+    refused. Defaults to the root derived from this script's own location
+    (packaging\windows under the checkout). The derived default is only
+    trusted when that layout is real (the script's sibling
+    verify-checksums.ps1 is present) — a copy of the script run from
+    elsewhere fails and asks for -RepositoryRoot instead of silently
+    protecting a guessed root, so the default is safe by construction. Pass
+    it explicitly when running a copy of the script or a checkout with a
+    different layout. Normalized to a full path and must be an existing
+    directory; validated read-only before anything is created or downloaded.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File packaging\windows\verify-release-download.ps1 -Tag v0.1.0
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File packaging\windows\verify-release-download.ps1 -Tag v0.1.0 -OutDir C:\downloads\nextide -SkipSmoke
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File C:\tools\verify-release-download.ps1 -Tag v0.1.0 -RepositoryRoot C:\work\ai-code
 #>
 [CmdletBinding()]
 param(
@@ -133,7 +157,8 @@ param(
     [string]$MetadataDir = '',
     [switch]$SkipSmoke,
     [string]$BaseReleaseUrl = '',
-    [string]$VerifyScriptUrl = ''
+    [string]$VerifyScriptUrl = '',
+    [string]$RepositoryRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -265,12 +290,38 @@ if (Test-PathWithin $OutDir $MetadataDir) {
 }
 
 # The documented 'never into the repository' rule, enforced: refuse the
-# repository root and its staging folder (dist/) as download targets.
-$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$StagingRoot = Join-Path $RepoRoot 'dist'
+# repository root and its staging folder (dist/) as download targets. The
+# root is derived from this script's own location (packaging\windows under
+# the checkout) by default; -RepositoryRoot states it explicitly.
+$RepositoryRootDerived = $false
+if (-not $RepositoryRoot) {
+    $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $RepositoryRootDerived = $true
+}
+try {
+    $RepositoryRoot = [System.IO.Path]::GetFullPath($RepositoryRoot)
+}
+catch {
+    Fail "Invalid -RepositoryRoot path: $($_.Exception.Message)"
+}
+if (-not (Test-Path -LiteralPath $RepositoryRoot -PathType Container)) {
+    Fail "-RepositoryRoot must be an existing directory (the repository checkout that must never be written into), got: '$RepositoryRoot'"
+}
+if ($RepositoryRootDerived) {
+    # Fail-safe default: the derived root is only trusted when this script
+    # really sits in packaging\windows of that checkout (its sibling
+    # verify-checksums.ps1 is present). A copy of the script run from
+    # elsewhere derives a guessed root; protecting the wrong folder would
+    # silently disable the guarantee, so fail and ask for -RepositoryRoot
+    # instead — the default is safe by construction.
+    if (-not (Test-Path -LiteralPath (Join-Path $RepositoryRoot 'packaging\windows\verify-checksums.ps1') -PathType Leaf)) {
+        Fail "Cannot trust the repository root derived from this script's location ('$RepositoryRoot'): the script is expected to live in packaging\windows under the repository root, next to verify-checksums.ps1. Pass -RepositoryRoot <path> explicitly to state the repository checkout that must never be written into."
+    }
+}
+$StagingRoot = Join-Path $RepositoryRoot 'dist'
 foreach ($Folder in @($OutDir, $MetadataDir)) {
-    if ((Test-SamePath $Folder $RepoRoot) -or (Test-SamePath $Folder $StagingRoot) -or (Test-PathWithin $Folder $StagingRoot)) {
-        Fail "Refusing to write into the repository: -OutDir/-MetadataDir must not resolve to the repository root or its staging folder (dist/), got: '$Folder'. Run from a scratch/download directory, or pass -OutDir/-MetadataDir outside the repository checkout."
+    if ((Test-SamePath $Folder $RepositoryRoot) -or (Test-SamePath $Folder $StagingRoot) -or (Test-PathWithin $Folder $StagingRoot)) {
+        Fail "Refusing to write into the repository: -OutDir/-MetadataDir must not resolve to the repository root ('$RepositoryRoot') or its staging folder (dist/), got: '$Folder'. Run from a scratch/download directory, or pass -OutDir/-MetadataDir outside the repository checkout."
     }
 }
 
@@ -278,6 +329,7 @@ Write-Host "==> Verifying GitHub Release $Tag ($Repo)"
 Write-Host "  release assets : $BaseReleaseUrl"
 Write-Host "  verified folder: $OutDir"
 Write-Host "  metadata folder: $MetadataDir"
+Write-Host "  repository root: $RepositoryRoot (never written into)"
 
 # 3. Create the two folders. All downloads land here — nothing else is ever
 #    written.
