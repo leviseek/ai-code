@@ -386,7 +386,7 @@ The only thing the suite ever deletes is its own sandboxes:
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
 ```
 
-Covered scenarios (19 tests):
+Covered scenarios (21 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -409,6 +409,8 @@ Covered scenarios (19 tests):
 | Verified folder nested inside the metadata folder — symmetric rejection | fail |
 | `-OutDir` resolving to the repository root — refused read-only, nothing written into the repository | fail |
 | `-OutDir` resolving inside the repository's staging folder (`dist/`) — refused read-only | fail |
+| `-BaseReleaseUrl` with an `http`/`ftp`/other scheme or no scheme (`javascript:`, plain text) — refused read-only before anything is created or downloaded | fail |
+| `-VerifyScriptUrl` with an `http` scheme — refused read-only before anything is created or downloaded | fail |
 
 The suite runs under both Windows PowerShell 5.1 and PowerShell 7 and exits
 `0` when every test passes, `1` otherwise. Useful switches:
@@ -696,8 +698,12 @@ folder inside the checkout — run from a scratch/download directory, or pass
 `-SkipSmoke` (skip only the smoke gate), `-OutDir` / `-MetadataDir` (pick the
 folders — `-OutDir` must be clean, the exact-match contract rejects stale
 extra files), `-Repo` (a fork), and `-BaseReleaseUrl` / `-VerifyScriptUrl`
-(mirrors / the sandboxed self-test). Its sandboxed self-test suite is
-[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (19
+(mirrors / the sandboxed self-test; `https://` or `file://` URLs only — `http`
+and any other scheme are refused, since the checksum manifest and the consumer
+verifier travel over the same URLs and an unauthenticated transport would let
+a network attacker substitute the binaries and their manifest together). Its
+sandboxed self-test suite is
+[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (21
 cases over `file://` URLs — no network, the repository never touched, the
 seeded consumer verifier is this repository's own `verify-checksums.ps1`; see
 [Testing](#testing)).

@@ -22,7 +22,9 @@
     release that renamed its checksum file keeps verifying instead of breaking.
 
     Flow:
-      1. validate -Tag (must be exactly v<semver>) and -Repo (owner/name);
+      1. validate -Tag (must be exactly v<semver>), -Repo (owner/name) and the
+         -BaseReleaseUrl/-VerifyScriptUrl schemes (each must be an absolute
+         https:// or file:// URL — http and any other scheme are refused);
       2. resolve -OutDir/-MetadataDir to full paths and validate their shape
          read-only — the two folders must be distinct, neither inside the
          other (the metadata must stay OUTSIDE the verified folder: a nested
@@ -59,10 +61,14 @@
     (.\nextide-download / .\nextide-download-metadata), so running from the
     repository root places the download folder inside the checkout — run from
     a scratch/download directory, or pass -OutDir and -MetadataDir, to keep
-    the repository untouched. It never executes a downloaded binary before
-    its checksum has been verified, it never executes nextide-shell.exe at
-    all, and the only executable it runs is the downloaded nextide-cli.exe
-    smoke flow.
+    the repository untouched. It downloads only over https (real releases) or
+    file (local mirrors, the sandboxed self-test) — http and any other scheme
+    are refused, because the checksum manifest and the consumer verifier
+    travel over the same URLs and an unauthenticated transport would let a
+    network attacker substitute binaries and manifest together. It never
+    executes a downloaded binary before its checksum has been verified, it
+    never executes nextide-shell.exe at all, and the only executable it runs
+    is the downloaded nextide-cli.exe smoke flow.
 
 .PARAMETER Tag
     The GitHub Release tag to verify, e.g. v0.1.0. Must be exactly
@@ -101,11 +107,17 @@
     Override the base URL of the release assets (default:
     https://github.com/<Repo>/releases/download/<Tag>). Intended for mirrors
     and for the sandboxed self-test (file:// URIs); not needed for normal use.
+    Must be an absolute https:// or file:// URL — http and any other scheme
+    are refused: the checksum manifest and the consumer verifier are fetched
+    over the same URLs, so an unauthenticated transport would let a network
+    attacker substitute the binaries and their manifest together.
 
 .PARAMETER VerifyScriptUrl
     Override the URL of the consumer verifier (default:
     https://raw.githubusercontent.com/<Repo>/<Tag>/packaging/windows/verify-checksums.ps1).
-    Same override intent as -BaseReleaseUrl.
+    Same override intent as -BaseReleaseUrl, and the same scheme rule: must
+    be an absolute https:// or file:// URL — http and any other scheme are
+    refused.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File packaging\windows\verify-release-download.ps1 -Tag v0.1.0
@@ -174,6 +186,31 @@ if ($Repo -notmatch '^[^\s/]+/[^\s/]+$') {
 
 if (-not $BaseReleaseUrl)  { $BaseReleaseUrl  = "https://github.com/$Repo/releases/download/$Tag" }
 if (-not $VerifyScriptUrl) { $VerifyScriptUrl = "https://raw.githubusercontent.com/$Repo/$Tag/packaging/windows/verify-checksums.ps1" }
+
+# The download transport is the release verifier's integrity channel: the two
+# binaries, the checksum manifest and the consumer verifier all travel over
+# these URLs, so an unauthenticated transport (http, ftp, ...) would let a
+# network attacker substitute the binaries AND their checksum manifest
+# together — verification would then "pass" on attacker-chosen bytes. Only
+# https (real releases) and file (local mirrors, the sandboxed self-test) are
+# allowed; anything else is refused read-only, before any folder is created or
+# file downloaded.
+function Test-AllowedDownloadUrl {
+    # True when $Url is an absolute URI whose scheme is exactly https or file
+    # (case-insensitive).
+    param([Parameter(Mandatory)][string]$Url)
+    $Uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$Uri)) { return $false }
+    return ($Uri.Scheme -eq 'https') -or ($Uri.Scheme -eq 'file')
+}
+foreach ($Entry in @(
+    @{ Url = $BaseReleaseUrl;  What = 'release asset' },
+    @{ Url = $VerifyScriptUrl; What = 'consumer verifier' }
+)) {
+    if (-not (Test-AllowedDownloadUrl $Entry.Url)) {
+        Fail "The $($Entry.What) URL must be an absolute https:// or file:// URL — a release verifier must never download over an unauthenticated channel (http and any other scheme are refused) — got: '$($Entry.Url)'"
+    }
+}
 
 # 2. Resolve -OutDir/-MetadataDir to full paths and validate their shape —
 #    all read-only, before anything is created or downloaded. The metadata

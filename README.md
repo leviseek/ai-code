@@ -106,9 +106,13 @@ default), asserts the tag is exactly `v<product.version>`, re-verifies the
 download read-only with `verify-checksums.ps1` (fetched from the same tag) and
 smoke-tests the downloaded CLI — the same two gates CI runs against the exact
 bytes it publishes; any failure exits non-zero and says not to run the
-binaries. Its sandboxed self-test suite is
+binaries. Downloads are restricted to `https://` and `file://` URLs only —
+`http` and any other scheme are refused (the checksum manifest and the
+consumer verifier travel over the same URLs, so an unauthenticated transport
+would let a network attacker substitute binaries and manifest together). Its
+sandboxed self-test suite is
 [`packaging/windows/test-verify-release-download.ps1`](packaging/windows/test-verify-release-download.ps1)
-(19 cases over `file://` URLs — no network, never touches the repository),
+(21 cases over `file://` URLs — no network, never touches the repository),
 and CI runs it as a pre-packaging gate. See the
 [packaging README](packaging/windows/README.md) for the full end-user guide.
 

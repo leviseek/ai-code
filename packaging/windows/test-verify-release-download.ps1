@@ -49,6 +49,9 @@
      17. verified folder nested inside the metadata folder      -> fails, nothing created
      18. -OutDir resolving to the repository root               -> fails, nothing created/downloaded
      19. -OutDir resolving inside the repository's dist staging -> fails, nothing created/downloaded
+     20. -BaseReleaseUrl with an http/ftp/other scheme or no
+         scheme (javascript:, plain text)                      -> fails, nothing created/downloaded
+     21. -VerifyScriptUrl with an http scheme                   -> fails, nothing created/downloaded
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -336,18 +339,25 @@ function Invoke-DownloadScript {
         # (defaults: the sandbox's own folders). Needed by the folder-shape
         # cases, which probe equal/nested/repository paths instead.
         [string]$OutDirOverride = '',
-        [string]$MetadataDirOverride = ''
+        [string]$MetadataDirOverride = '',
+        # Override the -BaseReleaseUrl/-VerifyScriptUrl handed to the script
+        # under test (defaults: the sandbox's file:// URLs). Needed by the
+        # URL-scheme cases, which probe http/ftp/other schemes instead.
+        [string]$BaseUrlOverride = '',
+        [string]$VerifyUrlOverride = ''
     )
     $ChildOut = if ($OutDirOverride)      { $OutDirOverride }      else { $Release.OutDir }
     $ChildMeta = if ($MetadataDirOverride) { $MetadataDirOverride } else { $Release.MetadataDir }
+    $ChildBase = if ($BaseUrlOverride)     { $BaseUrlOverride }     else { $Release.BaseUrl }
+    $ChildRaw  = if ($VerifyUrlOverride)   { $VerifyUrlOverride }   else { $Release.RawUrl }
     $ChildArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $DownloadScript,
         '-Tag', $Tag,
         '-Repo', $Repo,
         '-OutDir', $ChildOut,
         '-MetadataDir', $ChildMeta,
-        '-BaseReleaseUrl', $Release.BaseUrl,
-        '-VerifyScriptUrl', $Release.RawUrl
+        '-BaseReleaseUrl', $ChildBase,
+        '-VerifyScriptUrl', $ChildRaw
     )
     if ($SkipSmoke) { $ChildArgs += '-SkipSmoke' }
     # Under Windows PowerShell 5.1 a native stderr line becomes an error
@@ -733,6 +743,56 @@ Invoke-Test -Name '-OutDir resolving inside the repository staging folder (dist/
         $Result = Invoke-DownloadScript -Release $Release -OutDirOverride $Dist -MetadataDirOverride (Join-Path $Root 'meta')
         Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
         Assert ($Result.Output -match 'Refusing to write into the repository') "expected the repo-refusal message: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 20. Download URL scheme gate: only https and file are allowed; http/ftp and
+#     any other scheme (and non-absolute URLs) are refused read-only, before
+#     anything is created or downloaded. The binaries, the checksum manifest
+#     and the consumer verifier all travel over these URLs, so an
+#     unauthenticated transport would let a network attacker substitute the
+#     binaries AND their manifest together — the verifier must never download
+#     over one.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'release asset URL with an http/ftp/other scheme or no scheme is rejected before any download' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        foreach ($BadUrl in @(
+            'http://mirror.example.com/ai-code/releases/download/v0.1.0',
+            'ftp://mirror.example.com/ai-code/releases/download/v0.1.0',
+            'javascript:alert(1)',
+            'not a url'
+        )) {
+            $Result = Invoke-DownloadScript -Release $Release -BaseUrlOverride $BadUrl
+            Assert ($Result.ExitCode -ne 0) "'$BadUrl': expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+            Assert ($Result.Output -match 'https:// or file://') "'$BadUrl': expected the scheme-gate message: $($Result.Output)"
+            Assert (-not (Test-Path -LiteralPath $Release.OutDir)) "'$BadUrl': no download folder may be created"
+            Assert (-not (Test-Path -LiteralPath $Release.MetadataDir)) "'$BadUrl': no metadata folder may be created"
+        }
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 21. Same scheme gate for the consumer verifier URL: the verifier script is
+#     fetched over the same integrity channel, so http is refused there too.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'consumer verifier URL with an http scheme is rejected before any download' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $Result = Invoke-DownloadScript -Release $Release -VerifyUrlOverride 'http://mirror.example.com/ai-code/raw/v0.1.0/packaging/windows/verify-checksums.ps1'
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'https:// or file://') "expected the scheme-gate message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath $Release.OutDir)) 'no download folder may be created'
+        Assert (-not (Test-Path -LiteralPath $Release.MetadataDir)) 'no metadata folder may be created'
     }
     finally {
         Remove-Sandbox $Root

@@ -40,7 +40,7 @@ jobs:
     # release_channel) — twice, with no duplicated logic: first the sandboxed
     # self-test gates (test-build.ps1, 26 cases, plus
     # test-verify-checksums.ps1, 14 cases, for the consumer-side checksum
-    # verifier, and test-verify-release-download.ps1, 19 cases, for the
+    # verifier, and test-verify-release-download.ps1, 21 cases, for the
     # end-user one-command release download verifier) prove the scripts
     # reject every violation, then build.ps1
     # -SkipBuild re-runs the same read-only
@@ -159,7 +159,7 @@ jobs:
       - name: Verify end-user release download script (test-verify-release-download.ps1 gate)
         # Pre-packaging self-test gate for the end-user one-command release
         # download verifier (packaging/windows/verify-release-download.ps1).
-        # The sandboxed suite (19 cases, zero framework) proves the whole
+        # The sandboxed suite (21 cases, zero framework) proves the whole
         # consumer flow — download the release's two binaries, manifest.json
         # and checksum manifest, resolve the checksum file name from the
         # release's own manifest.json (stage.checksum_file, never a hardcoded
@@ -180,7 +180,14 @@ jobs:
         # downloaded (a nested metadata folder would sit inside the verified
         # tree and silently bypass the exact-match contract), and the
         # repository root / its staging folder (dist/) are refused as
-        # download targets. A failing test stops the
+        # download targets. The download URLs themselves are scheme-gated
+        # read-only: -BaseReleaseUrl/-VerifyScriptUrl must be absolute
+        # https:// or file:// URLs — http/ftp and any other scheme (and
+        # non-absolute URLs) are refused before anything is created or
+        # downloaded, because the binaries, the checksum manifest and the
+        # consumer verifier all travel over those URLs and an unauthenticated
+        # transport would let a network attacker substitute the binaries AND
+        # their manifest together. A failing test stops the
         # run before anything is built or staged.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
 
