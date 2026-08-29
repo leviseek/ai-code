@@ -146,7 +146,7 @@ jobs:
         # cases, zero framework) proves the script accepts a consistent staging
         # directory + SHA256SUMS.txt (happy path, GNU-style lowercase hashes,
         # CRLF line endings, a custom -ChecksumFile name), rejects a bad hash,
-        # a missing file, a malformed line, an empty manifest, a
+        # a missing file, a malformed line, missing/empty manifests, a
         # path-escaped/duplicate entry and an extra unlisted file, and never
         # writes to the directory it verifies (read-only snapshot assertion).
         # Every case runs the verifier against a throwaway sandbox under

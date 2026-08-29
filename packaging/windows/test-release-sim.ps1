@@ -2,15 +2,15 @@
 <#
 .SYNOPSIS
     Self-contained sandbox simulation tests for the CI release job
-    (.github/workflows/ci.yml, `release` job): tag/version rejection rules and
-    the release file manifest.
+    (.github/workflows/ci.yml, `release` job): tag/version rejection rules,
+    the release file manifest and the publish step's attachment naming.
 
 .DESCRIPTION
     Simulates the release job's gate rules in a pure PowerShell sandbox with no
     external test framework, no network access and no GitHub Release ever
     being created. The release job itself is inline pwsh in the workflow (it
     consumes GitHub Actions artifacts and calls the GitHub CLI at the very
-    end), so this suite re-implements the two rule sets it gates as plain
+    end), so this suite re-implements the three rule sets it gates as plain
     functions and proves them against throwaway sandbox copies under the
     sandbox root (default: $env:TEMP) — the real repository is never written,
     renamed or removed, and the only child process ever launched is the
