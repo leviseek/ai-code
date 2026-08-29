@@ -15,7 +15,7 @@ install anything.
 | Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
-| CI packaging job | Not yet — later phase |
+| CI packaging job | Done — `.github/workflows/ci.yml` `packaging-windows` job: runs after the `ci` checks pass, builds the release binaries, runs this script with `-SkipBuild`, uploads `dist/windows` as an artifact |
 
 ## Layout
 
@@ -191,5 +191,11 @@ After a successful run, smoke-test the staged binaries from `dist\windows\`:
 ```
 
 Note: `cargo test --workspace` and `cargo clippy` are **not** part of this
-script — they remain covered by the CI workflow (`.github/workflows/ci.yml`),
-which is unchanged.
+script — they remain covered by the `ci` job of the CI workflow
+(`.github/workflows/ci.yml`), which is unchanged. A second `packaging-windows`
+job was added to that workflow: it runs only after the `ci` checks pass
+(`needs: ci`, fail fast), builds the release binaries with
+`cargo build --release`, invokes this script with `-SkipBuild` to stage and
+verify them under `dist/windows/`, and uploads the staged directory as the
+`nextide-windows-dist` workflow artifact. That job is what exercises the
+real-repository `cargo build --release` success path end to end on CI.

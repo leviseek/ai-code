@@ -80,7 +80,7 @@ A minimal Windows packaging baseline lives in [`packaging/windows/`](packaging/w
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 ```
 
-The script verifies the release build succeeds, validates the manifest, checks that `product.version` matches the Cargo.toml workspace version, checks that every manifest artifact exists before copying, and after staging verifies each staged copy matches its release binary by size and SHA-256, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. Installer, signing, and a CI packaging job are later phases (see `STATUS.md`).
+The script verifies the release build succeeds, validates the manifest, checks that `product.version` matches the Cargo.toml workspace version, checks that every manifest artifact exists before copying, and after staging verifies each staged copy matches its release binary by size and SHA-256, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. CI runs the packaging job after the checks pass (see [CI](#ci)); installer and signing are later phases (see `STATUS.md`).
 
 The baseline is self-tested by [`packaging/windows/test-build.ps1`](packaging/windows/test-build.ps1) — a zero-framework PowerShell suite that runs `build.ps1` against throwaway sandbox copies under `%TEMP%` (the real repository is never modified) and covers the `-SkipBuild` happy path plus every failure mode: missing manifest, missing artifact, wrong pinned hash, path escapes (`..` and rooted paths), invalid JSON, file-name mismatch, unsupported schema version, a failed release build, a `product.version`/Cargo.toml workspace-version mismatch, a missing root `Cargo.toml`, and a `Cargo.toml` without a `[workspace.package]` version. It also proves pre-existing files in `dist\windows\` are preserved (the script only overwrites, never deletes):
 
@@ -98,4 +98,8 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on a `windows-latest` runner
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 
-The workflow installs only the stable Rust toolchain (with `rustfmt` and `clippy` components); the workspace has no external dependencies and nothing else is downloaded. See the [workflow status](https://github.com/leviseek/ai-code/actions/workflows/ci.yml) for current runs.
+The workflow installs only the stable Rust toolchain (with `rustfmt` and `clippy` components); the workspace has no external dependencies and nothing else is downloaded.
+
+A second job, `packaging-windows`, runs only after the checks pass (`needs: ci` — a failing check stops the run before packaging starts). It builds the release binaries with `cargo build --release`, stages them into `dist/windows/` with `packaging/windows/build.ps1 -SkipBuild` (which validates the manifest and verifies each staged artifact by size and SHA-256), and uploads the staged directory as the `nextide-windows-dist` workflow artifact (the upload fails if the directory is empty). `dist/` is git-ignored, so the artifact is how the packaged binaries reach later release/publish steps.
+
+See the [workflow status](https://github.com/leviseek/ai-code/actions/workflows/ci.yml) for current runs.

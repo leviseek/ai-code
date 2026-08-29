@@ -28,3 +28,31 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  packaging-windows:
+    # Produce and upload the Windows release artifacts (dist/windows). Runs
+    # only after the checks above pass: `needs: ci` makes the run fail fast,
+    # so a failing fmt/clippy/test check stops the pipeline before packaging
+    # ever starts. The release binaries are built here (cargo build --release)
+    # and the packaging script is then invoked with -SkipBuild, which stages
+    # and verifies the freshly built artifacts without rebuilding.
+    needs: ci
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Stage release artifacts into dist/windows (-SkipBuild)
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -SkipBuild
+
+      - name: Upload dist/windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextide-windows-dist
+          path: dist/windows
+          if-no-files-found: error
