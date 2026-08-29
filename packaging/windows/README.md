@@ -386,7 +386,7 @@ The only thing the suite ever deletes is its own sandboxes:
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
 ```
 
-Covered scenarios (14 tests):
+Covered scenarios (19 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -404,6 +404,11 @@ Covered scenarios (14 tests):
 | Stale extra file in a pre-existing download folder — the verifier's exact-match contract rejects it (clean-folder contract working) | fail |
 | Zero-byte CLI asset — the checksum manifest still matches, the non-empty assertion closes the gap (the release job's own checklist rule) | fail |
 | Non-runnable CLI — checksums pass, the smoke gate fails, success banner never printed | fail |
+| `-OutDir` and `-MetadataDir` resolving to the same folder — rejected before anything is created or downloaded (the metadata would land inside the verified folder) | fail |
+| Metadata folder nested inside the verified folder — rejected before any download (a nested metadata folder would sit inside the verified tree and silently bypass the exact-match contract) | fail |
+| Verified folder nested inside the metadata folder — symmetric rejection | fail |
+| `-OutDir` resolving to the repository root — refused read-only, nothing written into the repository | fail |
+| `-OutDir` resolving inside the repository's staging folder (`dist/`) — refused read-only | fail |
 
 The suite runs under both Windows PowerShell 5.1 and PowerShell 7 and exits
 `0` when every test passes, `1` otherwise. Useful switches:
@@ -679,13 +684,20 @@ against the exact bytes it publishes. Any failure exits non-zero with a
 message and prints "Do NOT run the downloaded binaries". The script is the
 scripted form of the manual steps below — it never re-implements checksum
 verification or the smoke flow, it delegates to them. It is the one consumer
-step that writes: only into `-OutDir` and `-MetadataDir`, never into the
-repository. Useful switches: `-SkipSmoke` (skip only the smoke gate),
-`-OutDir` / `-MetadataDir` (pick the folders — `-OutDir` must be clean, the
-exact-match contract rejects stale extra files), `-Repo` (a fork), and
-`-BaseReleaseUrl` / `-VerifyScriptUrl` (mirrors / the sandboxed self-test).
-Its sandboxed self-test suite is
-[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (14
+step that writes: only into `-OutDir` and `-MetadataDir` — validated read-only
+before anything is created or downloaded: the two folders must be distinct and
+neither may be inside the other (a nested metadata folder would sit inside the
+verified tree and silently bypass the exact-match contract), and the
+repository root and its staging folder (`dist/`) are refused as targets, so
+the "never into the repository" rule is enforced. The defaults resolve under
+the current directory, so running from the repository root places the download
+folder inside the checkout — run from a scratch/download directory, or pass
+`-OutDir` / `-MetadataDir`, to keep the repository untouched. Useful switches:
+`-SkipSmoke` (skip only the smoke gate), `-OutDir` / `-MetadataDir` (pick the
+folders — `-OutDir` must be clean, the exact-match contract rejects stale
+extra files), `-Repo` (a fork), and `-BaseReleaseUrl` / `-VerifyScriptUrl`
+(mirrors / the sandboxed self-test). Its sandboxed self-test suite is
+[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (19
 cases over `file://` URLs — no network, the repository never touched, the
 seeded consumer verifier is this repository's own `verify-checksums.ps1`; see
 [Testing](#testing)).

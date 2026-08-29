@@ -44,6 +44,11 @@
      12. stale extra file in a pre-existing OutDir              -> fails (clean-folder contract)
      13. zero-byte CLI asset                                    -> fails (non-empty assertion)
      14. non-runnable CLI smoke                                 -> fails, never verified
+     15. -OutDir and -MetadataDir resolving to the same folder  -> fails, nothing created
+     16. metadata folder nested inside the verified folder      -> fails, nothing created
+     17. verified folder nested inside the metadata folder      -> fails, nothing created
+     18. -OutDir resolving to the repository root               -> fails, nothing created/downloaded
+     19. -OutDir resolving inside the repository's dist staging -> fails, nothing created/downloaded
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -326,14 +331,21 @@ function Invoke-DownloadScript {
         [Parameter(Mandatory)][pscustomobject]$Release,
         [string]$Tag = 'v0.1.0',
         [string]$Repo = 'acme/nextide',
-        [switch]$SkipSmoke
+        [switch]$SkipSmoke,
+        # Override the -OutDir/-MetadataDir handed to the script under test
+        # (defaults: the sandbox's own folders). Needed by the folder-shape
+        # cases, which probe equal/nested/repository paths instead.
+        [string]$OutDirOverride = '',
+        [string]$MetadataDirOverride = ''
     )
+    $ChildOut = if ($OutDirOverride)      { $OutDirOverride }      else { $Release.OutDir }
+    $ChildMeta = if ($MetadataDirOverride) { $MetadataDirOverride } else { $Release.MetadataDir }
     $ChildArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $DownloadScript,
         '-Tag', $Tag,
         '-Repo', $Repo,
-        '-OutDir', $Release.OutDir,
-        '-MetadataDir', $Release.MetadataDir,
+        '-OutDir', $ChildOut,
+        '-MetadataDir', $ChildMeta,
         '-BaseReleaseUrl', $Release.BaseUrl,
         '-VerifyScriptUrl', $Release.RawUrl
     )
@@ -618,6 +630,109 @@ Invoke-Test -Name 'non-runnable CLI fails the smoke gate' -Body {
         Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
         Assert ($Result.Output -match 'smoke') "expected a smoke-failure message: $($Result.Output)"
         Assert ($Result.Output -notmatch '==> OK\. Release v0\.1\.0 verified') 'the download script success banner must not appear'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 15. Folder-shape validation (read-only, before anything is created or
+#     downloaded): -OutDir and -MetadataDir must be two distinct folders.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name '-OutDir and -MetadataDir resolving to the same folder are rejected' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $Shared = Join-Path $Root 'shared'
+        $Result = Invoke-DownloadScript -Release $Release -OutDirOverride $Shared -MetadataDirOverride $Shared
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'two different folders') "expected the distinct-folders message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath $Shared)) 'no folder may be created before the shape validation'
+        Assert ($Result.Output -notmatch 'Smoke-testing the downloaded CLI') 'no download/smoke may happen'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 16. Metadata folder nested inside the verified folder: the consumer verifier
+#     lists only top-level files, so the metadata would sit inside the
+#     verified tree and silently bypass the exact-match contract — rejected
+#     up front, before any download.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'metadata folder nested inside the verified folder is rejected' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $Out = Join-Path $Root 'out-nested'
+        $Meta = Join-Path $Out 'meta'
+        $Result = Invoke-DownloadScript -Release $Release -OutDirOverride $Out -MetadataDirOverride $Meta
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'must be outside the verified folder') "expected the outside-the-verified-folder message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath $Out)) 'no folder may be created before the shape validation'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 17. Symmetric nesting: the verified folder inside the metadata folder.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'verified folder nested inside the metadata folder is rejected' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $Meta = Join-Path $Root 'meta-out'
+        $Out = Join-Path $Meta 'out'
+        $Result = Invoke-DownloadScript -Release $Release -OutDirOverride $Out -MetadataDirOverride $Meta
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'must be outside the metadata folder') "expected the outside-the-metadata-folder message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath $Meta)) 'no folder may be created before the shape validation'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 18. The documented 'never into the repository' rule, enforced: -OutDir
+#     resolving to the repository root is refused. The script under test
+#     derives the repo root from its own location, so -OutDir <real repo
+#     root> must fail read-only, before anything is created or downloaded —
+#     nothing in the real repository is ever touched.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name '-OutDir resolving to the repository root is rejected (nothing written)' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        $Result = Invoke-DownloadScript -Release $Release -OutDirOverride $RepoRoot -MetadataDirOverride (Join-Path $Root 'meta')
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'Refusing to write into the repository') "expected the repo-refusal message: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $RepoRoot 'nextide-cli.exe'))) 'no binary may be downloaded into the repository'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $RepoRoot 'manifest.json'))) 'no metadata may be downloaded into the repository'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 19. Same rule for the repository's staging folder: -OutDir resolving inside
+#     dist/ (where the release artifacts are staged) is refused.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name '-OutDir resolving inside the repository staging folder (dist/) is rejected' -Body {
+    $Root = New-Sandbox
+    try {
+        $Release = New-FakeRelease -Root $Root -RunnableCli
+        $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        $Dist = Join-Path $RepoRoot 'dist\windows'
+        $Result = Invoke-DownloadScript -Release $Release -OutDirOverride $Dist -MetadataDirOverride (Join-Path $Root 'meta')
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'Refusing to write into the repository') "expected the repo-refusal message: $($Result.Output)"
     }
     finally {
         Remove-Sandbox $Root

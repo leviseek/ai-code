@@ -108,7 +108,7 @@ smoke-tests the downloaded CLI — the same two gates CI runs against the exact
 bytes it publishes; any failure exits non-zero and says not to run the
 binaries. Its sandboxed self-test suite is
 [`packaging/windows/test-verify-release-download.ps1`](packaging/windows/test-verify-release-download.ps1)
-(14 cases over `file://` URLs — no network, never touches the repository),
+(19 cases over `file://` URLs — no network, never touches the repository),
 and CI runs it as a pre-packaging gate. See the
 [packaging README](packaging/windows/README.md) for the full end-user guide.
 

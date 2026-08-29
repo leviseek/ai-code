@@ -23,30 +23,46 @@
 
     Flow:
       1. validate -Tag (must be exactly v<semver>) and -Repo (owner/name);
-      2. create -OutDir (the verified folder) and -MetadataDir (its sibling);
-      3. download the release's manifest.json into MetadataDir and parse it
+      2. resolve -OutDir/-MetadataDir to full paths and validate their shape
+         read-only — the two folders must be distinct, neither inside the
+         other (the metadata must stay OUTSIDE the verified folder: a nested
+         metadata folder would sit inside the verified tree and silently
+         bypass the verifier's exact-match contract) and neither inside the
+         repository (the repository root and its staging folder dist/ are
+         refused) — nothing is created or downloaded yet;
+      3. create -OutDir (the verified folder) and -MetadataDir (its sibling
+         by default, '<OutDir>-metadata');
+      4. download the release's manifest.json into MetadataDir and parse it
          read-only: it must be valid JSON, product.version must be non-blank
          and exactly the -Tag version, and stage.checksum_file must be a
          non-blank plain file name — the tag/version and checksum-file-name
          rules the CI release job enforces, checked here on the consumer side;
-      4. download nextide-cli.exe, nextide-shell.exe and the declared checksum
+      5. download nextide-cli.exe, nextide-shell.exe and the declared checksum
          file into OutDir, each proven present and non-empty after download;
-      5. download verify-checksums.ps1 from the same tag into MetadataDir —
+      6. download verify-checksums.ps1 from the same tag into MetadataDir —
          outside the verified folder, because the checksum manifest covers
          only the two binaries and the verifier enforces an exact-match
          contract: any unlisted file in the verified folder, the verifier
          itself included, is rejected;
-      6. run the downloaded verifier read-only against OutDir (-DistDir) with
+      7. run the downloaded verifier read-only against OutDir (-DistDir) with
          the declared checksum file (-ChecksumFile);
-      7. unless -SkipSmoke, run the downloaded nextide-cli.exe smoke — the
+      8. unless -SkipSmoke, run the downloaded nextide-cli.exe smoke — the
          editor-kernel smoke flow, the same gate CI runs;
-      8. print a summary and exit 0.
+      9. print a summary and exit 0.
 
     Safety: this script downloads files — the one consumer step that must
     write — and writes only into -OutDir and -MetadataDir, never into the
-    repository. It never executes a downloaded binary before its checksum has
-    been verified, it never executes nextide-shell.exe at all, and the only
-    executable it runs is the downloaded nextide-cli.exe smoke flow.
+    repository: it refuses -OutDir/-MetadataDir that resolve to the
+    repository root or to its staging folder (dist/), and it keeps the
+    metadata folder out of the verified folder by refusing equal or nested
+    folder pairs. The defaults resolve under the current directory
+    (.\nextide-download / .\nextide-download-metadata), so running from the
+    repository root places the download folder inside the checkout — run from
+    a scratch/download directory, or pass -OutDir and -MetadataDir, to keep
+    the repository untouched. It never executes a downloaded binary before
+    its checksum has been verified, it never executes nextide-shell.exe at
+    all, and the only executable it runs is the downloaded nextide-cli.exe
+    smoke flow.
 
 .PARAMETER Tag
     The GitHub Release tag to verify, e.g. v0.1.0. Must be exactly
@@ -57,17 +73,26 @@
 
 .PARAMETER OutDir
     The clean folder the two binaries and the checksum manifest are
-    downloaded into and verified against. Defaults to .\nextide-download.
-    The folder must hold nothing else when verification starts: the verifier
-    enforces an exact-match contract, so any pre-existing extra file makes
-    verification fail (that failure is the contract working — use a fresh
-    folder, or remove stale files first).
+    downloaded into and verified against. Defaults to .\nextide-download
+    (resolved against the current directory). The folder must hold nothing
+    else when verification starts: the verifier enforces an exact-match
+    contract, so any pre-existing extra file makes verification fail (that
+    failure is the contract working — use a fresh folder, or remove stale
+    files first). Must be a distinct folder from -MetadataDir, and neither
+    may be inside the other — validated read-only before anything is created
+    or downloaded. The repository root and its staging folder (dist/) are
+    refused as targets.
 
 .PARAMETER MetadataDir
     Folder outside OutDir that receives the release's manifest.json and the
-    downloaded verify-checksums.ps1. Defaults to <OutDir>-metadata. Both are
-    release metadata, not checksum-covered files, so they must stay out of
-    the verified folder.
+    downloaded verify-checksums.ps1. Defaults to <OutDir>-metadata (derived
+    from the normalized OutDir, so a trailing separator in -OutDir cannot
+    make it a subfolder of the verified folder). Both are release metadata,
+    not checksum-covered files, so they must stay out of the verified
+    folder: -OutDir/-MetadataDir pairs that are equal or nested are rejected
+    before anything is created or downloaded, so the exact-match contract
+    cannot be bypassed by nesting the metadata folder inside the verified
+    folder.
 
 .PARAMETER SkipSmoke
     Skip the nextide-cli.exe smoke step. Checksum verification still runs.
@@ -149,19 +174,79 @@ if ($Repo -notmatch '^[^\s/]+/[^\s/]+$') {
 
 if (-not $BaseReleaseUrl)  { $BaseReleaseUrl  = "https://github.com/$Repo/releases/download/$Tag" }
 if (-not $VerifyScriptUrl) { $VerifyScriptUrl = "https://raw.githubusercontent.com/$Repo/$Tag/packaging/windows/verify-checksums.ps1" }
-if (-not $OutDir)          { $OutDir      = Join-Path (Get-Location) 'nextide-download' }
-if (-not $MetadataDir)     { $MetadataDir = "$OutDir-metadata" }
+
+# 2. Resolve -OutDir/-MetadataDir to full paths and validate their shape —
+#    all read-only, before anything is created or downloaded. The metadata
+#    folder must stay OUTSIDE the verified folder: the consumer verifier
+#    enforces an exact-match contract over the verified folder, so a metadata
+#    folder equal to it (its manifest.json and the verifier itself would land
+#    in the verified folder) or nested inside it (they would land inside the
+#    verified tree, silently bypassing the exact-match contract) would break
+#    the documented guarantee.
+function Test-SamePath {
+    # Case-insensitive path equality (Windows paths), tolerating a trailing
+    # separator on either side.
+    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+    return [string]::Equals($A.TrimEnd([char[]]@('/', '\')), $B.TrimEnd([char[]]@('/', '\')), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-PathWithin {
+    # True when $Child is strictly inside $Parent (case-insensitive, with a
+    # path boundary: 'C:\dl2' is not inside 'C:\dl'). A drive root like
+    # 'C:\' trims to 'C:' and still works as a prefix.
+    param([Parameter(Mandatory)][string]$Child, [Parameter(Mandatory)][string]$Parent)
+    return $Child.StartsWith($Parent.TrimEnd([char[]]@('/', '\')) + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+if (-not $OutDir) { $OutDir = Join-Path (Get-Location) 'nextide-download' }
+try {
+    $OutDir = [System.IO.Path]::GetFullPath($OutDir)
+}
+catch {
+    Fail "Invalid -OutDir path: $($_.Exception.Message)"
+}
+# The metadata default derives from the normalized OutDir, so a trailing
+# separator in -OutDir cannot make the default metadata folder a subfolder of
+# the verified folder (previously '<OutDir>-metadata' with -OutDir 'C:\foo\'
+# resolved to 'C:\foo\-metadata', silently nested inside the verified folder).
+if (-not $MetadataDir) { $MetadataDir = "$OutDir-metadata" }
+try {
+    $MetadataDir = [System.IO.Path]::GetFullPath($MetadataDir)
+}
+catch {
+    Fail "Invalid -MetadataDir path: $($_.Exception.Message)"
+}
+
+if (Test-SamePath $OutDir $MetadataDir) {
+    Fail "-OutDir and -MetadataDir must be two different folders (both resolve to '$OutDir'): the release metadata would land inside the verified folder and be rejected by the exact-match contract"
+}
+if (Test-PathWithin $MetadataDir $OutDir) {
+    Fail "-MetadataDir ('$MetadataDir') must be outside the verified folder -OutDir ('$OutDir'): a nested metadata folder would sit inside the verified tree and silently bypass the verifier's exact-match contract. Pick a sibling folder (default '<OutDir>-metadata')"
+}
+if (Test-PathWithin $OutDir $MetadataDir) {
+    Fail "-OutDir ('$OutDir') must be outside the metadata folder -MetadataDir ('$MetadataDir'): the verified folder and the metadata folder must be two separate folders. Pick a sibling folder (default '<OutDir>-metadata')"
+}
+
+# The documented 'never into the repository' rule, enforced: refuse the
+# repository root and its staging folder (dist/) as download targets.
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$StagingRoot = Join-Path $RepoRoot 'dist'
+foreach ($Folder in @($OutDir, $MetadataDir)) {
+    if ((Test-SamePath $Folder $RepoRoot) -or (Test-SamePath $Folder $StagingRoot) -or (Test-PathWithin $Folder $StagingRoot)) {
+        Fail "Refusing to write into the repository: -OutDir/-MetadataDir must not resolve to the repository root or its staging folder (dist/), got: '$Folder'. Run from a scratch/download directory, or pass -OutDir/-MetadataDir outside the repository checkout."
+    }
+}
 
 Write-Host "==> Verifying GitHub Release $Tag ($Repo)"
 Write-Host "  release assets : $BaseReleaseUrl"
 Write-Host "  verified folder: $OutDir"
 Write-Host "  metadata folder: $MetadataDir"
 
-# 2. Create the two folders. All downloads land here — nothing else is ever
+# 3. Create the two folders. All downloads land here — nothing else is ever
 #    written.
 $null = New-Item -ItemType Directory -Force -Path $OutDir, $MetadataDir
 
-# 3. The release's own manifest.json is the single source of truth for the
+# 4. The release's own manifest.json is the single source of truth for the
 #    version and the checksum file name. A release whose manifest is missing,
 #    unparseable, version-disagreeing or checksum-file-less is broken by
 #    construction — fail before downloading the binaries.
@@ -193,7 +278,7 @@ if ($ChecksumFile -match '[\\/]' -or $ChecksumFile -eq '.' -or $ChecksumFile -eq
     Fail "Release manifest.json stage.checksum_file must be a plain file name, got: '$ChecksumFile'"
 }
 
-# 4. Download the two binaries and the manifest-declared checksum file into
+# 5. Download the two binaries and the manifest-declared checksum file into
 #    the verified folder.
 $CliPath       = Join-Path $OutDir 'nextide-cli.exe'
 $ShellPath     = Join-Path $OutDir 'nextide-shell.exe'
@@ -202,13 +287,13 @@ Download-File -Url "$BaseReleaseUrl/nextide-cli.exe"   -Destination $CliPath    
 Download-File -Url "$BaseReleaseUrl/nextide-shell.exe" -Destination $ShellPath     -What 'release binary nextide-shell.exe'
 Download-File -Url "$BaseReleaseUrl/$ChecksumFile"     -Destination $ChecksumPath  -What "checksum manifest $ChecksumFile"
 
-# 5. Fetch the repository's consumer verifier from the same tag — outside the
+# 6. Fetch the repository's consumer verifier from the same tag — outside the
 #    verified folder (the exact-match contract rejects any unlisted file, the
 #    verifier itself included).
 $VerifierPath = Join-Path $MetadataDir 'verify-checksums.ps1'
 Download-File -Url $VerifyScriptUrl -Destination $VerifierPath -What 'consumer verifier verify-checksums.ps1'
 
-# 6. Run the downloaded verifier in a child process of the same PowerShell
+# 7. Run the downloaded verifier in a child process of the same PowerShell
 #    edition so the real exit-code contract (0 = success) is honored. Its
 #    stderr under Windows PowerShell 5.1 becomes error records; capture with
 #    EAP=Continue so the exit code below is the value under test, then fail on
@@ -235,7 +320,7 @@ if ($LASTEXITCODE -ne 0) {
     Fail "Checksum verification of the downloaded files failed (exit $LASTEXITCODE) - the download does not match its checksum manifest"
 }
 
-# 7. Smoke-test the downloaded CLI — the same editor-kernel smoke flow the CI
+# 8. Smoke-test the downloaded CLI — the same editor-kernel smoke flow the CI
 #    release job runs against the exact bytes it publishes. Runs only after
 #    the checksums passed; nextide-shell.exe is never executed.
 if (-not $SkipSmoke) {
