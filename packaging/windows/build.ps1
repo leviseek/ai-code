@@ -30,6 +30,14 @@
     fails before anything is built or staged, so a stale or cross-arch manifest
     can never stage an artifact set for the wrong platform.
 
+    The manifest release block carries the release metadata and is validated
+    read-only the same way: release.license and release.publisher must be
+    non-empty, and release.release_channel must be exactly 'stable' or 'beta'
+    (beta is a valid channel; any other value — e.g. 'alpha' or 'nightly' — is
+    a hard error). A missing release block or a missing/blank field fails
+    before anything is built or staged. This block only carries metadata — the
+    script performs no signing and no installation.
+
     It deliberately performs NO dangerous operations:
       - no deleting / cleaning of existing directories (dist is overwritten
         in place with Copy-Item -Force, never removed first)
@@ -40,8 +48,10 @@
     The script fails loudly (non-zero exit code) if cargo is missing, the
     release build fails, the manifest is invalid, product.version does not
     match the Cargo.toml workspace version, the manifest target block does not
-    match the pinned packaging target x86_64-pc-windows-msvc, or an expected
-    artifact is missing or mismatched before or after staging.
+    match the pinned packaging target x86_64-pc-windows-msvc, the manifest
+    release block is missing or invalid (license/publisher required,
+    release_channel must be stable or beta), or an expected artifact is missing
+    or mismatched before or after staging.
 
 .PARAMETER SkipBuild
     Skip the `cargo build --release` step and only (re)stage the artifacts
@@ -122,6 +132,28 @@ function Get-ProductManifest {
     }
     if ($null -eq $Manifest.target -or [string]::IsNullOrWhiteSpace($Manifest.target.triple)) {
         throw 'Manifest is missing target.triple'
+    }
+    # The release block is required and validated read-only: license and
+    # publisher must be non-empty, release_channel must be exactly 'stable' or
+    # 'beta'. It is metadata only — the script never signs or installs.
+    $Release = Get-ManifestField $Manifest 'release'
+    if ($null -eq $Release) {
+        throw 'Manifest is missing the release block (release.license, release.publisher and release.release_channel are required)'
+    }
+    $ReleaseLicense   = Get-ManifestField $Release 'license'
+    $ReleasePublisher = Get-ManifestField $Release 'publisher'
+    $ReleaseChannel   = Get-ManifestField $Release 'release_channel'
+    if ([string]::IsNullOrWhiteSpace([string]$ReleaseLicense)) {
+        throw 'Manifest release.license is required (non-empty)'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$ReleasePublisher)) {
+        throw 'Manifest release.publisher is required (non-empty)'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$ReleaseChannel)) {
+        throw 'Manifest release.release_channel is required (must be exactly stable or beta)'
+    }
+    if ($ReleaseChannel -ne 'stable' -and $ReleaseChannel -ne 'beta') {
+        throw "Manifest release.release_channel '$ReleaseChannel' is not allowed (must be exactly 'stable' or 'beta')"
     }
     if ($null -eq $Manifest.verification -or [string]::IsNullOrWhiteSpace($Manifest.verification.algorithm)) {
         throw 'Manifest is missing verification.algorithm'
@@ -252,11 +284,19 @@ $Report = @($Report) | ForEach-Object { [string]$_ }
 # the script execute something else or write outside the repository.
 $Strategy       = Get-ManifestField $Manifest.verification 'strategy'
 
+# Release metadata was validated in Get-ProductManifest; re-read it (safely,
+# Get-ManifestField never trips strict mode) for the header printout.
+$ReleaseBlock   = Get-ManifestField $Manifest 'release'
+$ReleaseLicense = Get-ManifestField $ReleaseBlock 'license'
+$ReleasePub     = Get-ManifestField $ReleaseBlock 'publisher'
+$ReleaseChannel = Get-ManifestField $ReleaseBlock 'release_channel'
+
 Write-Step "NextIDE packaging baseline (repo root: $RepoRoot)"
 Write-Host "  manifest: $ManifestPath"
 Write-Host "  product:  $($Manifest.product.name) $ProductVersion"
 Write-Host "  version:  manifest '$ProductVersion' == Cargo.toml [workspace.package] '$CargoVersion'"
 Write-Host "  target:   $TargetOs/$TargetArch ($TargetTriple)"
+Write-Host "  release:  license=$ReleaseLicense publisher=$ReleasePub channel=$ReleaseChannel"
 Write-Host "  verify:   $Strategy / $($Manifest.verification.algorithm)"
 
 if (-not $SkipBuild) {

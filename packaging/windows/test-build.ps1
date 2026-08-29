@@ -38,6 +38,12 @@
      15. target.architecture mismatch vs pinned x86_64-pc-windows-msvc -> fails
      16. target.triple mismatch vs pinned x86_64-pc-windows-msvc      -> fails
      17. target.os mismatch vs pinned windows target                  -> fails
+     18. missing release block (license/publisher/release_channel)    -> fails
+     19. missing release.license                -> fails
+     20. missing release.publisher              -> fails
+     21. missing release.release_channel        -> fails
+     22. release.release_channel not stable/beta (e.g. 'alpha')       -> fails
+     23. release.release_channel 'beta' (valid channel)               -> passes
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -293,6 +299,34 @@ function Set-ManifestTargetField {
     $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
     $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
     $Manifest.target | Add-Member -NotePropertyName $Key -NotePropertyValue $Value -Force
+    Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
+}
+
+function Set-ManifestReleaseField {
+    # Overwrite (or add) a field inside the release block of the sandbox
+    # manifest. Passing $null blanks the field out (the build script treats a
+    # present-but-blank field the same as a missing one).
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][string]$Key,
+        $Value
+    )
+    $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
+    $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    $Manifest.release | Add-Member -NotePropertyName $Key -NotePropertyValue $Value -Force
+    Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
+}
+
+function Remove-ManifestProperty {
+    # Remove a top-level property from the sandbox manifest (e.g. the whole
+    # release block) to test missing-block rejection.
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][string]$Key
+    )
+    $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
+    $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    $null = $Manifest.PSObject.Properties.Remove($Key)
     Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
 }
 
@@ -612,6 +646,107 @@ Invoke-Test -Name 'manifest target.os mismatch with pinned packaging target fail
         Assert ($Result.Output -match 'does not match the pinned packaging target') "expected pinned-target rejection in output: $($Result.Output)"
         Assert ($Result.Output -match 'target\.os') "expected 'target.os' in output: $($Result.Output)"
         Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a target mismatch'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 18. Manifest without the release block entirely.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'missing release block fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Remove-ManifestProperty -Sandbox $Root -Key 'release'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'release block') "expected missing-release-block rejection in output: $($Result.Output)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged without release metadata'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 19. Release block present but release.license blank.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'missing release.license fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestReleaseField -Sandbox $Root -Key 'license' -Value $null
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'release\.license') "expected 'release.license' rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 20. Release block present but release.publisher blank.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'missing release.publisher fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestReleaseField -Sandbox $Root -Key 'publisher' -Value $null
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'release\.publisher') "expected 'release.publisher' rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 21. Release block present but release.release_channel blank.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'missing release.release_channel fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestReleaseField -Sandbox $Root -Key 'release_channel' -Value $null
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'release\.release_channel') "expected 'release.release_channel' rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 22. Release channel that is neither stable nor beta.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'release.release_channel not stable/beta fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestReleaseField -Sandbox $Root -Key 'release_channel' -Value 'alpha'
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'not allowed') "expected channel rejection in output: $($Result.Output)"
+        Assert ($Result.Output -match 'alpha') 'expected the offending channel value in output'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a channel mismatch'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 23. Release channel 'beta' is a valid channel (positive counterpart of 22).
+# ---------------------------------------------------------------------------
+Invoke-Test -Name "release.release_channel 'beta' passes" -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestReleaseField -Sandbox $Root -Key 'release_channel' -Value 'beta'
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -eq 0) "expected exit 0, got $($Result.ExitCode)`n$($Result.Output)"
+        Assert ($Result.Output -match 'channel=beta') 'expected the release channel line in output'
+        Assert (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe')) 'nextide-cli.exe was not staged'
     }
     finally {
         Remove-Sandbox $Root

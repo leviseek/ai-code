@@ -12,6 +12,12 @@
     "triple": "x86_64-pc-windows-msvc",
     "notes": "The project targets Windows x86_64. build.ps1 enforces that this target block matches the pinned packaging target x86_64-pc-windows-msvc (os windows, architecture x86_64, triple x86_64-pc-windows-msvc) and fails before building or staging on any mismatch, so a stale or cross-arch manifest can never stage an artifact set for the wrong platform. The release build itself runs with the host stable Rust toolchain (cargo build --release)."
   },
+  "release": {
+    "license": "MIT",
+    "publisher": "leviseek",
+    "release_channel": "stable",
+    "notes": "Release metadata is mandatory and validated read-only by build.ps1 before anything is built or staged: license and publisher must be non-empty, and release_channel must be exactly 'stable' or 'beta' (beta is accepted as a valid channel; any other value fails). license mirrors the SPDX license declared by every member crate (MIT), publisher is the publishing identity (repository owner). This block carries release metadata only — it does not sign or install anything."
+  },
   "build": {
     "profile": "release",
     "command": "cargo build --release",

@@ -11,6 +11,7 @@ install anything.
 | --- | --- |
 | Release build (`cargo build --release`) | Done — performed and verified by the script |
 | Manifest-driven artifact list + verification | Done — `manifest.json` is the single source of truth; `build.ps1` validates and enforces it |
+| Release metadata validation (`license` / `publisher` / `release_channel`) | Done — required, validated read-only; channel must be `stable` or `beta` |
 | Stage CLI + Desktop Shell executables under `dist/windows/` | Done — performed by the script |
 | Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
@@ -45,6 +46,7 @@ artifact list is no longer hardcoded in the script.
 | `schema_version` | Manifest schema version (currently `1`). |
 | `product.name` / `product.version` | Product identity (`NextIDE`, `0.1.0`). `product.version` must equal the `[workspace.package]` version in the root `Cargo.toml`; `build.ps1` enforces the match (see [Version consistency](#version-consistency)). |
 | `target.os` / `target.architecture` / `target.triple` | Declared target platform (`windows`, `x86_64`, `x86_64-pc-windows-msvc`). **Enforced**: each field must equal the pinned packaging target this script produces — `os` = `windows`, `architecture` = `x86_64`, `triple` = `x86_64-pc-windows-msvc` — and the triple's architecture component must agree with `architecture` (see [Target consistency](#target-consistency)). |
+| `release.license` / `release.publisher` / `release.release_channel` | Release metadata (`MIT`, `leviseek`, `stable`). **Enforced**: `license` and `publisher` must be non-empty, and `release_channel` must be exactly `stable` or `beta` (see [Release metadata](#release-metadata)). |
 | `build.profile` / `build.command` / `build.output_dir` | Declared build metadata (informational — the script deliberately always runs the pinned, safe `cargo build --release` from the repo root; it never executes an arbitrary command read from a manifest). |
 | `stage.output_dir` | Declared staging location (informational — the script deliberately pins staging to the repo-local `dist/windows` so a tampered manifest can never redirect writes outside the repository). |
 | `artifacts[]` | Each entry: `id`, `file` (staged file name), `source` (repo-relative path of the release binary), optional `description`, optional `expected_sha256`. `file` must equal the source file name. |
@@ -74,6 +76,20 @@ before anything is built or staged, so a stale manifest can never ship a
 release that claims a version the workspace does not declare. A missing
 `Cargo.toml`, a missing `[workspace.package]` version, or a mismatch with
 `product.version` is a hard error (non-zero exit).
+
+### Release metadata
+
+The `release` block is not free-form either: it carries the release metadata
+and `build.ps1` validates it **read-only** before anything is built or staged.
+`release.license` and `release.publisher` must be non-empty (the committed
+manifest declares `MIT` — mirroring the SPDX license of every member crate —
+and `leviseek`, the publishing identity), and `release.release_channel` must be
+exactly `stable` or `beta` — `beta` is a valid channel, anything else (for
+example `alpha` or `nightly`) is a hard error, so a release can never be
+labelled with an undeclared channel. A missing `release` block or a
+missing/blank field is also a hard error (non-zero exit). This block is
+metadata only — the script performs **no signing and no installation**; the
+channel is a label the script validates, not a behavior it switches.
 
 ### Target consistency
 
@@ -116,14 +132,18 @@ The script:
    `x86_64-pc-windows-msvc` (`target.os` = `windows`, `target.architecture` =
    `x86_64`, `target.triple` = `x86_64-pc-windows-msvc`, mutually consistent)
    and fails before building or staging on any mismatch;
-4. runs `cargo build --release` from the repository root and **fails with a
+4. checks the release block read-only — `release.license` and
+   `release.publisher` must be non-empty and `release.release_channel` must be
+   exactly `stable` or `beta` — and fails before building or staging on any
+   missing field or disallowed channel;
+5. runs `cargo build --release` from the repository root and **fails with a
    non-zero exit code** if the build fails;
-5. checks that every artifact listed in the manifest exists in
+6. checks that every artifact listed in the manifest exists in
    `target\release\` — an unexpected missing artifact is a hard error, so a
    stale `dist` can never look like a successful build;
-6. creates `dist\windows\` if needed and copies the executables there
+7. creates `dist\windows\` if needed and copies the executables there
    (overwriting in place);
-7. verifies the staged copies exist, match the release binaries by size and
+8. verifies the staged copies exist, match the release binaries by size and
    SHA-256, honor any pinned `expected_sha256`, and prints each file's size
    and SHA-256.
 
@@ -148,8 +168,10 @@ The script is deliberately boring. It never:
 
 Every failure path — missing cargo, failed build, invalid manifest,
 `product.version`/Cargo.toml version mismatch, manifest target block mismatch
-with the pinned `x86_64-pc-windows-msvc` packaging target, missing artifact,
-size/hash mismatch — exits non-zero with a message explaining what was wrong.
+with the pinned `x86_64-pc-windows-msvc` packaging target, missing or invalid
+release block (blank `license`/`publisher` or a `release_channel` other than
+`stable`/`beta`), missing artifact, size/hash mismatch — exits non-zero with a
+message explaining what was wrong.
 
 ## Testing
 
@@ -170,12 +192,13 @@ both Windows PowerShell 5.1 and PowerShell 7.
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
 ```
 
-Covered scenarios (17 tests):
+Covered scenarios (23 tests):
 
 | Scenario | Expected result |
 | --- | --- |
 | `-SkipBuild` happy path (staging + size/SHA-256 verification + report, sentinel file preserved) | pass |
 | Correct pinned `expected_sha256` | pass |
+| `release.release_channel` = `beta` (valid channel) | pass |
 | Missing `manifest.json` | fail |
 | Missing release artifact (source absent) | fail |
 | Wrong pinned `expected_sha256` | fail |
@@ -191,6 +214,11 @@ Covered scenarios (17 tests):
 | `target.architecture` mismatch with pinned packaging target (`x86_64`) | fail before build/staging, nothing staged |
 | `target.triple` mismatch with pinned packaging target (`x86_64-pc-windows-msvc`) | fail before build/staging, nothing staged |
 | `target.os` mismatch with pinned packaging target (`windows`) | fail before build/staging, nothing staged |
+| Missing `release` block entirely | fail before build/staging, nothing staged |
+| Missing/blank `release.license` | fail before build/staging |
+| Missing/blank `release.publisher` | fail before build/staging |
+| Missing/blank `release.release_channel` | fail before build/staging |
+| `release.release_channel` not `stable`/`beta` (e.g. `alpha`) | fail before build/staging, nothing staged |
 
 The script exits `0` when every test passes and `1` when any fails. Useful
 switches: `-BuildScript <path>` points at another copy of `build.ps1` under
