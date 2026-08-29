@@ -34,7 +34,10 @@ pub use capability::{CapabilityDescriptor, CapabilityRegistry, CapabilitySummary
 pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};
 pub use file_tree::{FileNode, FileNodeKind, FileTreeModel};
-pub use git::{status, GitFileState, GitStatusCode, GitStatusEntry, GitStatusSnapshot};
+pub use git::{
+    diff, status, GitDiffFile, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitDiffSnapshot,
+    GitFileState, GitStatusCode, GitStatusEntry, GitStatusSnapshot,
+};
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};
 pub use render::{HeadlessSurface, RenderSurface, SurfaceSize};
