@@ -1,0 +1,474 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Self-contained validation tests for packaging\windows\build.ps1.
+
+.DESCRIPTION
+    Tests the Windows packaging baseline without any external test framework
+    (plain PowerShell assertions only) and without touching the real
+    repository: every test runs `build.ps1` against a throwaway sandbox copy
+    created under the sandbox root (default: $env:TEMP), and the sandbox is
+    deleted again when the run finishes. Nothing in the repository is written,
+    renamed or removed; in particular `dist\windows\` of the real repo is never
+    touched, and one test proves the script itself preserves pre-existing
+    files in the staging directory (it only overwrites, never deletes).
+
+    Covered scenarios:
+      1. -SkipBuild happy path: artifacts staged, size+SHA-256 verified,
+         report printed, pre-existing files in dist\windows\ preserved
+      2. missing manifest.json                  -> fails
+      3. missing release artifact (source)      -> fails
+      4. wrong pinned expected_sha256           -> fails
+      5. correct pinned expected_sha256         -> passes
+      6. path escape via '..' component         -> fails
+      7. path escape via rooted absolute path   -> fails
+      8. invalid manifest JSON                  -> fails
+      9. artifact file != source file name      -> fails
+     10. unsupported manifest schema_version    -> fails
+     11. failed release build (no Cargo.toml)   -> fails loudly
+
+    The script exits 0 when every test passes and 1 when any fails.
+
+.PARAMETER BuildScript
+    Path of the build.ps1 under test. Defaults to build.ps1 next to this
+    script; the manifest.json sitting next to it is used as the template.
+
+.PARAMETER SandboxRoot
+    Directory under which the per-test sandboxes are created. Defaults to
+    $env:TEMP. The real repository is never used as a sandbox.
+
+.PARAMETER KeepSandbox
+    Keep the sandbox directories after the run (useful for debugging); by
+    default every sandbox created by this script is deleted again. The only
+    thing this script ever deletes is its own sandboxes under $SandboxRoot.
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1 -KeepSandbox
+#>
+[CmdletBinding()]
+param(
+    [string]$BuildScript = '',
+    [string]$SandboxRoot = $env:TEMP,
+    [switch]$KeepSandbox
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+if (-not $BuildScript) { $BuildScript = Join-Path $PSScriptRoot 'build.ps1' }
+if (-not (Test-Path -LiteralPath $BuildScript)) {
+    throw "build.ps1 under test not found: $BuildScript"
+}
+$ManifestSource = Join-Path (Split-Path -Parent $BuildScript) 'manifest.json'
+if (-not (Test-Path -LiteralPath $ManifestSource)) {
+    throw "manifest.json for the build script under test not found: $ManifestSource"
+}
+if (-not (Test-Path -LiteralPath $SandboxRoot)) {
+    throw "Sandbox root does not exist: $SandboxRoot"
+}
+
+# Run build.ps1 in a child process of the same PowerShell edition so the exit
+# code contract (0 = success, non-zero = failure) is tested for real.
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    $ShellExe = Join-Path $PSHOME 'pwsh.exe'
+}
+else {
+    $ShellExe = Join-Path $PSHOME 'powershell.exe'
+}
+if (-not (Test-Path -LiteralPath $ShellExe)) {
+    throw "PowerShell interpreter not found: $ShellExe"
+}
+
+$script:Passed    = 0
+$script:Failed    = 0
+$script:Failures  = @()
+$script:Detail    = $null
+$script:Sandboxes = @()
+
+function Invoke-Test {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Body
+    )
+    Write-Host ''
+    Write-Host "==> $Name"
+    $script:Detail = $null
+    $Passed = $false
+    try {
+        & $Body
+        $Passed = $true
+    }
+    catch {
+        $Passed = $false
+        if (-not $script:Detail) { $script:Detail = $_.Exception.Message }
+    }
+    if ($Passed) {
+        $script:Passed++
+        Write-Host "    [PASS] $Name"
+    }
+    else {
+        $script:Failed++
+        Write-Host "    [FAIL] $Name"
+        if ($script:Detail) { Write-Host "           $($script:Detail)" }
+        $script:Failures += "$Name -- $($script:Detail)"
+    }
+}
+
+function Assert {
+    param(
+        [Parameter(Mandatory)][bool]$Condition,
+        [Parameter(Mandatory)][string]$Message
+    )
+    if (-not $Condition) {
+        $script:Detail = $Message
+        throw $Message
+    }
+}
+
+function New-Sandbox {
+    param([switch]$WithManifest)
+    $Root = Join-Path $SandboxRoot ('nextide-test-build-' + [guid]::NewGuid().ToString('N'))
+    $Pkg = Join-Path $Root 'packaging\windows'
+    $null = New-Item -ItemType Directory -Force -Path $Pkg
+    Copy-Item -LiteralPath $BuildScript -Destination (Join-Path $Pkg 'build.ps1')
+    if ($WithManifest) {
+        Copy-Item -LiteralPath $ManifestSource -Destination (Join-Path $Pkg 'manifest.json')
+    }
+    $script:Sandboxes += $Root
+    return $Root
+}
+
+function Remove-Sandbox {
+    param([Parameter(Mandatory)][string]$Root)
+    if ($KeepSandbox) {
+        Write-Host "    (sandbox kept for inspection: $Root)"
+        return
+    }
+    $Leaf = Split-Path -Leaf $Root
+    if ($Leaf -notlike 'nextide-test-build-*') {
+        throw "Refusing to remove unexpected path: $Root"
+    }
+    if (Test-Path -LiteralPath $Root) {
+        Remove-Item -LiteralPath $Root -Recurse -Force
+    }
+}
+
+function Invoke-BuildScript {
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [switch]$SkipBuild
+    )
+    $ChildScript = Join-Path $Sandbox 'packaging\windows\build.ps1'
+    $ChildArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ChildScript)
+    if ($SkipBuild) { $ChildArgs += '-SkipBuild' }
+    # Never turn a non-zero native exit code into a terminating error here:
+    # the exit code is the value under test. Note: do NOT pre-assign
+    # $LASTEXITCODE in this function — that would shadow the automatic
+    # variable and the engine would no longer update it.
+    $PSNativeCommandUseErrorActionPreference = $false
+    $Output = (& $ShellExe $ChildArgs 2>&1 | Out-String)
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output   = $Output
+    }
+}
+
+function New-FakeBinaries {
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+    $Rel = Join-Path $Sandbox 'target\release'
+    $null = New-Item -ItemType Directory -Force -Path $Rel
+    foreach ($Name in $Names) {
+        Set-Content -LiteralPath (Join-Path $Rel $Name) -Value "fake payload for $Name" -Encoding ASCII -NoNewline
+    }
+}
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+function Save-Manifest {
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)]$Manifest
+    )
+    $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
+    # ASCII: no BOM, safe for both Windows PowerShell 5.1 and PowerShell Core.
+    $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ManifestPath -Encoding ASCII
+}
+
+function Set-ManifestArtifact {
+    # Overwrite (or add) a field on one artifact entry of the sandbox manifest.
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][int]$Index,
+        [Parameter(Mandatory)][hashtable]$Set
+    )
+    $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
+    $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    $Artifact = $Manifest.artifacts[$Index]
+    foreach ($Key in $Set.Keys) {
+        $Artifact | Add-Member -NotePropertyName $Key -NotePropertyValue $Set[$Key] -Force
+    }
+    Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
+}
+
+function Set-ManifestField {
+    # Overwrite (or add) a top-level field of the sandbox manifest.
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)]$Value
+    )
+    $ManifestPath = Join-Path $Sandbox 'packaging\windows\manifest.json'
+    $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    $Manifest | Add-Member -NotePropertyName $Key -NotePropertyValue $Value -Force
+    Save-Manifest -Sandbox $Sandbox -Manifest $Manifest
+}
+
+Write-Host '=================================================='
+Write-Host "Windows packaging baseline tests"
+Write-Host "  build.ps1 under test : $BuildScript"
+Write-Host "  manifest template     : $ManifestSource"
+Write-Host "  sandbox root          : $SandboxRoot"
+Write-Host '  every run happens in a throwaway sandbox; the real repository is never modified'
+Write-Host '=================================================='
+
+# ---------------------------------------------------------------------------
+# 1. Happy path: -SkipBuild stages artifacts, verifies them, preserves files.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'SkipBuild happy path stages artifacts and preserves pre-existing files' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+
+        # A pre-existing file in dist\windows must survive the run untouched.
+        $Dist = Join-Path $Root 'dist\windows'
+        $null = New-Item -ItemType Directory -Force -Path $Dist
+        $Keep = Join-Path $Dist 'keep-me.txt'
+        Set-Content -LiteralPath $Keep -Value 'sentinel: must survive' -Encoding ASCII -NoNewline
+
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -eq 0) "expected exit 0, got $($Result.ExitCode)`n$($Result.Output)"
+
+        $Cli   = Join-Path $Dist 'nextide-cli.exe'
+        $Shell = Join-Path $Dist 'nextide-shell.exe'
+        Assert (Test-Path -LiteralPath $Cli) 'nextide-cli.exe was not staged'
+        Assert (Test-Path -LiteralPath $Shell) 'nextide-shell.exe was not staged'
+
+        $CliSrc   = Join-Path $Root 'target\release\nextide-cli.exe'
+        $ShellSrc = Join-Path $Root 'target\release\nextide-shell.exe'
+        Assert ((Get-Sha256Hex $Cli) -eq (Get-Sha256Hex $CliSrc)) 'staged cli SHA-256 differs from source'
+        Assert ((Get-Sha256Hex $Shell) -eq (Get-Sha256Hex $ShellSrc)) 'staged shell SHA-256 differs from source'
+        Assert ((Get-Item -LiteralPath $Cli).Length -eq (Get-Item -LiteralPath $CliSrc).Length) 'staged cli size differs from source'
+
+        Assert ((Get-Content -Raw -LiteralPath $Keep) -eq 'sentinel: must survive') 'pre-existing file in dist\windows was modified or deleted'
+        Assert ($Result.Output -match 'Done\.') 'expected completion banner in output'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 2. Missing manifest.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'missing manifest.json fails' -Body {
+    $Root = New-Sandbox
+    try {
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'Missing manifest') "expected 'Missing manifest' in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Missing release artifact (source file absent).
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'missing release artifact fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        # Only the first manifest artifact exists; the second is missing.
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe')
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'Missing release artifact') "expected 'Missing release artifact' in output: $($Result.Output)"
+        Assert ($Result.Output -match 'nextide-shell\.exe') 'expected the missing file name in output'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. Wrong pinned expected_sha256.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'wrong pinned expected_sha256 fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Set-ManifestArtifact -Sandbox $Root -Index 0 -Set @{ expected_sha256 = ('0' * 64) }
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'expected_sha256') "expected 'expected_sha256' mismatch in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 5. Correct pinned expected_sha256 (positive counterpart of test 4).
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'correct pinned expected_sha256 passes' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        $Hash = Get-Sha256Hex (Join-Path $Root 'target\release\nextide-cli.exe')
+        Set-ManifestArtifact -Sandbox $Root -Index 0 -Set @{ expected_sha256 = $Hash }
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -eq 0) "expected exit 0, got $($Result.ExitCode)`n$($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 6. Path escape via '..' component.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name "path escape via '..' component fails" -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Set-ManifestArtifact -Sandbox $Root -Index 0 -Set @{ source = '..\..\outside.txt'; file = 'outside.txt' }
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'must not escape the repo root') "expected escape rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 7. Path escape via rooted absolute path.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'path escape via rooted absolute path fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Set-ManifestArtifact -Sandbox $Root -Index 0 -Set @{ source = 'C:\Windows\System32\notepad.exe'; file = 'notepad.exe' }
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'must be a repo-relative path') "expected rooted-path rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 8. Invalid manifest JSON.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'invalid manifest JSON fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-Content -LiteralPath (Join-Path $Root 'packaging\windows\manifest.json') -Value '{ this is not json' -Encoding ASCII
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'Invalid manifest JSON') "expected 'Invalid manifest JSON' in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 9. Artifact file name differs from source file name.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'artifact file name differs from source fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        New-FakeBinaries -Sandbox $Root -Names @('nextide-cli.exe', 'nextide-shell.exe')
+        Set-ManifestArtifact -Sandbox $Root -Index 0 -Set @{ file = 'renamed.exe' }
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'must equal the source file name') "expected leaf-mismatch rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 10. Unsupported manifest schema_version.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'unsupported manifest schema_version fails' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        Set-ManifestField -Sandbox $Root -Key 'schema_version' -Value 2
+        $Result = Invoke-BuildScript -Sandbox $Root -SkipBuild
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'Unsupported manifest schema_version') "expected schema rejection in output: $($Result.Output)"
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 11. Failed release build fails loudly (sandbox has no Cargo.toml).
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'failed release build fails loudly' -Body {
+    $Root = New-Sandbox -WithManifest
+    try {
+        # No target\release binaries and no Cargo.toml: without -SkipBuild the
+        # script must reach the build step and fail there (cargo missing or
+        # failing -> non-zero exit; either way the script exits non-zero).
+        $Result = Invoke-BuildScript -Sandbox $Root
+        Assert ($Result.ExitCode -ne 0) "expected non-zero exit, got $($Result.ExitCode)"
+        Assert ($Result.Output -match 'Building release binaries') 'expected the build step to be reached'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $Root 'dist\windows\nextide-cli.exe'))) 'no artifact may be staged after a failed build'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Summary.
+# ---------------------------------------------------------------------------
+if (-not $KeepSandbox) {
+    foreach ($S in $script:Sandboxes) {
+        $Leaf = Split-Path -Leaf $S
+        if ($Leaf -like 'nextide-test-build-*' -and (Test-Path -LiteralPath $S)) {
+            Remove-Item -LiteralPath $S -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Write-Host ''
+Write-Host '=================================================='
+Write-Host ("PASSED: {0}   FAILED: {1}" -f $script:Passed, $script:Failed)
+if ($script:Failures.Count -gt 0) {
+    Write-Host 'FAILURES:'
+    foreach ($F in $script:Failures) { Write-Host "  - $F" }
+}
+if ($KeepSandbox) {
+    Write-Host "Sandboxes kept under $SandboxRoot for inspection."
+}
+else {
+    Write-Host "The real repository was not modified; only sandboxes under $SandboxRoot were written and removed."
+}
+if ($script:Failed -gt 0) { exit 1 }
+exit 0

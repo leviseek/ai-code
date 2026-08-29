@@ -12,6 +12,7 @@ install anything.
 | Release build (`cargo build --release`) | Done — performed and verified by the script |
 | Manifest-driven artifact list + verification | Done — `manifest.json` is the single source of truth; `build.ps1` validates and enforces it |
 | Stage CLI + Desktop Shell executables under `dist/windows/` | Done — performed by the script |
+| Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
 | CI packaging job | Not yet — later phase |
@@ -21,9 +22,10 @@ install anything.
 ```
 packaging/
   windows/
-    build.ps1      # the only entry point
-    manifest.json  # product metadata, target, artifact list, verification strategy
-    README.md      # this file
+    build.ps1       # the only entry point
+    manifest.json   # product metadata, target, artifact list, verification strategy
+    test-build.ps1  # self-contained, sandboxed validation tests for build.ps1
+    README.md       # this file
 dist/              # build output, git-ignored (not committed)
   windows/
     nextide-cli.exe
@@ -43,8 +45,8 @@ artifact list is no longer hardcoded in the script.
 | `schema_version` | Manifest schema version (currently `1`). |
 | `product.name` / `product.version` | Product identity (`NextIDE`, `0.1.0`). |
 | `target.os` / `target.arch` / `target.triple` | Declared target platform (`windows`, `x86_64`, `x86_64-pc-windows-msvc`). Informational — the script builds with the host toolchain. |
-| `build.profile` / `build.command` / `build.output_dir` | How the release binaries are produced. |
-| `stage.output_dir` | Where artifacts are copied (`dist/windows`). |
+| `build.profile` / `build.command` / `build.output_dir` | Declared build metadata (informational — the script deliberately always runs the pinned, safe `cargo build --release` from the repo root; it never executes an arbitrary command read from a manifest). |
+| `stage.output_dir` | Declared staging location (informational — the script deliberately pins staging to the repo-local `dist/windows` so a tampered manifest can never redirect writes outside the repository). |
 | `artifacts[]` | Each entry: `id`, `file` (staged file name), `source` (repo-relative path of the release binary), optional `description`, optional `expected_sha256`. `file` must equal the source file name. |
 | `verification.strategy` / `verification.algorithm` | Verification strategy (`exists-and-sha256` with SHA-256). |
 | `verification.rules` | `source_must_exist`, `staged_must_exist`, `staged_must_match_source` (all default to enforce when absent) and `report` (which fields to print: `size_bytes`, `sha256`). |
@@ -109,6 +111,47 @@ The script is deliberately boring. It never:
 Every failure path — missing cargo, failed build, invalid manifest, missing
 artifact, size/hash mismatch — exits non-zero with a message explaining what
 was wrong.
+
+## Testing
+
+`test-build.ps1` validates `build.ps1` end-to-end with plain PowerShell
+assertions — **no external test framework** — and without ever touching the
+real repository: every test runs `build.ps1` against a throwaway sandbox copy
+under the sandbox root (default `%TEMP%`), then deletes its own sandbox again.
+The only thing the suite ever deletes is those sandboxes; the repository's
+`dist\windows\` is never written to, and one test plants a sentinel file in
+the sandbox's staging directory to prove the script preserves pre-existing
+files (it only overwrites, never deletes).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
+```
+
+Covered scenarios (11 tests):
+
+| Scenario | Expected result |
+| --- | --- |
+| `-SkipBuild` happy path (staging + size/SHA-256 verification + report, sentinel file preserved) | pass |
+| Correct pinned `expected_sha256` | pass |
+| Missing `manifest.json` | fail |
+| Missing release artifact (source absent) | fail |
+| Wrong pinned `expected_sha256` | fail |
+| Path escape via `..` component | fail |
+| Path escape via rooted absolute path | fail |
+| Invalid manifest JSON | fail |
+| `file` differs from the source file name | fail |
+| Unsupported `schema_version` | fail |
+| Failed release build (no `Cargo.toml` in the sandbox, no `-SkipBuild`) | fail loudly, nothing staged |
+
+The script exits `0` when every test passes and `1` when any fails. Useful
+switches: `-BuildScript <path>` points at another copy of `build.ps1` under
+test, `-SandboxRoot <dir>` overrides where sandboxes are created, and
+`-KeepSandbox` keeps the sandboxes for inspection instead of deleting them.
+
+Note: the `cargo build --release` *success* path is not exercised by the
+sandboxed suite (there is no `Cargo.toml` in a sandbox); it is covered by CI
+(`.github/workflows/ci.yml`). The suite does verify that a failing build makes
+the script exit non-zero without staging anything.
 
 ## Verify
 

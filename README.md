@@ -82,6 +82,14 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 
 The script verifies the release build succeeds, validates the manifest, checks that every manifest artifact exists before copying, and after staging verifies each staged copy matches its release binary by size and SHA-256, then reports the staged files' size and SHA-256. It deliberately performs no dangerous operations — no cleaning/deleting, no registry changes, no signing, no installation, no writes outside the repository. `dist/` is generated output and is git-ignored. Installer, signing, and a CI packaging job are later phases (see `STATUS.md`).
 
+The baseline is self-tested by [`packaging/windows/test-build.ps1`](packaging/windows/test-build.ps1) — a zero-framework PowerShell suite that runs `build.ps1` against throwaway sandbox copies under `%TEMP%` (the real repository is never modified) and covers the `-SkipBuild` happy path plus every failure mode: missing manifest, missing artifact, wrong pinned hash, path escapes (`..` and rooted paths), invalid JSON, file-name mismatch, unsupported schema version, and a failed release build. It also proves pre-existing files in `dist\windows\` are preserved (the script only overwrites, never deletes):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
+```
+
+The suite exits `0` when all 11 tests pass and `1` otherwise.
+
 ## CI
 
 GitHub Actions CI (`.github/workflows/ci.yml`) runs on a `windows-latest` runner, since the project targets Windows, and gates every push and pull request with the same three checks that are verified locally:

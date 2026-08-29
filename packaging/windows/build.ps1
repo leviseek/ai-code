@@ -151,9 +151,10 @@ $Report = Get-ManifestField $Rules 'report'
 if ($null -eq $Report) { $Report = @('size_bytes', 'sha256') }
 $Report = @($Report) | ForEach-Object { [string]$_ }
 
-$BuildInfo     = Get-ManifestField $Manifest 'build'
-$BuildCommand  = Get-ManifestField $BuildInfo 'command'
-if ([string]::IsNullOrWhiteSpace($BuildCommand)) { $BuildCommand = 'cargo build --release' }
+# Note: manifest build.command is declared metadata only. The script always
+# runs the pinned, safe `cargo build --release` from the repo root, never an
+# arbitrary command read from a manifest, so a tampered manifest cannot make
+# the script execute something else or write outside the repository.
 $ProductVersion = Get-ManifestField $Manifest.product 'version'
 $TargetOs       = Get-ManifestField $Manifest.target 'os'
 $TargetTriple   = Get-ManifestField $Manifest.target 'triple'
@@ -166,7 +167,7 @@ Write-Host "  target:   $TargetOs/$($Manifest.target.arch) ($TargetTriple)"
 Write-Host "  verify:   $Strategy / $($Manifest.verification.algorithm)"
 
 if (-not $SkipBuild) {
-    Write-Step "Building release binaries: $BuildCommand"
+    Write-Step 'Building release binaries: cargo build --release'
     Push-Location $RepoRoot
     try {
         cargo build --release
