@@ -1,6 +1,7 @@
 mod command_registry;
 mod commands;
 mod event_loop;
+mod git_status;
 mod input;
 mod keymap;
 mod layout;
@@ -21,6 +22,10 @@ pub use commands::{
     CommandOutcome, CommandResult, ShellCommand,
 };
 pub use event_loop::{EventLoop, HeadlessEventLoop};
+pub use git_status::{
+    marker_for, status_kind, summary, tree_statuses, DefaultGitStatusAdapter, GitStatusAdapter,
+    GitStatusSummary, StatusKind, TreeStatus,
+};
 pub use input::{command_for_input, UiInput};
 pub use keymap::{command_for, KeyChord};
 pub use layout::{Point, Rect, ShellLayout, UiRegion};
