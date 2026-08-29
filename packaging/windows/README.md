@@ -17,6 +17,8 @@ install anything.
 | Consumer-side verification of `SHA256SUMS.txt` | Done — `verify-checksums.ps1` reads the checksum manifest and proves every line parses (`<hash>  <file>`), every named file exists, every hash matches the actual file, and the directory matches the manifest exactly; strictly read-only, exits non-zero on any failure |
 | Self-tests for the packaging baseline | Done — `test-build.ps1` (zero external framework, sandboxed, never touches the repo) |
 | Self-tests for the checksum verifier | Done — `test-verify-checksums.ps1` (zero external framework, sandboxed, never touches the repo) |
+| End-user one-command verification of a GitHub Release download | Done — `verify-release-download.ps1` downloads the release's two binaries, its `manifest.json` and the manifest-declared checksum file, resolves the checksum file name from the release's own `manifest.json` (`stage.checksum_file`, never a hardcoded default), asserts the tag is exactly `v<product.version>`, re-verifies the download read-only with the repository's consumer verifier (fetched from the same tag) and smoke-tests the downloaded CLI — the same two gates CI runs on the exact bytes it publishes (see [Verifying a GitHub Release download (end user)](#verifying-a-github-release-download-end-user)) |
+| Self-tests for the end-user download verifier | Done — `test-verify-release-download.ps1` (zero external framework, sandboxed over `file://` URLs — no network, never touches the repo) |
 | Self-tests for the CI release job (tag/version rules + release file manifest + publish attachment naming) | Done — `test-release-sim.ps1` (zero external framework, sandboxed simulation, never touches the repo, no network access, never creates a GitHub Release) |
 | Installer (WiX / Inno Setup / NSIS) | Not yet — later phase |
 | Code signing | Not yet — later phase |
@@ -30,9 +32,11 @@ packaging/
   windows/
     build.ps1                 # the staging entry point (build + stage + generate)
     verify-checksums.ps1      # consumer-side, strictly read-only verification of SHA256SUMS.txt
+    verify-release-download.ps1 # end-user one-command download + checksum + smoke verification of a GitHub Release
     manifest.json             # product metadata, target, artifact list, verification strategy
     test-build.ps1            # self-contained, sandboxed validation tests for build.ps1
     test-verify-checksums.ps1 # self-contained, sandboxed validation tests for verify-checksums.ps1
+    test-verify-release-download.ps1 # self-contained, sandboxed validation tests for verify-release-download.ps1
     test-release-sim.ps1      # self-contained, sandboxed simulation tests for the CI release job
     README.md                 # this file
 dist/              # build output, git-ignored (not committed)
@@ -362,6 +366,53 @@ The suite runs under both Windows PowerShell 5.1 and PowerShell 7 and exits
 test, `-SandboxRoot <dir>` overrides where sandboxes are created, and
 `-KeepSandbox` keeps them for inspection.
 
+`test-verify-release-download.ps1` validates the end-user one-command download
+verifier the same way — zero external framework, every case runs
+`verify-release-download.ps1` in a child process of the same PowerShell
+edition against a throwaway sandbox under the sandbox root (default `%TEMP%`),
+never touching the real repository, **no network access**: each sandbox
+mirrors a GitHub Release — a `release/` tree holding fake binaries,
+`manifest.json` and the checksum manifest (the layout of
+`https://github.com/<repo>/releases/download/<tag>/`) and a `raw/` tree
+holding a copy of the repository's own `verify-checksums.ps1` (the layout of
+`https://raw.githubusercontent.com/<repo>/<tag>/packaging/windows/`) — and
+the script under test is pointed at those trees with `-BaseReleaseUrl` /
+`-VerifyScriptUrl` `file://` URIs, so every download step is exercised for
+real (the exit-code contract is tested for real, the seeded consumer verifier
+is the exact script dist consumers use) while nothing touches the network.
+The only thing the suite ever deletes is its own sandboxes:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
+```
+
+Covered scenarios (14 tests):
+
+| Scenario | Expected result |
+| --- | --- |
+| Happy path (download + checksum verify + CLI smoke, via a runnable CLI stub; verified folder holds exactly the two binaries + the checksum file, metadata folder holds `manifest.json` + `verify-checksums.ps1`) | pass |
+| Happy path with `-SkipSmoke` (a non-runnable CLI stub proves the smoke gate is really skipped) | pass |
+| Invalid tags (`main`, `v0.1`, `v0.1.0.1`, `0.1.0`) rejected before anything is created or downloaded | fail |
+| Tag disagrees with the release's manifest `product.version` (final consistency link, consumer side) | fail |
+| Corrupt `manifest.json` (invalid JSON) | fail |
+| Missing `manifest.json` | fail |
+| Missing release asset (`nextide-shell.exe`) | fail |
+| Tampered binary (served bytes differ from the checksum manifest) — rejected by the consumer verifier, the smoke step never runs on unverified bytes | fail |
+| Renamed checksum file (`CHECKSUMS.txt`) resolved from the release's own `manifest.json` (`stage.checksum_file`), the hardcoded default never appears | pass |
+| Missing declared checksum asset | fail |
+| Missing consumer verifier script in the raw tree | fail |
+| Stale extra file in a pre-existing download folder — the verifier's exact-match contract rejects it (clean-folder contract working) | fail |
+| Zero-byte CLI asset — the checksum manifest still matches, the non-empty assertion closes the gap (the release job's own checklist rule) | fail |
+| Non-runnable CLI — checksums pass, the smoke gate fails, success banner never printed | fail |
+
+The suite runs under both Windows PowerShell 5.1 and PowerShell 7 and exits
+`0` when every test passes, `1` otherwise. Useful switches:
+`-DownloadScript <path>` points at another copy of
+`verify-release-download.ps1` under test, `-VerifyScript <path>` at the
+consumer verifier seeded into each sandbox's raw tree, `-SandboxRoot <dir>`
+overrides where sandboxes are created, and `-KeepSandbox` keeps them for
+inspection.
+
 `test-release-sim.ps1` validates the CI `release` job's own gate rules the same
 way — zero external framework, every case runs against a throwaway sandbox
 under the sandbox root (default `%TEMP%`), never touching the real repository,
@@ -602,6 +653,42 @@ are *not* interchangeable files.
    working, not a broken download. Keep `manifest.json` outside the verified
    folder (next to it is fine); it is metadata *about* the release, not
    something the checksum manifest covers.
+
+### One-command verification (quick start)
+
+The whole flow below — download the three verified files, fetch the consumer
+verifier from the **same tag**, verify the checksums, smoke-test the CLI — is
+scripted in [`verify-release-download.ps1`](verify-release-download.ps1):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\verify-release-download.ps1 -Tag v0.1.0
+```
+
+The script downloads `nextide-cli.exe`, `nextide-shell.exe` and the
+manifest-declared checksum file into a clean folder (default
+`.\nextide-download`), plus the release's `manifest.json` and the repository's
+consumer verifier `verify-checksums.ps1` — fetched from the **same tag** —
+into a sibling metadata folder (default `.\nextide-download-metadata`). It
+resolves the checksum file name from the release's own `manifest.json`
+(`stage.checksum_file`, never a hardcoded default), asserts the tag is exactly
+`v<product.version>` (the same final consistency link CI enforces), runs the
+downloaded verifier read-only against the verified folder (the exact-match
+contract is why the verifier and `manifest.json` live outside it), and finally
+runs `nextide-cli.exe smoke` — the same two gates the CI `release` job runs
+against the exact bytes it publishes. Any failure exits non-zero with a
+message and prints "Do NOT run the downloaded binaries". The script is the
+scripted form of the manual steps below — it never re-implements checksum
+verification or the smoke flow, it delegates to them. It is the one consumer
+step that writes: only into `-OutDir` and `-MetadataDir`, never into the
+repository. Useful switches: `-SkipSmoke` (skip only the smoke gate),
+`-OutDir` / `-MetadataDir` (pick the folders — `-OutDir` must be clean, the
+exact-match contract rejects stale extra files), `-Repo` (a fork), and
+`-BaseReleaseUrl` / `-VerifyScriptUrl` (mirrors / the sandboxed self-test).
+Its sandboxed self-test suite is
+[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (14
+cases over `file://` URLs — no network, the repository never touched, the
+seeded consumer verifier is this repository's own `verify-checksums.ps1`; see
+[Testing](#testing)).
 
 ### 1. Download
 

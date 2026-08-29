@@ -96,6 +96,22 @@ Consumers can verify any staged directory — the repository's own `dist/windows
 powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1
 ```
 
+End users can run the whole download → checksum → smoke flow against a
+published GitHub Release with one command:
+[`packaging/windows/verify-release-download.ps1`](packaging/windows/verify-release-download.ps1)
+(`-Tag v0.1.0`): it downloads the release's two binaries and the
+manifest-declared checksum file, resolves the checksum file name from the
+release's own `manifest.json` (`stage.checksum_file`, never a hardcoded
+default), asserts the tag is exactly `v<product.version>`, re-verifies the
+download read-only with `verify-checksums.ps1` (fetched from the same tag) and
+smoke-tests the downloaded CLI — the same two gates CI runs against the exact
+bytes it publishes; any failure exits non-zero and says not to run the
+binaries. Its sandboxed self-test suite is
+[`packaging/windows/test-verify-release-download.ps1`](packaging/windows/test-verify-release-download.ps1)
+(14 cases over `file://` URLs — no network, never touches the repository),
+and CI runs it as a pre-packaging gate. See the
+[packaging README](packaging/windows/README.md) for the full end-user guide.
+
 ## CI
 
 GitHub Actions CI (`.github/workflows/ci.yml`) runs on a `windows-latest` runner, since the project targets Windows, and gates every push and pull request with the same three checks that are verified locally:

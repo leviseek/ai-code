@@ -40,7 +40,9 @@ jobs:
     # release_channel) — twice, with no duplicated logic: first the sandboxed
     # self-test gates (test-build.ps1, 26 cases, plus
     # test-verify-checksums.ps1, 14 cases, for the consumer-side checksum
-    # verifier) prove the scripts reject every violation, then build.ps1
+    # verifier, and test-verify-release-download.ps1, 14 cases, for the
+    # end-user one-command release download verifier) prove the scripts
+    # reject every violation, then build.ps1
     # -SkipBuild re-runs the same read-only
     # validation against the committed manifest.json and the real Cargo.toml
     # before anything is staged. The release binaries are built here
@@ -153,6 +155,28 @@ jobs:
         # $env:TEMP — the repository is never touched — so a failing test
         # stops the run before anything is built or staged.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-checksums.ps1
+
+      - name: Verify end-user release download script (test-verify-release-download.ps1 gate)
+        # Pre-packaging self-test gate for the end-user one-command release
+        # download verifier (packaging/windows/verify-release-download.ps1).
+        # The sandboxed suite (14 cases, zero framework) proves the whole
+        # consumer flow — download the release's two binaries, manifest.json
+        # and checksum manifest, resolve the checksum file name from the
+        # release's own manifest.json (stage.checksum_file, never a hardcoded
+        # default), assert the tag is exactly v<product.version>, run the
+        # downloaded verify-checksums.ps1 read-only against the download
+        # folder, and smoke-test the downloaded CLI — against throwaway
+        # %TEMP% sandboxes over file:// URLs (no network access, the real
+        # repository is never touched, the seeded consumer verifier is this
+        # repository's own verify-checksums.ps1): happy path with and without
+        # -SkipSmoke, a renamed checksum file, invalid tags rejected before
+        # any download, tag/version mismatches, corrupt/missing manifests,
+        # missing assets and verifier, a tampered binary that never reaches
+        # the smoke step, a stale extra file in the download folder
+        # (exact-match clean-folder contract), a zero-byte CLI (non-empty
+        # assertion) and a non-runnable CLI smoke. A failing test stops the
+        # run before anything is built or staged.
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
 
       - name: Build release binaries
         # --locked: the workspace's Cargo.lock is committed and is the exact
