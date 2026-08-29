@@ -33,9 +33,12 @@ jobs:
     # Produce and upload the Windows release artifacts (dist/windows). Runs
     # only after the checks above pass: `needs: ci` makes the run fail fast,
     # so a failing fmt/clippy/test check stops the pipeline before packaging
-    # ever starts. The release binaries are built here (cargo build --release)
-    # and the packaging script is then invoked with -SkipBuild, which stages
-    # and verifies the freshly built artifacts without rebuilding.
+    # ever starts. The sandboxed packaging self-test (test-build.ps1) runs
+    # first as a pre-packaging gate — a failing test stops the run before
+    # anything is built or staged. The release binaries are then built here
+    # (cargo build --release) and the packaging script is invoked with
+    # -SkipBuild, which stages and verifies the freshly built artifacts
+    # without rebuilding.
     needs: ci
     runs-on: windows-latest
     steps:
@@ -43,6 +46,13 @@ jobs:
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Self-test packaging baseline (test-build.ps1)
+        # Runs the sandboxed packaging self-tests before anything is built or
+        # staged: every test runs build.ps1 against a throwaway sandbox copy
+        # under $env:TEMP and never touches the repository, so this step gates
+        # the build/stage/upload on the packaging script behaving correctly.
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-build.ps1
 
       - name: Build release binaries
         run: cargo build --release
