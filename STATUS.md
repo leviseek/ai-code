@@ -33,11 +33,12 @@ Phase 0：技术基线与核心内核起步。
 - `FileSystem::exists` 升级为类型化只读查询：签名从 `exists(path) -> bool` 变为 `exists(path) -> io::Result<bool>`，默认实现基于 `metadata` 给出 `Ok(true)`（工作区内存在）/`Ok(false)`（缺失）/`Err`（路径逃逸或权限错误，`PermissionDenied`），不再把越界路径静默当作 `false`；`LocalFileSystem` 改用默认实现（rooted 安全约束不变），测试伪实现 MemoryFs/TreeFs/NoopFs 与全部调用点同步更新为 `io::Result<bool>`，新增测试覆盖存在/缺失/相对逃逸/绝对越界四类语义。
 - VFS 新增类型化、稳定排序的目录枚举 API：`FileSystem::read_dir(path) -> io::Result<Vec<FileEntry>>`，`FileEntry` 含 `name`/`path`/`kind`/`len`（`path` 为相对请求目录的完整条目路径），条目按名称字典序稳定排序；缺失路径明确返回 `NotFound`、非目录路径明确返回 `NotADirectory`（含清晰错误消息）、越界路径继续返回 `PermissionDenied`，rooted 文件系统根安全约束不变；trait 默认实现返回 `Unsupported`，现有 `FileSystem` 实现（LocalFileSystem/MemoryFs/TreeFs/NoopFs）无需改动、编译与行为兼容，`LocalFileSystem::list` 改为委托 `read_dir`（排序语义与返回内容保持一致），新增测试覆盖类型字段与长度、稳定排序顺序、缺失/非目录/越界错误、空目录与默认 Unsupported 兼容性。
 - 新增纯 std 的 workspace 全局子串搜索模块（`search` 模块，`SearchQuery`/`SearchOptions`/`SearchMatch`，入口 `search::search(fs, &query)` 与 `query.run(fs)`）：基于任意 rooted `FileSystem` 递归 `read_dir`，返回每个命中的相对路径/1 基行号/字节列偏移/行文本；跳过二进制（非 UTF-8 或含 NUL）与不可读/被拒文件及子目录（静默继续），仅搜索根目录错误向上传播；结果按 `(path, line, column)` 稳定排序并截断到 `max_results`；`case_sensitive`（默认开）、`max_depth`（默认 64，限制含符号链接环的递归）、`"."` 根归一化保证路径不逃逸工作区根。新增 12 个测试覆盖文本命中、大小写、结果上限、稳定排序、二进制/NUL 跳过、不可读文件与目录跳过、符号链接越界与环、空 needle、根错误传播、多字节列偏移与默认选项。未引入新依赖，现有 API 完全兼容。
+- search 模块新增可复用的匹配抽象 `SearchMatcher`（`Literal` 字面模式与 `Glob` 通配符模式，`find_columns`/`is_match` 可脱离文件系统对任意文本复用）：`SearchQuery` 新增 `matcher` 字段并提供 `SearchQuery::glob` 构造器，`SearchQuery::new` 仍默认为字面子串搜索（行为不变），现有 API 完全兼容；Glob 为简单通配符匹配——`*` 匹配任意字符序列（含空）、`?` 恰好一个字符、按子串匹配且首部 `*` 只扩大搜索窗口（`*error*` 等价于"包含 error"并报告 error 的列偏移），明确是 glob 而非正则：字符类/分组/锚点/转义等一律按字面匹配；实现为基于字符的动态规划（按行 O(pattern×line) 时间、O(line) 内存），纯 std 无新依赖。新增 11 个测试覆盖字面/通配符列偏移、空模式、纯 `*` 模式、多列命中、大小写、多字节字符与正则元字符按字面匹配，以及 `SearchQuery::glob` 的端到端查询。
 
 ## 下一步
 
 1. 为 Editor Kernel 增加订阅式事件接口与持久化编辑日志（`document.changed`/`document.saved` 等事件已可经 `EventBus` 轮询/排空，订阅式 API 与持久化日志尚未实现）。
 2. 接入 Windows ConPTY 终端后端（`PlatformServices`/`TerminalSession` 接口与 `WindowsPlatform` 进程 spawn/terminate/状态查询已就绪，ConPTY 实现待接入）。
-3. 增加当前文件搜索与正则表达式搜索（全局子串搜索已实现）。
+3. 增加当前文件搜索与正则表达式搜索（全局子串搜索已实现；通配符搜索已通过 `SearchMatcher::Glob` 支持，完整正则需引入依赖或自研引擎，暂不在纯 std 模块内实现）。
 4. 增加 Git 状态、Diff 与提交服务。
 5. 建立 Windows 安装工程与 CI（编译、测试、打包）流水线。

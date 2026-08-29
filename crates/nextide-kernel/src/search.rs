@@ -2,8 +2,20 @@
 //!
 //! The module is dependency-free and uses only `std`. A search walks a
 //! directory tree recursively through the [`FileSystem`] abstraction, reads
-//! every regular file it can, and reports the lines containing the query
-//! needle.
+//! every regular file it can, and reports the lines matching the query
+//! pattern.
+//!
+//! Matching is pluggable through [`SearchMatcher`]. [`SearchMatcher::Literal`]
+//! (the default) keeps the original behavior: a line matches when it contains
+//! the pattern as a plain substring. [`SearchMatcher::Glob`] interprets the
+//! pattern as a simple glob (wildcard) pattern where `*` matches any run of
+//! characters and `?` matches exactly one character. Glob matching is
+//! deliberately not regular-expression matching: there are no character
+//! classes, alternation, anchors, escapes, or quantifiers beyond `*`/`?`, and
+//! every other character — including regex metacharacters such as `.`, `[`,
+//! `(`, or `+` — matches itself literally. The implementation is a compact
+//! dynamic program over characters, so matching a line is O(pattern × line)
+//! in time and O(line) in memory even for patterns with many wildcards.
 //!
 //! Robustness rules:
 //!
@@ -49,18 +61,86 @@ impl Default for SearchOptions {
     }
 }
 
-/// A request to find every line containing `needle` under `root`.
+/// How a [`SearchQuery`] interprets its `needle` pattern.
+///
+/// The matcher is the reusable matching strategy behind a query: it can be
+/// used standalone through [`SearchMatcher::find_columns`] and
+/// [`SearchMatcher::is_match`] on any text, independent of the filesystem
+/// walk in [`SearchQuery`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchMatcher {
+    /// The needle is a plain substring: every occurrence inside a line
+    /// matches. This is the default and keeps the historical search behavior.
+    #[default]
+    Literal,
+    /// The needle is a simple glob (wildcard) pattern:
+    ///
+    /// - `*` matches any run of characters, including the empty run;
+    /// - `?` matches exactly one character;
+    /// - every other character matches itself.
+    ///
+    /// Like [`SearchMatcher::Literal`], a glob matches *substrings* of a
+    /// line: the pattern must match some contiguous region of the line.
+    /// Leading `*`s only widen the search window and never start matches of
+    /// their own, so `*error*` is equivalent to "contains `error`" and
+    /// reports the column where `error` starts, `gr?y` matches `grey` and
+    /// `gray` but not `gravy`, and `fn *(` matches `fn main(` and `fn (x)`
+    /// but not `fn main`. A pattern whose anchored remainder is empty (only
+    /// `*`s) matches nothing.
+    ///
+    /// This is a glob matcher, not a regular expression: character classes
+    /// (`[a-z]`), alternation (`a|b`), anchors (`^`/`$`), escapes, grouping,
+    /// and other regex syntax are not supported, and those metacharacters
+    /// match literally.
+    Glob,
+}
+
+impl SearchMatcher {
+    /// Byte offsets (0-based) of every occurrence of `pattern` inside `line`,
+    /// honoring `case_sensitive`.
+    ///
+    /// [`SearchMatcher::Literal`] reports every substring occurrence;
+    /// [`SearchMatcher::Glob`] reports the start of every contiguous substring
+    /// the glob matches (see the [`SearchMatcher::Glob`] documentation for
+    /// the pattern language and column semantics). An empty `pattern` matches
+    /// nothing in either mode.
+    pub fn find_columns(&self, pattern: &str, line: &str, case_sensitive: bool) -> Vec<usize> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+        match self {
+            SearchMatcher::Literal => literal_columns(line, pattern, case_sensitive),
+            SearchMatcher::Glob => glob_columns(line, pattern, case_sensitive),
+        }
+    }
+
+    /// Whether `pattern` occurs anywhere inside `line`.
+    pub fn is_match(&self, pattern: &str, line: &str, case_sensitive: bool) -> bool {
+        !self.find_columns(pattern, line, case_sensitive).is_empty()
+    }
+}
+
+/// A request to find every line matching `needle` under `root`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchQuery {
-    /// The substring to search for. An empty needle matches nothing.
+    /// The pattern to search for, interpreted according to
+    /// [`SearchQuery::matcher`]. An empty pattern matches nothing.
     pub needle: String,
     /// Directory to start the search from, relative to the filesystem root.
     pub root: PathBuf,
     /// Options controlling the execution.
     pub options: SearchOptions,
+    /// How [`SearchQuery::needle`] is interpreted. Defaults to
+    /// [`SearchMatcher::Literal`], so a bare word still searches for a plain
+    /// substring.
+    pub matcher: SearchMatcher,
 }
 
 impl SearchQuery {
+    /// Creates a literal-substring query: `needle` is matched as a plain
+    /// substring, with case sensitivity and limits taken from `options`.
+    ///
+    /// This is the historical constructor; its behavior is unchanged.
     pub fn new(
         needle: impl Into<String>,
         root: impl Into<PathBuf>,
@@ -70,6 +150,22 @@ impl SearchQuery {
             needle: needle.into(),
             root: root.into(),
             options,
+            matcher: SearchMatcher::Literal,
+        }
+    }
+
+    /// Creates a glob query: `needle` is interpreted as a simple glob pattern
+    /// (see [`SearchMatcher::Glob`] for the pattern language).
+    pub fn glob(
+        pattern: impl Into<String>,
+        root: impl Into<PathBuf>,
+        options: SearchOptions,
+    ) -> Self {
+        Self {
+            needle: pattern.into(),
+            root: root.into(),
+            options,
+            matcher: SearchMatcher::Glob,
         }
     }
 
@@ -92,9 +188,14 @@ pub struct SearchMatch {
     pub line_text: String,
 }
 
-/// Searches `query.root` inside `fs` for every line containing `query.needle`
-/// and returns the matches stably sorted by `(path, line, column)`, truncated
-/// to [`SearchOptions::max_results`].
+/// Searches `query.root` inside `fs` for every line matching `query.needle`
+/// under `query.matcher` and returns the matches stably sorted by
+/// `(path, line, column)`, truncated to [`SearchOptions::max_results`].
+///
+/// [`SearchMatcher::Literal`] (the default) finds lines containing the needle
+/// as a substring; [`SearchMatcher::Glob`] finds lines containing a substring
+/// matched by the simple glob pattern (see [`SearchMatcher::Glob`] for the
+/// pattern language). An empty needle matches nothing.
 ///
 /// Only regular files are read. Files that cannot be decoded as UTF-8
 /// (binary files), files that contain a NUL byte, and files or directories
@@ -171,10 +272,12 @@ fn search_file<F: FileSystem>(
         // Treat NUL-containing files as binary even when they are valid UTF-8.
         return None;
     }
-    let needle = &query.needle;
     let mut hits = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        for column in match_columns(line, needle, query.options.case_sensitive) {
+        for column in query
+            .matcher
+            .find_columns(&query.needle, line, query.options.case_sensitive)
+        {
             hits.push(SearchMatch {
                 path: entry.path.clone(),
                 line: index + 1,
@@ -186,8 +289,8 @@ fn search_file<F: FileSystem>(
     (!hits.is_empty()).then_some(hits)
 }
 
-/// Byte offsets of every needle occurrence inside `line`.
-fn match_columns(line: &str, needle: &str, case_sensitive: bool) -> Vec<usize> {
+/// Byte offsets of every literal occurrence of `needle` inside `line`.
+fn literal_columns(line: &str, needle: &str, case_sensitive: bool) -> Vec<usize> {
     if case_sensitive {
         line.match_indices(needle).map(|(index, _)| index).collect()
     } else {
@@ -199,6 +302,76 @@ fn match_columns(line: &str, needle: &str, case_sensitive: bool) -> Vec<usize> {
     }
 }
 
+/// Byte offsets of the start of every substring of `line` matched by the glob
+/// `pattern` (`*` matches any run of characters, `?` matches exactly one).
+///
+/// A glob matches at `start` when the pattern can be consumed against the
+/// characters from `start` onwards, ending anywhere before or at the end of
+/// the line, so matching is substring-based: `*X*` is equivalent to "contains
+/// `X`", and `gr?y` matches both `grey` and `gray`. Leading `*`s only widen
+/// the search window and never start matches of their own — the reported
+/// columns are the starts of the anchored remainder of the pattern, so
+/// `*error*` reports the column of `error` itself. A pattern whose anchored
+/// remainder is empty (only `*`s) matches nothing.
+///
+/// The implementation runs a dynamic program of the pattern's characters
+/// against the reversed line (a glob is symmetric under reversal), which is
+/// O(pattern × line) in time and O(line) in memory and stays safe even for
+/// patterns with many wildcards. Columns are byte offsets, so they are always
+/// valid UTF-8 boundaries.
+fn glob_columns(line: &str, pattern: &str, case_sensitive: bool) -> Vec<usize> {
+    let pattern: Vec<char> = pattern.chars().skip_while(|&c| c == '*').collect();
+    let text: Vec<char> = line.chars().collect();
+    if pattern.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let byte_offsets: Vec<usize> = line.char_indices().map(|(index, _)| index).collect();
+    // `ends[j]` is true when the reversed pattern prefix processed so far
+    // matches `reversed_line[k..j]` for some `k`; the empty pattern matches
+    // the empty substring ending at any `j`, which is what lets a match start
+    // anywhere. A reversed match ending at `j` corresponds to an original
+    // match starting at `text.len() - j`.
+    let mut ends = vec![true; text.len() + 1];
+    for &pattern_char in pattern.iter().rev() {
+        let mut next = vec![false; text.len() + 1];
+        if pattern_char == '*' {
+            next[0] = ends[0];
+            for j in 1..=text.len() {
+                // `*` matches the empty run (ends[j]) or one more character
+                // (next[j - 1]).
+                next[j] = ends[j] || next[j - 1];
+            }
+        } else if pattern_char == '?' {
+            // `?` matches exactly one character, whatever it is: each
+            // previous end position simply advances by one character.
+            next[1..].copy_from_slice(&ends[..text.len()]);
+        } else {
+            for j in 1..=text.len() {
+                next[j] =
+                    ends[j - 1] && chars_equal(pattern_char, text[text.len() - j], case_sensitive);
+            }
+        }
+        ends = next;
+    }
+    let mut columns = Vec::new();
+    for (j, &matched) in ends.iter().enumerate().rev() {
+        if matched {
+            let start = text.len() - j;
+            columns.push(byte_offsets.get(start).copied().unwrap_or(line.len()));
+        }
+    }
+    columns
+}
+
+/// Whether two characters are equal, optionally case-folding both sides.
+fn chars_equal(a: char, b: char, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        a == b
+    } else {
+        a.to_lowercase().eq(b.to_lowercase())
+    }
+}
+
 /// Whether `haystack` starts with `needle`, comparing characters with case
 /// folding. Offsets stay valid because matching happens on the original
 /// string, never on a lowercased copy.
@@ -206,7 +379,7 @@ fn chars_match_case_insensitive(haystack: &str, needle: &[char]) -> bool {
     let mut hay = haystack.chars();
     for &expected in needle {
         match hay.next() {
-            Some(actual) if actual.to_lowercase().eq(expected.to_lowercase()) => {}
+            Some(actual) if chars_equal(actual, expected, false) => {}
             _ => return false,
         }
     }
@@ -522,10 +695,156 @@ mod tests {
     }
 
     #[test]
+    fn new_query_defaults_to_literal_and_glob_constructor_sets_matcher() {
+        let literal = SearchQuery::new("x", ".", SearchOptions::default());
+        assert_eq!(literal.matcher, SearchMatcher::Literal);
+        let glob = SearchQuery::glob("x*", ".", SearchOptions::default());
+        assert_eq!(glob.matcher, SearchMatcher::Glob);
+    }
+
+    #[test]
+    fn glob_query_finds_lines_matching_the_pattern() {
+        let root = temp_root("glob");
+        let fs = LocalFileSystem::rooted(&root);
+        fs.write(
+            Path::new("a.txt"),
+            "fn main() {\nlet x = 1;\n// TODO: fix\nfn helper()\n",
+        )
+        .unwrap();
+        let matches = SearchQuery::glob("fn *(", ".", SearchOptions::default())
+            .run(&fs)
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].line, 1);
+        assert_eq!(matches[0].column, 0);
+        assert_eq!(matches[0].line_text, "fn main() {");
+        assert_eq!(matches[1].line, 4);
+        assert_eq!(matches[1].column, 0);
+        assert_eq!(matches[1].line_text, "fn helper()");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn glob_query_respects_case_sensitivity() {
+        let root = temp_root("glob-case");
+        let fs = LocalFileSystem::rooted(&root);
+        fs.write(Path::new("a.txt"), "Hello world\n").unwrap();
+        let sensitive = SearchQuery::glob("h?llo*", ".", SearchOptions::default())
+            .run(&fs)
+            .unwrap();
+        assert!(sensitive.is_empty());
+        let options = SearchOptions {
+            case_sensitive: false,
+            ..Default::default()
+        };
+        let matches = SearchQuery::glob("h?llo*", ".", options).run(&fs).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 1);
+        assert_eq!(matches[0].column, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn glob_query_empty_pattern_matches_nothing() {
+        let root = temp_root("glob-empty");
+        let fs = LocalFileSystem::rooted(&root);
+        fs.write(Path::new("a.txt"), "anything\n").unwrap();
+        let matches = SearchQuery::glob("", ".", SearchOptions::default())
+            .run(&fs)
+            .unwrap();
+        assert!(matches.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn default_options_are_case_sensitive_and_bounded() {
         let options = SearchOptions::default();
         assert!(options.case_sensitive);
         assert_eq!(options.max_results, None);
         assert_eq!(options.max_depth, Some(64));
+    }
+}
+
+#[cfg(test)]
+mod matcher_tests {
+    use super::*;
+
+    #[test]
+    fn literal_finds_every_occurrence() {
+        let matcher = SearchMatcher::Literal;
+        assert_eq!(matcher.find_columns("ab", "abab", true), vec![0, 2]);
+        assert_eq!(matcher.find_columns("ab", "ABab", false), vec![0, 2]);
+        assert_eq!(matcher.find_columns("", "ab", true), Vec::<usize>::new());
+        assert!(matcher.is_match("ab", "xaby", true));
+        assert!(!matcher.is_match("ab", "xay", true));
+    }
+
+    #[test]
+    fn glob_star_matches_any_run_including_the_empty_run() {
+        let matcher = SearchMatcher::Glob;
+        assert!(matcher.is_match("a*b", "ab", true));
+        assert!(matcher.is_match("a*b", "a123b", true));
+        assert!(!matcher.is_match("a*b", "ac", true));
+        // `a*` matches every `a` followed by anything.
+        assert_eq!(matcher.find_columns("a*", "banana", true), vec![1, 3, 5]);
+        // A pattern of only `*`s has no anchored part and matches nothing.
+        assert!(matcher.find_columns("*", "ab", true).is_empty());
+        assert!(!matcher.is_match("*", "ab", true));
+    }
+
+    #[test]
+    fn glob_question_matches_exactly_one_character() {
+        let matcher = SearchMatcher::Glob;
+        assert!(matcher.is_match("gr?y", "grey", true));
+        assert!(matcher.is_match("gr?y", "gray", true));
+        assert!(!matcher.is_match("gr?y", "gravy", true));
+        assert!(!matcher.is_match("gr?y", "gr", true));
+        assert!(!matcher.is_match("gr?y", "gy", true));
+    }
+
+    #[test]
+    fn glob_matches_substrings_and_keeps_literal_behavior_without_wildcards() {
+        let matcher = SearchMatcher::Glob;
+        // A glob without wildcards behaves exactly like a literal search.
+        assert_eq!(
+            matcher.find_columns("needle", "needle in needle", true),
+            vec![0, 10]
+        );
+        assert!(matcher.is_match("gr?y", "a grey sky", true));
+        assert_eq!(matcher.find_columns("gr?y", "grey gray", true), vec![0, 5]);
+        // Leading `*`s widen the window; columns point at the anchored part.
+        assert_eq!(
+            matcher.find_columns("*error*", "xx error yy", true),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn glob_respects_case_sensitivity() {
+        let matcher = SearchMatcher::Glob;
+        assert!(!matcher.is_match("h?llo", "HELLO", true));
+        assert!(matcher.is_match("h?llo", "HELLO", false));
+        assert_eq!(matcher.find_columns("h*", "Hello", false), vec![0]);
+        assert!(matcher.find_columns("h*", "Hello", true).is_empty());
+    }
+
+    #[test]
+    fn glob_question_matches_one_character_and_columns_are_byte_offsets() {
+        let matcher = SearchMatcher::Glob;
+        // `?` consumes exactly one character, so it covers a whole
+        // multibyte char, and columns stay byte offsets.
+        assert!(matcher.is_match("?界", "世界", true));
+        assert_eq!(matcher.find_columns("?界", "世界", true), vec![0]);
+        assert_eq!(matcher.find_columns("*好*", "你好世界", true), vec![3]);
+    }
+
+    #[test]
+    fn glob_treats_regex_metacharacters_as_literals() {
+        let matcher = SearchMatcher::Glob;
+        // Not a regex: character classes and alternation match literally.
+        assert!(matcher.is_match("[ab]", "x[ab]y", true));
+        assert!(!matcher.is_match("[ab]", "xay", true));
+        assert!(matcher.is_match("a+b", "a+b", true));
+        assert!(!matcher.is_match("a+b", "ab", true));
     }
 }

@@ -37,7 +37,7 @@ pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlat
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};
 pub use render::{HeadlessSurface, RenderSurface, SurfaceSize};
 pub use rpc::{LocalRpcRouter, RpcError, RpcHandler, RpcRequest, RpcResponse};
-pub use search::{SearchMatch, SearchOptions, SearchQuery};
+pub use search::{SearchMatch, SearchMatcher, SearchOptions, SearchQuery};
 pub use tabs::{Tab, TabModel};
 pub use task::{Task, TaskError, TaskResult, TaskSpec, TaskState};
 pub use task_events::{AsyncTaskEventSink, TaskEventReceiver};
