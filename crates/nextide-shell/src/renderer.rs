@@ -12,6 +12,10 @@ pub struct TreeRenderRow {
     /// The Git status marker projected from [`crate::TreeItem::status`];
     /// [`StatusKind::Clean`] when the item carries no pending change.
     pub status: StatusKind,
+    /// The stable short badge for [`status`](Self::status), projected from
+    /// [`StatusKind::marker`]; a single space when the item carries no
+    /// pending change, so badge columns keep a fixed width.
+    pub status_marker: &'static str,
 }
 
 impl TreeRenderRow {
@@ -41,6 +45,7 @@ pub fn tree_rows(snapshot: &ShellSnapshot) -> Vec<TreeRenderRow> {
             selected: item.selected,
             icon: if item.directory { "folder" } else { "file" },
             status: item.status,
+            status_marker: item.status.marker(),
         })
         .collect()
 }
@@ -128,6 +133,7 @@ pub trait UiRenderer {
                 selected: item.selected,
                 icon: if item.directory { "folder" } else { "file" },
                 status: item.status,
+                status_marker: item.status.marker(),
             })
             .collect())
     }
@@ -192,6 +198,7 @@ mod tests {
             selected: false,
             icon: "file",
             status: StatusKind::Clean,
+            status_marker: " ",
         }];
         let current = vec![
             TreeRenderRow {
@@ -202,6 +209,7 @@ mod tests {
                 selected: true,
                 icon: "file",
                 status: StatusKind::Clean,
+                status_marker: " ",
             },
             TreeRenderRow {
                 path: "new.rs".into(),
@@ -211,6 +219,7 @@ mod tests {
                 selected: false,
                 icon: "file",
                 status: StatusKind::Clean,
+                status_marker: " ",
             },
         ];
         let changes = diff_tree_rows(&old, &current);
@@ -237,6 +246,7 @@ mod tests {
                 selected: false,
                 icon: "folder",
                 status: StatusKind::Clean,
+                status_marker: " ",
             }),
             TreeRowChange::Updated(TreeRenderRow {
                 path: "src/main.rs".into(),
@@ -246,6 +256,7 @@ mod tests {
                 selected: true,
                 icon: "file",
                 status: StatusKind::Clean,
+                status_marker: " ",
             }),
             TreeRowChange::Removed("old.rs".into()),
         ];
@@ -301,6 +312,7 @@ mod tests {
             (16, 24, "file", true)
         );
         assert_eq!(rows[1].status, StatusKind::Staged);
+        assert_eq!(rows[1].status_marker, "S");
     }
 
     #[test]
@@ -313,6 +325,7 @@ mod tests {
             selected: false,
             icon: "folder",
             status: StatusKind::Clean,
+            status_marker: " ",
         };
         assert!(row.toggle_hit(crate::Point { x: 8, y: 30 }));
         assert!(!row.toggle_hit(crate::Point { x: 20, y: 30 }));
@@ -333,6 +346,7 @@ mod tests {
             selected: false,
             icon: "file",
             status: StatusKind::Clean,
+            status_marker: " ",
         };
         assert!(row.hit(crate::Point { x: 20, y: 30 }, 280));
         assert!(!row.hit(crate::Point { x: 10, y: 30 }, 280));
@@ -407,6 +421,11 @@ mod tests {
         let rows = tree_rows(&snapshot);
         assert_eq!(rows[0].status, StatusKind::Staged);
         assert_eq!(rows[1].status, StatusKind::Untracked);
+        // The short badge is projected alongside the kind.
+        assert_eq!(rows[0].status_marker, "S");
+        assert_eq!(rows[1].status_marker, "?");
+        assert_eq!(rows[0].status_marker, rows[0].status.marker());
+        assert_eq!(rows[1].status_marker, rows[1].status.marker());
     }
 
     #[test]
@@ -419,6 +438,7 @@ mod tests {
             selected: false,
             icon: "file",
             status: StatusKind::Clean,
+            status_marker: " ",
         }];
         let current = vec![TreeRenderRow {
             path: "main.rs".into(),
@@ -428,11 +448,12 @@ mod tests {
             selected: false,
             icon: "file",
             status: StatusKind::Staged,
+            status_marker: "S",
         }];
         let changes = diff_tree_rows(&old, &current);
         assert_eq!(changes.len(), 1);
         assert!(
-            matches!(&changes[0], TreeRowChange::Updated(row) if row.status == StatusKind::Staged)
+            matches!(&changes[0], TreeRowChange::Updated(row) if row.status == StatusKind::Staged && row.status_marker == "S")
         );
     }
 }

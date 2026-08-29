@@ -13,7 +13,9 @@
 //!   conflicts beat ordinary changes, a two-sided change
 //!   ([`StatusKind::StagedAndUnstaged`]) beats a one-sided one, and states
 //!   with no change (including `Ignored`, which `status` never reports)
-//!   classify as [`StatusKind::Clean`].
+//!   classify as [`StatusKind::Clean`]. Each kind also exposes a stable
+//!   single-character badge via [`StatusKind::marker`] (`!`/`M`/`S`/`U`/`?`/
+//!   single space).
 //! - [`tree_statuses`] projects every entry of a snapshot into a
 //!   [`TreeStatus`] and re-sorts them stably by path, so the model's path
 //!   order is its own contract even if the snapshot's ordering ever changed.
@@ -73,6 +75,32 @@ impl StatusKind {
             Self::Unstaged => "unstaged",
             Self::Untracked => "untracked",
             Self::Clean => "clean",
+        }
+    }
+
+    /// A stable, single-character visual marker for tree-row badges.
+    ///
+    /// Each variant maps to exactly one ASCII character, so badge columns can
+    /// keep a fixed width and the mapping never changes between releases:
+    ///
+    /// - [`StatusKind::Conflicted`] → `"!"` (unmerged/conflict)
+    /// - [`StatusKind::StagedAndUnstaged`] → `"M"` (modified on both sides)
+    /// - [`StatusKind::Staged`] → `"S"` (staged in the index)
+    /// - [`StatusKind::Unstaged`] → `"U"` (worktree-only change)
+    /// - [`StatusKind::Untracked`] → `"?"`
+    /// - [`StatusKind::Clean`] → `" "` (a single space: no badge)
+    ///
+    /// The marker is derived purely from the kind, so it is available even
+    /// without a kernel snapshot; UIs that need the exact porcelain letter
+    /// (`M`/`A`/`D`/…) can read [`TreeStatus::state`] instead.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Conflicted => "!",
+            Self::StagedAndUnstaged => "M",
+            Self::Staged => "S",
+            Self::Unstaged => "U",
+            Self::Untracked => "?",
+            Self::Clean => " ",
         }
     }
 
@@ -340,6 +368,29 @@ mod tests {
         assert_eq!(StatusKind::Clean.as_str(), "clean");
         assert!(StatusKind::Staged.is_change());
         assert!(!StatusKind::Clean.is_change());
+    }
+
+    #[test]
+    fn status_kind_markers_are_stable_distinct_and_fixed_width() {
+        let markers: Vec<&'static str> = [
+            StatusKind::Conflicted,
+            StatusKind::StagedAndUnstaged,
+            StatusKind::Staged,
+            StatusKind::Unstaged,
+            StatusKind::Untracked,
+            StatusKind::Clean,
+        ]
+        .iter()
+        .map(|kind| kind.marker())
+        .collect();
+        assert_eq!(markers, vec!["!", "M", "S", "U", "?", " "]);
+        // Every variant has its own marker, so a badge column never
+        // conflates two kinds, and every marker is exactly one character.
+        let mut sorted = markers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), markers.len());
+        assert!(markers.iter().all(|marker| marker.len() == 1));
     }
 
     #[test]

@@ -934,6 +934,9 @@ mod tests {
         shell.render_ui(&mut renderer).unwrap();
         assert_eq!(renderer.tree_rows()[0].status, StatusKind::Staged);
         assert_eq!(renderer.tree_rows()[1].status, StatusKind::Untracked);
+        // The short badge reaches render rows through the same projection.
+        assert_eq!(renderer.tree_rows()[0].status_marker, "S");
+        assert_eq!(renderer.tree_rows()[1].status_marker, "?");
     }
 
     #[test]
@@ -991,7 +994,7 @@ mod tests {
         shell.render_ui(&mut renderer).unwrap();
         assert_eq!(shell.tree_changes().len(), 1);
         assert!(
-            matches!(&shell.tree_changes()[0], TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged)
+            matches!(&shell.tree_changes()[0], TreeRowChange::Updated(row) if row.status == StatusKind::Unstaged && row.status_marker == "U")
         );
         assert_eq!(shell.tree_change_frame(), 2);
     }
