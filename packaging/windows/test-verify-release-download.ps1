@@ -59,6 +59,9 @@
      24. copied script outside the repository layout fails
          safely and asks for -RepositoryRoot (the derived root
          is only trusted when the layout is real)               -> fails, nothing created/downloaded
+     25. manifest-declared checksum file name that is not a plain,
+         URL-safe file name ('.. ' / '.. .' Windows-normalize like
+         '..', ':ads', control character, space)               -> fails, nothing downloaded
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -892,6 +895,34 @@ Invoke-Test -Name 'copied script outside the repository layout fails safely and 
         Assert ($Result.Output -match 'pass -RepositoryRoot') "expected the -RepositoryRoot guidance message: $($Result.Output)"
         Assert (-not (Test-Path -LiteralPath $Release.OutDir)) 'no download folder may be created'
         Assert (-not (Test-Path -LiteralPath $Release.MetadataDir)) 'no metadata folder may be created'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 25. Manifest-declared checksum file name safety: the name flows into a
+#     download URL and a local write inside OutDir, so it must be a plain,
+#     URL-safe file name. The consumer verifier's own leaf-name rule (no path
+#     separators, no '.'/'..', no control characters) is the baseline; the
+#     download script refuses more because the name also drives a URL and a
+#     local write: '.. ' / '.. .' (Windows strips the trailing dot/space, so
+#     they would resolve like '..', outside the verified folder), ':' (an
+#     alternate data stream), and spaces (invalid in a URL) are all rejected
+#     up front, before any binary is downloaded.
+# ---------------------------------------------------------------------------
+Invoke-Test -Name 'manifest checksum file name that is not a plain, URL-safe file name is rejected before any download' -Body {
+    $Root = New-Sandbox
+    try {
+        foreach ($BadName in @('.. ', '.. .', 'evil.txt:ads', "bad`tname.txt", 'bad name.txt')) {
+            $Release = New-FakeRelease -Root $Root -RunnableCli -ChecksumFile $BadName -NoChecksumAsset
+            $Result = Invoke-DownloadScript -Release $Release
+            Assert ($Result.ExitCode -ne 0) "'$BadName': expected non-zero exit, got $($Result.ExitCode)`n$($Result.Output)"
+            Assert ($Result.Output -match 'plain, URL-safe file name') "'$BadName': expected the plain-file-name message: $($Result.Output)"
+            $OutFiles = Get-FileNames $Release.OutDir
+            Assert (($OutFiles -join ',') -eq '') "'$BadName': no binary may be downloaded into the verified folder, got: $($OutFiles -join ', ')"
+        }
     }
     finally {
         Remove-Sandbox $Root

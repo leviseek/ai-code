@@ -40,7 +40,7 @@ jobs:
     # release_channel) — twice, with no duplicated logic: first the sandboxed
     # self-test gates (test-build.ps1, 26 cases, plus
     # test-verify-checksums.ps1, 14 cases, for the consumer-side checksum
-    # verifier, and test-verify-release-download.ps1, 24 cases, for the
+    # verifier, and test-verify-release-download.ps1, 25 cases, for the
     # end-user one-command release download verifier) prove the scripts
     # reject every violation, then build.ps1
     # -SkipBuild re-runs the same read-only
@@ -159,13 +159,17 @@ jobs:
       - name: Verify end-user release download script (test-verify-release-download.ps1 gate)
         # Pre-packaging self-test gate for the end-user one-command release
         # download verifier (packaging/windows/verify-release-download.ps1).
-        # The sandboxed suite (24 cases, zero framework) proves the whole
+        # The sandboxed suite (25 cases, zero framework) proves the whole
         # consumer flow — download the release's two binaries, manifest.json
         # and checksum manifest, resolve the checksum file name from the
         # release's own manifest.json (stage.checksum_file, never a hardcoded
-        # default), assert the tag is exactly v<product.version>, run the
-        # downloaded verify-checksums.ps1 read-only against the download
-        # folder, and smoke-test the downloaded CLI — against throwaway
+        # default, and validated as a plain, URL-safe file name — separators,
+        # ':' (alternate data streams), control characters, spaces and a
+        # trailing dot/space that Windows normalizes to '.'/'..' are all
+        # refused before any binary is downloaded), assert the tag is exactly
+        # v<product.version>, run the downloaded verify-checksums.ps1
+        # read-only against the download folder, and smoke-test the downloaded
+        # CLI — against throwaway
         # %TEMP% sandboxes over file:// URLs (no network access, the real
         # repository is never touched, the seeded consumer verifier is this
         # repository's own verify-checksums.ps1): happy path with and without

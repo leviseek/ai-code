@@ -386,7 +386,7 @@ The only thing the suite ever deletes is its own sandboxes:
 powershell -ExecutionPolicy Bypass -File packaging\windows\test-verify-release-download.ps1
 ```
 
-Covered scenarios (24 tests):
+Covered scenarios (25 tests):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -414,6 +414,7 @@ Covered scenarios (24 tests):
 | Explicit `-RepositoryRoot` protects the stated root — a custom root, not the one derived from the script's own location — and its `dist/` subtree; the stated root is normalized (`..` and a trailing separator cannot dodge the check) | fail |
 | Explicit `-RepositoryRoot` that does not exist — a typo must never silently disable the protection | fail |
 | Copied script outside the repository layout — the derived root is only trusted when the script really sits in `packaging\windows` of that checkout; the copy fails safely and asks for `-RepositoryRoot` | fail |
+| Manifest-declared checksum file name that is not a plain, URL-safe file name (`.. ` / `.. .` Windows-normalize like `..`, `:ads` alternate data stream, control character, space) — rejected before any binary is downloaded, because the name also drives a URL and a local write | fail |
 
 The suite runs under both Windows PowerShell 5.1 and PowerShell 7 and exits
 `0` when every test passes, `1` otherwise. Useful switches:
@@ -715,7 +716,7 @@ and any other scheme are refused, since the checksum manifest and the consumer
 verifier travel over the same URLs and an unauthenticated transport would let
 a network attacker substitute the binaries and their manifest together). Its
 sandboxed self-test suite is
-[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (24
+[`test-verify-release-download.ps1`](test-verify-release-download.ps1) (25
 cases over `file://` URLs — no network, the repository never touched, the
 seeded consumer verifier is this repository's own `verify-checksums.ps1`; see
 [Testing](#testing)).

@@ -39,8 +39,9 @@
       4. download the release's manifest.json into MetadataDir and parse it
          read-only: it must be valid JSON, product.version must be non-blank
          and exactly the -Tag version, and stage.checksum_file must be a
-         non-blank plain file name — the tag/version and checksum-file-name
-         rules the CI release job enforces, checked here on the consumer side;
+         non-blank plain, URL-safe file name — the tag/version and
+         checksum-file-name rules the CI release job enforces, checked here on
+         the consumer side;
       5. download nextide-cli.exe, nextide-shell.exe and the declared checksum
          file into OutDir, each proven present and non-empty after download;
       6. download verify-checksums.ps1 from the same tag into MetadataDir —
@@ -363,8 +364,17 @@ if ($null -ne $Manifest.stage) { $ChecksumFile = [string]$Manifest.stage.checksu
 if ([string]::IsNullOrWhiteSpace($ChecksumFile)) {
     Fail 'Release manifest.json declares no stage.checksum_file'
 }
-if ($ChecksumFile -match '[\\/]' -or $ChecksumFile -eq '.' -or $ChecksumFile -eq '..') {
-    Fail "Release manifest.json stage.checksum_file must be a plain file name, got: '$ChecksumFile'"
+# The name is used both as a URL path segment and as the local file name the
+# checksum manifest is written to inside OutDir, so it must be a plain,
+# URL-safe file name. The consumer verifier's own leaf-name rule (no path
+# separators, no '.'/'..', no control characters) is the baseline; the
+# download script refuses more because the name also drives a URL and a local
+# write: ':' (alternate data streams), a space (invalid in a URL), and a
+# trailing dot/space (Windows silently strips them, so '.. ' / '.. .' would
+# resolve like '..' — outside the verified folder — and 'X.' would be written
+# as 'X', a name the manifest did not declare).
+if ($ChecksumFile -match '[\\/:]' -or $ChecksumFile -eq '.' -or $ChecksumFile -eq '..' -or $ChecksumFile -match '[\x00-\x1f ]' -or $ChecksumFile -match '[. ]$') {
+    Fail "Release manifest.json stage.checksum_file must be a plain, URL-safe file name (no path separators, no ':' (alternate data streams), no '.'/'..' or a trailing dot/space that Windows normalizes to them, no control characters or spaces), got: '$ChecksumFile'"
 }
 
 # 5. Download the two binaries and the manifest-declared checksum file into

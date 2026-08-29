@@ -118,7 +118,7 @@ script fails and asks for it) and can be stated explicitly with
 `-RepositoryRoot` — e.g. when running a copy of the script. Its
 sandboxed self-test suite is
 [`packaging/windows/test-verify-release-download.ps1`](packaging/windows/test-verify-release-download.ps1)
-(24 cases over `file://` URLs — no network, never touches the repository),
+(25 cases over `file://` URLs — no network, never touches the repository),
 and CI runs it as a pre-packaging gate. See the
 [packaging README](packaging/windows/README.md) for the full end-user guide.
 
