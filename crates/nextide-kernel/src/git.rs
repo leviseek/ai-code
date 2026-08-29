@@ -66,7 +66,7 @@
 //! content), while every parsed path still passes the same safety check as
 //! `status`.
 //!
-//! # Stage and commit
+//! # Stage, unstage and commit
 //!
 //! [`stage(root, paths)`](stage) stages paths into the index with
 //! `git -C <root> add -- <paths>` and returns the fresh
@@ -78,6 +78,19 @@
 //! prefix as pathspec magic (for example `:(top)` or `:(exclude)`) — or the
 //! call fails with [`io::ErrorKind::InvalidInput`] before git is spawned;
 //! an empty `paths` slice is rejected the same way.
+//!
+//! [`unstage(root, paths)`](unstage) removes paths from the index with
+//! `git -C <root> reset -- <paths>` and returns the fresh
+//! [`GitStatusSnapshot`] from [`status`]. The same safety rules as
+//! [`stage`] apply: no shell, every path is its own argument after the `--`
+//! separator, and each path must be rooted at `root` (relative, non-empty,
+//! free of parent, root and drive components) and must not start with `:` —
+//! an empty `paths` slice is rejected with [`io::ErrorKind::InvalidInput`]
+//! before git is spawned. A `.` pathspec un-stages everything under `root`
+//! (git resolves it relative to `root`). Unlike `git add`, `git reset --`
+//! with a pathspec does not fail when a pathspec matches nothing — the
+//! index is simply left untouched for that path — so a successful call
+//! always reflects the resulting state.
 //!
 //! [`commit(root, message)`](commit) creates a commit from the staged
 //! changes with `git -C <root> commit --message=<message>`, where the
@@ -873,7 +886,7 @@ fn check_rooted_path_named(path: &Path, what: &str) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Git stage and commit
+// Git stage, unstage and commit
 // ---------------------------------------------------------------------------
 
 /// The result of a successful [`commit`].
@@ -941,6 +954,62 @@ fn run_git_add(program: &str, root: &Path, paths: &[&Path]) -> io::Result<()> {
         .args(paths)
         .output()?;
     ensure_git_success(&output, "add")
+}
+
+/// Removes the given paths from the index and returns the resulting
+/// [`GitStatusSnapshot`] from [`status`].
+///
+/// Runs `git -C <root> reset -- <paths>`: no shell, and every path is passed
+/// as its own argument after the `--` separator, so option-like names such
+/// as `--help` or `-f` are un-staged literally. A `.` pathspec un-stages
+/// everything under `root` (git resolves it relative to `root`). Unlike
+/// `git add`, `git reset --` with a pathspec does not fail when a path
+/// matches nothing — the index is simply left untouched for that path — so a
+/// successful call means git accepted the pathspecs and the returned
+/// snapshot always reflects the resulting state.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `paths` is empty or contains a path
+///   that is not rooted at `root` or starts with `:`.
+/// - [`io::ErrorKind::Other`] if `git reset` exits non-zero; git's message
+///   is included.
+pub fn unstage(root: &Path, paths: &[&Path]) -> io::Result<GitStatusSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    if paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one path must be un-staged",
+        ));
+    }
+    for path in paths {
+        check_unstage_path(path)?;
+    }
+    run_git_reset("git", root, paths)?;
+    status(root)
+}
+
+/// Runs `program -C root reset -- <paths>`; split out so tests can exercise
+/// the spawn-failure path with a program that does not exist.
+fn run_git_reset(program: &str, root: &Path, paths: &[&Path]) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("reset")
+        .arg("--")
+        .args(paths)
+        .output()?;
+    ensure_git_success(&output, "reset")
 }
 
 /// Creates a commit from the staged changes and returns its hash and
@@ -1058,22 +1127,33 @@ fn check_commit_message(message: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Validates a caller-supplied stage path: it must be rooted at `root` and
-/// must not start with `:` — after the `--` separator git still interprets a
-/// `:` prefix as pathspec magic (for example `:(top)` or `:(exclude)`), so
-/// such paths are rejected before git is spawned.
-fn check_stage_path(path: &Path) -> io::Result<()> {
-    check_rooted_path_named(path, "stage path")?;
+/// Validates a caller-supplied path that git will see after the `--`
+/// separator of an index-changing command (stage or unstage): it must be
+/// rooted at `root` and must not start with `:` — after the `--` separator
+/// git still interprets a `:` prefix as pathspec magic (for example
+/// `:(top)` or `:(exclude)`). `what` names the operation in error messages.
+fn check_index_path(path: &Path, what: &str) -> io::Result<()> {
+    check_rooted_path_named(path, what)?;
     if path.to_string_lossy().starts_with(':') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "stage path must not start with ':' (git pathspec magic): {}",
+                "{what} must not start with ':' (git pathspec magic): {}",
                 path.display()
             ),
         ));
     }
     Ok(())
+}
+
+/// Validates a caller-supplied stage path: see [`check_index_path`].
+fn check_stage_path(path: &Path) -> io::Result<()> {
+    check_index_path(path, "stage path")
+}
+
+/// Validates a caller-supplied unstage path: see [`check_index_path`].
+fn check_unstage_path(path: &Path) -> io::Result<()> {
+    check_index_path(path, "unstage path")
 }
 
 // ---------------------------------------------------------------------------
@@ -2497,6 +2577,224 @@ mod tests {
         assert_eq!(
             entry.state,
             GitFileState::new(GitStatusCode::Added, GitStatusCode::Unmodified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- unstage() argument safety (no git binary needed) ----
+
+    #[test]
+    fn unstage_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-unstage-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            unstage(&missing, &[Path::new("a.txt")]).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn unstage_file_root_is_not_a_directory() {
+        let file =
+            std::env::temp_dir().join(format!("nextide-unstage-notdir-{}.txt", std::process::id()));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            unstage(&file, &[Path::new("a.txt")]).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn unstage_empty_paths_is_invalid_input() {
+        let root = temp_dir("unstageempty");
+        let error = unstage(&root, &[]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unstage_rejects_unrooted_and_magic_paths() {
+        let root = temp_dir("unstagebad");
+        for path in [
+            Path::new(""),
+            Path::new("/etc/passwd"),
+            Path::new("..\\outside.txt"),
+            Path::new("a/../../outside.txt"),
+            Path::new("C:\\windows\\file.txt"),
+            Path::new("C:drive-relative.txt"),
+            Path::new("\\\\server\\share\\file.txt"),
+            Path::new(":(top)etc"),
+            Path::new(":(exclude)secret"),
+        ] {
+            let error = unstage(&root, &[path]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "path {path:?} should be rejected"
+            );
+        }
+        // `.` (un-stage everything under root) passes validation.
+        check_unstage_path(Path::new(".")).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_unstage_surfaces_as_not_found() {
+        let root = temp_dir("unstagenobinary");
+        let error =
+            run_git_reset("nextide-no-such-git-binary", &root, &[Path::new("a.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- unstage() integration (requires a git binary) ----
+
+    #[test]
+    fn unstage_removes_paths_from_the_index_and_returns_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("unstagepick", &[("a.txt", "a"), ("b.txt", "b")]);
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let staged = stage(&root, &[Path::new("a.txt"), Path::new("b.txt")]).unwrap();
+        assert_eq!(staged.entries.len(), 2);
+
+        // Only a.txt is un-staged; b.txt stays staged.
+        let snapshot = unstage(&root, &[Path::new("a.txt")]).unwrap();
+        let a = find(&snapshot, "a.txt");
+        assert_eq!(
+            a.state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        let b = find(&snapshot, "b.txt");
+        assert_eq!(
+            b.state,
+            GitFileState::new(GitStatusCode::Modified, GitStatusCode::Unmodified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unstage_with_dot_unstages_the_whole_root() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("unstagedot", &[("a.txt", "a")]);
+        fs::write(root.join("a.txt"), "CHANGED").unwrap();
+        fs::write(root.join("new.txt"), "untracked").unwrap();
+        let staged = stage(&root, &[Path::new("a.txt"), Path::new("new.txt")]).unwrap();
+        assert_eq!(staged.entries.len(), 2);
+
+        let snapshot = unstage(&root, &[Path::new(".")]).unwrap();
+        let a = find(&snapshot, "a.txt");
+        assert_eq!(
+            a.state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        let new = find(&snapshot, "new.txt");
+        assert!(new.state.is_untracked());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unstage_restores_staged_deletion_to_unstaged() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("unstagedel", &[("gone.txt", "x")]);
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        let staged = stage(&root, &[Path::new("gone.txt")]).unwrap();
+        assert_eq!(
+            find(&staged, "gone.txt").state,
+            GitFileState::new(GitStatusCode::Deleted, GitStatusCode::Unmodified)
+        );
+
+        let snapshot = unstage(&root, &[Path::new("gone.txt")]).unwrap();
+        let entry = find(&snapshot, "gone.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Deleted)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unstage_handles_option_like_and_whitespace_paths() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("unstageopt", &[("plain.txt", "p")]);
+        fs::write(root.join("--help"), "x").unwrap();
+        fs::write(root.join("-f"), "z").unwrap();
+        fs::write(root.join("with space 中文.txt"), "y").unwrap();
+        let paths = [
+            Path::new("--help"),
+            Path::new("-f"),
+            Path::new("with space 中文.txt"),
+        ];
+        let staged = stage(&root, &paths).unwrap();
+        for path in ["--help", "-f", "with space 中文.txt"] {
+            assert_eq!(
+                find(&staged, path).state,
+                GitFileState::new(GitStatusCode::Added, GitStatusCode::Unmodified)
+            );
+        }
+
+        // Option-like names are passed literally after `--`, never parsed as
+        // git options, and un-staging drops them back to untracked.
+        let snapshot = unstage(&root, &paths).unwrap();
+        for path in ["--help", "-f", "with space 中文.txt"] {
+            let entry = find(&snapshot, path);
+            assert!(
+                entry.state.is_untracked(),
+                "{path:?} should be untracked again, was {:?}",
+                entry.state
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unstage_with_nothing_staged_returns_clean_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("unstageclean", &[("a.txt", "a")]);
+        let snapshot = unstage(&root, &[Path::new("a.txt")]).unwrap();
+        assert!(snapshot.is_clean());
+        // Unlike `git add`, a `git reset` pathspec that matches nothing is a
+        // no-op (exit 0), so un-staging a non-existent path also succeeds.
+        let snapshot = unstage(&root, &[Path::new("no-such-file.txt")]).unwrap();
+        assert!(snapshot.is_clean());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unstage_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("unstagenonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = unstage(&root, &[Path::new("a.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
         );
         let _ = fs::remove_dir_all(root);
     }
