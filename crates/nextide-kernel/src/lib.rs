@@ -35,9 +35,9 @@ pub use editor_view::EditorViewState;
 pub use events::{Event, EventBus};
 pub use file_tree::{FileNode, FileNodeKind, FileTreeModel};
 pub use git::{
-    commit, diff, stage, status, GitCommitResult, GitDiffFile, GitDiffHunk, GitDiffLine,
-    GitDiffLineKind, GitDiffSnapshot, GitFileState, GitStatusCode, GitStatusEntry,
-    GitStatusSnapshot,
+    branches, checkout, commit, diff, stage, status, GitBranch, GitBranchSnapshot, GitCommitResult,
+    GitDiffFile, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitDiffSnapshot, GitFileState,
+    GitStatusCode, GitStatusEntry, GitStatusSnapshot,
 };
 pub use platform::{PlatformServices, ProcessHandle, TerminalSession, WindowsPlatform};
 pub use process::{run_capture, run_capture_timeout, ProcessOutput};

@@ -97,6 +97,32 @@
 //! commit") is [`io::ErrorKind::Other`] with git's message — taken from
 //! stderr, or from stdout when stderr is empty, because `git commit` prints
 //! some failures (such as "nothing to commit") on stdout.
+//!
+//! # Branches and checkout
+//!
+//! [`branches(root)`](branches) lists the repository's local branches with
+//! `git -C <root> for-each-ref --format=%(HEAD)|%(refname:short) refs/heads`
+//! and returns a stably sorted [`GitBranchSnapshot`]. Every [`GitBranch`]
+//! carries the branch's short name (the part after `refs/heads/`) and a
+//! `current` flag for the checked-out branch; a detached HEAD marks no branch
+//! as current. The `%(HEAD)|name` lines are machine-oriented — git's own
+//! `%(HEAD)` atom emits `*` for the checked-out branch and a space otherwise,
+//! and the name is everything after the first `|` — so no human-format parsing
+//! is involved, and every parsed name still passes the same escape-rejecting
+//! check as status paths.
+//!
+//! [`checkout(root, branch)`](checkout) switches the worktree with
+//! `git -C <root> checkout <branch>` and returns the fresh
+//! [`GitStatusSnapshot`] from [`status`]. The branch name is validated before
+//! git is spawned: it must be non-empty, free of NUL bytes, not absolute and
+//! without `..` components, and must not start with `-` — a `-`-prefixed name
+//! would be parsed by git as an option, and `--` cannot be used as a shield
+//! here because it would turn the argument into a pathspec instead of a
+//! branch. Anything else (an unknown branch, a checkout that would overwrite
+//! local changes, an invalid reference) surfaces as
+//! [`io::ErrorKind::Other`] with git's message. Root and git-binary error
+//! behaviour matches [`status`] and [`stage`]: `NotFound` for a missing root
+//! or missing `git`, `NotADirectory` for a non-directory root.
 
 use std::io;
 use std::path::{Component, Path};
@@ -1045,6 +1071,211 @@ fn check_stage_path(path: &Path) -> io::Result<()> {
                 "stage path must not start with ':' (git pathspec magic): {}",
                 path.display()
             ),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Git branches and checkout
+// ---------------------------------------------------------------------------
+
+/// One local branch of a repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitBranch {
+    /// The branch's short name — the part after `refs/heads/`, for example
+    /// `main`.
+    pub name: String,
+    /// Whether this branch is the currently checked-out branch. A detached
+    /// HEAD marks no branch as current.
+    pub current: bool,
+}
+
+/// The parsed result of [`branches`]: every local branch of the repository,
+/// stably sorted by name.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GitBranchSnapshot {
+    /// The branches, stably sorted by [`GitBranch::name`] in byte-wise order.
+    /// An empty vec means the repository has no local branches (for example a
+    /// fresh repository with no commits yet).
+    pub branches: Vec<GitBranch>,
+}
+
+impl GitBranchSnapshot {
+    /// The number of local branches.
+    pub fn len(&self) -> usize {
+        self.branches.len()
+    }
+
+    /// Whether the repository has no local branches.
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty()
+    }
+}
+
+/// Lists the repository's local branches and returns the stably sorted
+/// snapshot.
+///
+/// Runs `git -C <root> for-each-ref --format=%(HEAD)|%(refname:short)
+/// refs/heads`: no shell, and the format is git's own machine-oriented output
+/// (`%(HEAD)` emits `*` for the checked-out branch and a space otherwise), so
+/// no human-format line parsing is involved.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::Other`] if `git` exits non-zero (for example `root` is
+///   not inside a Git repository); git's stderr is included in the message.
+/// - [`io::ErrorKind::InvalidData`] if git's output is not valid UTF-8,
+///   cannot be parsed, or reports a branch name that escapes the repository.
+pub fn branches(root: &Path) -> io::Result<GitBranchSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    run_branches("git", root)
+}
+
+/// Runs `program -C root for-each-ref --format=%(HEAD)|%(refname:short)
+/// refs/heads`; split out so tests can exercise the spawn-failure path with a
+/// program that does not exist.
+fn run_branches(program: &str, root: &Path) -> io::Result<GitBranchSnapshot> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .args([
+            "for-each-ref",
+            "--format=%(HEAD)|%(refname:short)",
+            "refs/heads",
+        ])
+        .output()?;
+    ensure_git_success(&output, "for-each-ref")?;
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git for-each-ref output is not valid UTF-8",
+        )
+    })?;
+    parse_branches(&stdout)
+}
+
+/// Parses `HEAD|name` lines into a snapshot, stably sorted by name.
+fn parse_branches(output: &str) -> io::Result<GitBranchSnapshot> {
+    let mut branches = Vec::new();
+    for line in output.lines() {
+        // Defensive CRLF tolerance; git itself always emits `\n`.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let (head, name) = line
+            .split_once('|')
+            .ok_or_else(|| malformed("branch line must be HEAD|name"))?;
+        let current = match head {
+            "*" => true,
+            // git's %(HEAD) atom emits a single space (not empty) for refs
+            // that are not the current HEAD.
+            " " | "" => false,
+            _ => return Err(malformed("branch line has an unknown HEAD marker")),
+        };
+        check_safe_path(name)?;
+        branches.push(GitBranch {
+            name: name.to_string(),
+            current,
+        });
+    }
+    branches.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(GitBranchSnapshot { branches })
+}
+
+/// Switches the worktree to `branch` and returns the resulting
+/// [`GitStatusSnapshot`] from [`status`].
+///
+/// Runs `git -C <root> checkout <branch>`: no shell, and the branch name is a
+/// single argument. The name is validated before git is spawned — non-empty,
+/// free of NUL bytes, not absolute and without `..` components, and not
+/// `-`-prefixed — so it can never be parsed by git as an option. A `--`
+/// separator cannot be used as an extra shield because `git checkout --` turns
+/// its argument into a pathspec instead of a branch.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `branch` is empty, contains a NUL
+///   byte, is absolute or contains a `..` component, or starts with `-`.
+/// - [`io::ErrorKind::Other`] if `git checkout` exits non-zero (for example
+///   an unknown branch, a checkout that would overwrite local changes, or a
+///   `root` that is not inside a Git repository); git's message is included.
+/// - [`io::ErrorKind::InvalidData`] if the fresh [`status`] output cannot be
+///   parsed or reports a path that escapes the repository root.
+pub fn checkout(root: &Path, branch: &str) -> io::Result<GitStatusSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    check_branch_name(branch)?;
+    run_git_checkout("git", root, branch)?;
+    status(root)
+}
+
+/// Runs `program -C root checkout <branch>`; split out so tests can exercise
+/// the spawn-failure path with a program that does not exist.
+fn run_git_checkout(program: &str, root: &Path, branch: &str) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("checkout")
+        .arg(branch)
+        .output()?;
+    ensure_git_success(&output, "checkout")
+}
+
+/// Validates a caller-supplied branch name before git is spawned: it must be
+/// non-empty, free of NUL bytes, not absolute and without `..` components
+/// (under either platform's rules), and must not start with `-` so it can
+/// never be parsed by git as an option.
+fn check_branch_name(branch: &str) -> io::Result<()> {
+    if branch.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "branch name must not be empty",
+        ));
+    }
+    if branch.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "branch name must not contain NUL bytes",
+        ));
+    }
+    if branch.starts_with('-') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("branch name must not start with '-': {branch:?}"),
+        ));
+    }
+    let bytes = branch.as_bytes();
+    let looks_absolute = bytes[0] == b'/'
+        || bytes[0] == b'\\'
+        || bytes.starts_with(b"//")
+        || (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic());
+    let escapes = Path::new(branch).is_absolute()
+        || looks_absolute
+        || Path::new(branch)
+            .components()
+            .any(|component| matches!(component, Component::ParentDir));
+    if escapes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("branch name must not be absolute or contain '..': {branch:?}"),
         ));
     }
     Ok(())
@@ -2459,6 +2690,351 @@ mod tests {
             return;
         }
         let error = commit(&root, "message").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- branch parsing ----
+
+    #[test]
+    fn parses_branch_lines_with_current_marker() {
+        let snapshot = parse_branches("*|main\n|feature\n|dev\n").unwrap();
+        let names: Vec<&str> = snapshot
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect();
+        assert_eq!(names, ["dev", "feature", "main"]);
+        assert!(snapshot.branches[2].current);
+        assert!(!snapshot.branches[0].current);
+        assert!(!snapshot.branches[1].current);
+    }
+
+    #[test]
+    fn branch_sort_is_stable_for_equal_names() {
+        // for-each-ref never emits two lines for one branch, but the snapshot
+        // must still preserve input order when sort keys tie.
+        let snapshot = parse_branches("*|dup\n|dup\n").unwrap();
+        assert!(snapshot.branches[0].current);
+        assert!(!snapshot.branches[1].current);
+    }
+
+    #[test]
+    fn parses_empty_branch_list_as_empty_snapshot() {
+        let snapshot = parse_branches("").unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.len(), 0);
+        assert!(snapshot.branches.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_branch_lines() {
+        for output in [
+            "main",    // no `|` separator
+            "x|main",  // unknown HEAD marker
+            "**|main", // unknown HEAD marker
+            " *|main", // unknown HEAD marker
+            "|",       // empty name
+            "*|",      // empty name
+        ] {
+            assert!(
+                parse_branches(output).is_err(),
+                "output {output:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_branch_names_that_escape_the_repository() {
+        for output in [
+            "|/etc/passwd",
+            "|\\\\server\\share\\x",
+            "|C:/windows/x",
+            "|../outside",
+            "|a/../../outside",
+        ] {
+            let error = parse_branches(output).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "output {output:?} should be rejected as unsafe"
+            );
+        }
+    }
+
+    // ---- branches() root validation (no git binary needed) ----
+
+    #[test]
+    fn branches_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-branches-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            branches(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn branches_file_root_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "nextide-branches-notdir-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            branches(&file).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_git_binary_for_branches_surfaces_as_not_found() {
+        let root = temp_dir("branchesnobinary");
+        let error = run_branches("nextide-no-such-git-binary", &root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- branches() integration (requires a git binary) ----
+
+    /// The current branch's short name, for example `main`.
+    fn current_branch(root: &Path) -> String {
+        let bytes = run_git_capture("git", root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        String::from_utf8(bytes).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn branches_lists_local_branches_with_current_marker() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("branches", &[("a.txt", "a")]);
+        let base = current_branch(&root);
+        run_git(&root, &["checkout", "-b", "feature"]);
+        run_git(&root, &["branch", "dev"]);
+        run_git(&root, &["branch", "zeta"]);
+
+        let snapshot = branches(&root).unwrap();
+        let names: Vec<&str> = snapshot
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect();
+        let mut expected = vec![base.as_str(), "dev", "feature", "zeta"];
+        expected.sort();
+        assert_eq!(names, expected);
+
+        let current = snapshot
+            .branches
+            .iter()
+            .find(|branch| branch.current)
+            .unwrap();
+        assert_eq!(current.name, "feature");
+
+        // Every name is a short, relative branch name.
+        for branch in &snapshot.branches {
+            assert!(Path::new(&branch.name).is_relative());
+            assert!(!branch.name.starts_with(".."));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn branches_reports_no_current_branch_when_detached() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("branchdetached", &[("a.txt", "a")]);
+        run_git(&root, &["checkout", "--detach", "-q"]);
+        run_git(&root, &["branch", "feature"]);
+        let snapshot = branches(&root).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.branches.iter().all(|branch| !branch.current));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- checkout() argument safety (no git binary needed) ----
+
+    #[test]
+    fn checkout_missing_root_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("nextide-checkout-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            checkout(&missing, "main").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn checkout_file_root_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "nextide-checkout-notdir-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            checkout(&file, "main").unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn checkout_rejects_unsafe_branch_names() {
+        let root = temp_dir("checkoutbad");
+        for branch in [
+            "",
+            "\0",
+            "/etc/passwd",
+            "\\server\\share\\x",
+            "C:/windows/x",
+            "C:\\windows\\x",
+            "..\\..\\outside",
+            "a/../../outside",
+            "..",
+            "-f",
+            "--force",
+            "-b",
+            "--",
+        ] {
+            let error = checkout(&root, branch).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "branch {branch:?} should be rejected"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_checkout_surfaces_as_not_found() {
+        let root = temp_dir("checkoutnobinary");
+        let error = run_git_checkout("nextide-no-such-git-binary", &root, "main").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- checkout() integration (requires a git binary) ----
+
+    #[test]
+    fn checkout_switches_branch_and_returns_clean_snapshot() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("checkoutswitch", &[("a.txt", "a\n")]);
+        let base = current_branch(&root);
+        run_git(&root, &["checkout", "-b", "feature"]);
+        fs::write(root.join("feature.txt"), "f\n").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature",
+            ],
+        );
+        assert_eq!(current_branch(&root), "feature");
+
+        let snapshot = checkout(&root, &base).unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(current_branch(&root), base);
+        assert!(!root.join("feature.txt").exists());
+
+        let snapshot = checkout(&root, "feature").unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(current_branch(&root), "feature");
+        assert!(root.join("feature.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkout_unknown_branch_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("checkoutunknown", &[("a.txt", "a")]);
+        let error = checkout(&root, "no-such-branch").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("did not match any file(s)"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkout_refuses_to_overwrite_conflicting_changes() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("checkoutconflict", &[("a.txt", "base\n")]);
+        let base = current_branch(&root);
+        // feature commits a different a.txt than the base branch.
+        run_git(&root, &["checkout", "-b", "feature"]);
+        fs::write(root.join("a.txt"), "feature\n").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature",
+            ],
+        );
+        run_git(&root, &["checkout", base.as_str()]);
+        fs::write(root.join("a.txt"), "side\n").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "side"],
+        );
+        run_git(&root, &["checkout", "-b", "side"]);
+        // A dirty worktree change to a.txt would be clobbered by switching to
+        // feature, so git must refuse the checkout.
+        fs::write(root.join("a.txt"), "local uncommitted\n").unwrap();
+
+        let error = checkout(&root, "feature").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(message.contains("local changes"), "message was: {message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkout_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("checkoutnonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = checkout(&root, "main").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
