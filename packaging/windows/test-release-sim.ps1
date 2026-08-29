@@ -18,10 +18,14 @@
     sandbox directory.
 
     Part 1 — tag/version rejection rules (the workflow's "Resolve release
-    metadata from manifest (channel + version vs tag)" step, mirrored exactly:
-    same checks, same order, same messages):
+    metadata from manifest (channel + version + checksum file vs tag)" step,
+    mirrored exactly: same checks, same order, same messages):
       - channel must be exactly 'stable' or 'beta'
       - product.version must be non-blank
+      - stage.checksum_file must be non-blank (the checksum manifest name is
+        not hardcoded anywhere in the chain — it flows from the committed
+        manifest, so the verify gates and the publish step attach exactly the
+        file build.ps1 generates)
       - the pushed tag must match '^v[0-9]+\.[0-9]+\.[0-9]+$'
       - the tag minus its leading 'v' must equal product.version
     Every violation is rejected; the committed manifest resolves with the
@@ -29,15 +33,18 @@
 
     Part 2 — release file manifest (the four files the publish step would
     attach — dist/windows/nextide-cli.exe, dist/windows/nextide-shell.exe,
-    dist/windows/SHA256SUMS.txt and release-metadata/manifest.json):
+    the checksum manifest named by stage.checksum_file and
+    release-metadata/manifest.json):
       - every attachment exists and is a non-empty regular file (a zero-byte
         or absent binary could not pass the job's CLI smoke step either)
       - dist/windows passes the repository's consumer-side verifier
-        (verify-checksums.ps1 -DistDir dist\windows), the exact gate the
-        release job runs before publishing
+        (verify-checksums.ps1 -DistDir dist\windows -ChecksumFile
+        dist\windows\<stage.checksum_file>), the exact gate the release job
+        runs before publishing — the checksum file is verified under the
+        declared name, exactly like the workflow
       - the checksum manifest entry set equals the manifest artifact list
-        (the two release binaries) and the staged checksum file name equals
-        stage.checksum_file
+        (the two release binaries) and the checksum file is staged under the
+        name stage.checksum_file declares
       - release-metadata/manifest.json is byte-identical (SHA-256) to the
         committed manifest.json the pipeline validated
 
@@ -45,7 +52,7 @@
     release-creation command invocations (it can never touch the network and
     can never create a Release).
 
-    Covered scenarios (22 tests):
+    Covered scenarios (24 tests):
       1.  committed manifest + matching v<version> tag resolves
       2.  beta channel (valid channel) resolves
       3.  non-v tag (e.g. 'main') is rejected
@@ -57,17 +64,19 @@
       9.  missing release block is rejected
      10.  invalid manifest JSON is rejected
      11.  missing manifest is rejected
-     12.  complete, consistent release file manifest passes
-     13.  missing nextide-cli.exe fails
-     14.  missing nextide-shell.exe fails
-     15.  missing SHA256SUMS.txt fails
-     16.  missing release-metadata/manifest.json fails
-     17.  tampered binary fails consumer verification
-     18.  extra unlisted file in dist fails consumer verification
-     19.  checksum entries not matching the manifest artifact list fail
-     20.  release-metadata manifest not byte-identical to the committed one fails
-     21.  zero-byte CLI binary fails (smoke-gate simulation)
-     22.  self-audit: no network or release-creation commands in the source
+     12.  blank stage.checksum_file is rejected
+     13.  complete, consistent release file manifest passes
+     14.  missing nextide-cli.exe fails
+     15.  missing nextide-shell.exe fails
+     16.  missing checksum manifest (the stage.checksum_file name) fails
+     17.  missing release-metadata/manifest.json fails
+     18.  tampered binary fails consumer verification
+     19.  extra unlisted file in dist fails consumer verification
+     20.  checksum entries not matching the manifest artifact list fail
+     21.  release-metadata manifest not byte-identical to the committed one fails
+     22.  zero-byte CLI binary fails (smoke-gate simulation)
+     23.  renamed stage.checksum_file is honored by the checklist (byte-identity still enforced)
+     24.  self-audit: no network or release-creation commands in the source
 
     The script exits 0 when every test passes and 1 when any fails.
 
@@ -151,6 +160,20 @@ if ($null -ne $GoldenRelease) {
     $script:GoldenChannel = [string](Get-JsonProperty -Object $GoldenRelease -Name 'release_channel')
 }
 $script:GoldenHash = (Get-FileHash -LiteralPath $ManifestSource -Algorithm SHA256).Hash
+
+# The checksum manifest name is not hardcoded anywhere in this suite: it flows
+# from the golden manifest's stage.checksum_file (the same single source of
+# truth build.ps1 generates from and the release job resolves), so renaming
+# the checksum file in the committed manifest keeps every test and the whole
+# simulated checklist consistent without code edits.
+$script:GoldenChecksumFile = 'SHA256SUMS.txt'
+$GoldenStage = Get-JsonProperty -Object $Golden -Name 'stage'
+if ($null -ne $GoldenStage) {
+    $DeclaredChecksum = [string](Get-JsonProperty -Object $GoldenStage -Name 'checksum_file')
+    if (-not [string]::IsNullOrWhiteSpace($DeclaredChecksum)) {
+        $script:GoldenChecksumFile = $DeclaredChecksum
+    }
+}
 
 # Run verify-checksums.ps1 in a child process of the same PowerShell edition so
 # the exit code contract (0 = success, non-zero = failure) is tested for real.
@@ -298,33 +321,39 @@ function Resolve-ReleaseMeta {
         [Parameter(Mandatory)][string]$Tag
     )
     if (-not (Test-Path -LiteralPath $ManifestPath)) {
-        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; Error = "Missing manifest: $ManifestPath" }
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = ''; Error = "Missing manifest: $ManifestPath" }
     }
     try {
         $Manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
     }
     catch {
-        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; Error = "Manifest is not valid JSON: $($_.Exception.Message)" }
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = ''; Error = "Manifest is not valid JSON: $($_.Exception.Message)" }
     }
     $Release = Get-JsonProperty -Object $Manifest -Name 'release'
     $Channel = ''
     if ($null -ne $Release) { $Channel = [string](Get-JsonProperty -Object $Release -Name 'release_channel') }
     if ($Channel -ne 'stable' -and $Channel -ne 'beta') {
-        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; Error = "Manifest release.release_channel must be exactly 'stable' or 'beta', got: '$Channel'" }
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = ''; Error = "Manifest release.release_channel must be exactly 'stable' or 'beta', got: '$Channel'" }
     }
     $Product = Get-JsonProperty -Object $Manifest -Name 'product'
     $Version = ''
     if ($null -ne $Product) { $Version = [string](Get-JsonProperty -Object $Product -Name 'version') }
     if ([string]::IsNullOrWhiteSpace($Version)) {
-        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; Error = 'Manifest product.version is missing or blank' }
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = ''; Error = 'Manifest product.version is missing or blank' }
+    }
+    $Stage = Get-JsonProperty -Object $Manifest -Name 'stage'
+    $ChecksumFile = ''
+    if ($null -ne $Stage) { $ChecksumFile = [string](Get-JsonProperty -Object $Stage -Name 'checksum_file') }
+    if ([string]::IsNullOrWhiteSpace($ChecksumFile)) {
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = ''; Error = 'Manifest stage.checksum_file is missing or blank' }
     }
     if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
-        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; Error = "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0)" }
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = $ChecksumFile; Error = "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0)" }
     }
     if ($Tag.Substring(1) -ne $Version) {
-        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; Error = "Release tag '$Tag' does not match manifest product.version '$Version' (tag must be v<product.version>)" }
+        return [pscustomobject]@{ Ok = $false; Channel = ''; Version = ''; ChecksumFile = $ChecksumFile; Error = "Release tag '$Tag' does not match manifest product.version '$Version' (tag must be v<product.version>)" }
     }
-    return [pscustomobject]@{ Ok = $true; Channel = $Channel; Version = $Version; Error = '' }
+    return [pscustomobject]@{ Ok = $true; Channel = $Channel; Version = $Version; ChecksumFile = $ChecksumFile; Error = '' }
 }
 
 # ---------------------------------------------------------------------------
@@ -332,14 +361,20 @@ function Resolve-ReleaseMeta {
 # ---------------------------------------------------------------------------
 function Invoke-ConsumerVerifier {
     # Run the repository's consumer-side verifier against a sandbox dist
-    # directory — the exact gate the release job runs before publishing.
-    # Never turn a non-zero native exit code into a terminating error here:
-    # the exit code is the value under test. Note: do NOT pre-assign
+    # directory — the exact gate the release job runs before publishing. The
+    # checksum manifest is verified under the declared stage.checksum_file
+    # name (passed as -ChecksumFile), exactly like the workflow's verify
+    # steps. Never turn a non-zero native exit code into a terminating error
+    # here: the exit code is the value under test. Note: do NOT pre-assign
     # $LASTEXITCODE in this function — that would shadow the automatic
     # variable and the engine would no longer update it.
-    param([Parameter(Mandatory)][string]$Sandbox)
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        [Parameter(Mandatory)][string]$ChecksumName
+    )
     $Dist = Join-Path $Sandbox 'dist\windows'
-    $ChildArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $VerifyScript, '-DistDir', $Dist)
+    $ChecksumPath = Join-Path $Dist $ChecksumName
+    $ChildArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $VerifyScript, '-DistDir', $Dist, '-ChecksumFile', $ChecksumPath)
     $PSNativeCommandUseErrorActionPreference = $false
     # Under Windows PowerShell 5.1 a native stderr line becomes an error
     # record, and with EAP=Stop the merged 2>&1 pipeline aborts on the first
@@ -386,6 +421,32 @@ function Assert-ReleaseFileManifest {
     $Errors = [System.Collections.Generic.List[string]]::new()
     $Dist    = Join-Path $Sandbox 'dist\windows'
     $MetaDir = Join-Path $Sandbox 'release-metadata'
+    $MetaManifest = Join-Path $MetaDir 'manifest.json'
+
+    # The checksum file name is not hardcoded: it is resolved from the
+    # release-metadata manifest's stage.checksum_file — the same manifest the
+    # release job downloads and the workflow's resolve step reads — so the
+    # attachment list and the verifier below use exactly the name the
+    # pipeline generated and validated. When the metadata manifest is missing
+    # or unparseable the default name is used so the missing-attachment errors
+    # below still name a concrete file.
+    $ChecksumName = 'SHA256SUMS.txt'
+    $Meta = $null
+    if (Test-Path -LiteralPath $MetaManifest -PathType Leaf) {
+        try {
+            $Meta = Get-Content -Raw -LiteralPath $MetaManifest | ConvertFrom-Json
+        }
+        catch {
+            $Errors.Add('release-metadata manifest.json is not valid JSON')
+        }
+    }
+    if ($null -ne $Meta) {
+        $Stage = Get-JsonProperty -Object $Meta -Name 'stage'
+        if ($null -ne $Stage) {
+            $DeclaredName = [string](Get-JsonProperty -Object $Stage -Name 'checksum_file')
+            if (-not [string]::IsNullOrWhiteSpace($DeclaredName)) { $ChecksumName = $DeclaredName }
+        }
+    }
 
     # 1. Every attachment exists and is a non-empty regular file. A zero-byte
     #    or absent binary could not pass the job's CLI smoke step either, so
@@ -393,7 +454,7 @@ function Assert-ReleaseFileManifest {
     $Attachments = @(
         (Join-Path $Dist 'nextide-cli.exe'),
         (Join-Path $Dist 'nextide-shell.exe'),
-        (Join-Path $Dist 'SHA256SUMS.txt'),
+        (Join-Path $Dist $ChecksumName),
         (Join-Path $MetaDir 'manifest.json')
     )
     foreach ($File in $Attachments) {
@@ -410,45 +471,32 @@ function Assert-ReleaseFileManifest {
     }
 
     # 2. The dist directory must pass the repository's consumer-side verifier
-    #    (the exact gate the release job runs before publishing).
-    $Result = Invoke-ConsumerVerifier -Sandbox $Sandbox
+    #    (the exact gate the release job runs before publishing), with the
+    #    resolved checksum file name passed as -ChecksumFile — exactly like
+    #    the workflow's verify steps.
+    $Result = Invoke-ConsumerVerifier -Sandbox $Sandbox -ChecksumName $ChecksumName
     if ($Result.ExitCode -ne 0) {
         $Errors.Add("consumer verifier rejected dist/windows (exit $($Result.ExitCode))")
     }
 
     # 3. The checksum manifest entry set must equal the manifest artifact list
     #    (the release binaries), so the release attachments match the single
-    #    source of truth — and the staged checksum file name must equal
-    #    stage.checksum_file (the publish step attaches SHA256SUMS.txt).
-    $MetaManifest = Join-Path $MetaDir 'manifest.json'
-    $ChecksumFile = Join-Path $Dist 'SHA256SUMS.txt'
-    if ((Test-Path -LiteralPath $MetaManifest -PathType Leaf) -and (Test-Path -LiteralPath $ChecksumFile -PathType Leaf)) {
-        try {
-            $Meta = Get-Content -Raw -LiteralPath $MetaManifest | ConvertFrom-Json
+    #    source of truth. The checksum file is staged under exactly the name
+    #    stage.checksum_file declares — the attachment list above already
+    #    resolved it, so the name and the file are consistent by construction.
+    $ChecksumFile = Join-Path $Dist $ChecksumName
+    if (($null -ne $Meta) -and (Test-Path -LiteralPath $ChecksumFile -PathType Leaf)) {
+        $Expected = @()
+        $Artifacts = @(Get-JsonProperty -Object $Meta -Name 'artifacts')
+        if ($Artifacts.Count -eq 1 -and $null -eq $Artifacts[0]) { $Artifacts = @() }
+        foreach ($Artifact in $Artifacts) {
+            if ($null -ne $Artifact) { $Expected += [string]$Artifact.file }
         }
-        catch {
-            $Errors.Add('release-metadata manifest.json is not valid JSON')
-            $Meta = $null
-        }
-        if ($null -ne $Meta) {
-            $Expected = @()
-            $Artifacts = @(Get-JsonProperty -Object $Meta -Name 'artifacts')
-            if ($Artifacts.Count -eq 1 -and $null -eq $Artifacts[0]) { $Artifacts = @() }
-            foreach ($Artifact in $Artifacts) {
-                if ($null -ne $Artifact) { $Expected += [string]$Artifact.file }
-            }
-            $Actual = @(Get-ChecksumManifestEntries -Path $ChecksumFile)
-            $ExpectedKey = (@($Expected | Sort-Object) -join '|')
-            $ActualKey   = (@($Actual   | Sort-Object) -join '|')
-            if ($ExpectedKey -ne $ActualKey) {
-                $Errors.Add("checksum manifest entries '$($Actual -join ', ')' do not match the manifest artifact files '$($Expected -join ', ')'")
-            }
-            $Stage = Get-JsonProperty -Object $Meta -Name 'stage'
-            $Declared = ''
-            if ($null -ne $Stage) { $Declared = [string](Get-JsonProperty -Object $Stage -Name 'checksum_file') }
-            if ($Declared -ne 'SHA256SUMS.txt') {
-                $Errors.Add("stage.checksum_file '$Declared' does not match the release attachment 'SHA256SUMS.txt'")
-            }
+        $Actual = @(Get-ChecksumManifestEntries -Path $ChecksumFile)
+        $ExpectedKey = (@($Expected | Sort-Object) -join '|')
+        $ActualKey   = (@($Actual   | Sort-Object) -join '|')
+        if ($ExpectedKey -ne $ActualKey) {
+            $Errors.Add("checksum manifest entries '$($Actual -join ', ')' do not match the manifest artifact files '$($Expected -join ', ')'")
         }
     }
 
@@ -481,7 +529,7 @@ function New-ReleaseSandbox {
     $Shell = Join-Path $Dist 'nextide-shell.exe'
     New-FakeFile -Path $Cli   -Content 'fake nextide-cli.exe payload'
     New-FakeFile -Path $Shell -Content 'fake nextide-shell.exe payload'
-    Write-ChecksumManifest -Path (Join-Path $Dist 'SHA256SUMS.txt') -Entries @{
+    Write-ChecksumManifest -Path (Join-Path $Dist $script:GoldenChecksumFile) -Entries @{
         'nextide-cli.exe'   = (Get-Sha256Hex $Cli)
         'nextide-shell.exe' = (Get-Sha256Hex $Shell)
     }
@@ -511,6 +559,7 @@ Invoke-Test -Name 'release-meta: committed manifest + matching v<version> tag re
         Assert $Result.Ok "expected resolution to succeed, got error: $($Result.Error)"
         Assert ($Result.Version -eq $script:GoldenVersion) "expected version '$($script:GoldenVersion)', got '$($Result.Version)'"
         Assert ($Result.Channel -eq $script:GoldenChannel) "expected channel '$($script:GoldenChannel)', got '$($Result.Channel)'"
+        Assert ($Result.ChecksumFile -eq $script:GoldenChecksumFile) "expected checksum file '$($script:GoldenChecksumFile)', got '$($Result.ChecksumFile)'"
     }
     finally {
         Remove-Sandbox $Root
@@ -521,10 +570,11 @@ Invoke-Test -Name 'release-meta: committed manifest + matching v<version> tag re
 Invoke-Test -Name 'release-meta: beta channel resolves (valid channel)' -Body {
     $Root = New-Sandbox
     try {
-        Write-SandboxManifest -Root $Root -Json ('{"release":{"release_channel":"beta"},"product":{"version":"' + $script:GoldenVersion + '"}}')
+        Write-SandboxManifest -Root $Root -Json ('{"release":{"release_channel":"beta"},"product":{"version":"' + $script:GoldenVersion + '"},"stage":{"checksum_file":"' + $script:GoldenChecksumFile + '"}}')
         $Result = Resolve-ReleaseMeta -ManifestPath (Join-Path $Root 'packaging\windows\manifest.json') -Tag ('v' + $script:GoldenVersion)
         Assert $Result.Ok "expected resolution to succeed, got error: $($Result.Error)"
         Assert ($Result.Channel -eq 'beta') "expected channel 'beta', got '$($Result.Channel)'"
+        Assert ($Result.ChecksumFile -eq $script:GoldenChecksumFile) "expected checksum file '$($script:GoldenChecksumFile)', got '$($Result.ChecksumFile)'"
     }
     finally {
         Remove-Sandbox $Root
@@ -670,11 +720,31 @@ Invoke-Test -Name 'release-meta: missing manifest is rejected' -Body {
     }
 }
 
+# 12. A blank stage.checksum_file is rejected: the checksum manifest name is
+#     not hardcoded anywhere in the chain, so the release job refuses to
+#     proceed without a declared name (the packaging job already proved the
+#     full leaf-name validation; this is the "I need the value" assertion,
+#     mirroring the workflow's resolve step).
+Invoke-Test -Name 'release-meta: blank stage.checksum_file is rejected' -Body {
+    $Root = New-Sandbox
+    try {
+        foreach ($StageJson in @('"stage":{}', '"stage":{"checksum_file":"   "}')) {
+            Write-SandboxManifest -Root $Root -Json ('{"release":{"release_channel":"stable"},"product":{"version":"' + $script:GoldenVersion + '"},' + $StageJson + '}')
+            $Result = Resolve-ReleaseMeta -ManifestPath (Join-Path $Root 'packaging\windows\manifest.json') -Tag ('v' + $script:GoldenVersion)
+            Assert (-not $Result.Ok) "expected the blank checksum file to be rejected for $StageJson"
+            Assert ($Result.Error -match 'stage\.checksum_file is missing or blank') "expected a checksum-file rejection, got: $($Result.Error)"
+        }
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Part 2 — release file manifest.
 # ---------------------------------------------------------------------------
 
-# 12. A complete, consistent release file manifest passes every gate,
+# 13. A complete, consistent release file manifest passes every gate,
 #     including the real consumer verifier against the sandbox dist.
 Invoke-Test -Name 'release checklist: complete consistent release passes' -Body {
     $Root = New-ReleaseSandbox
@@ -683,7 +753,7 @@ Invoke-Test -Name 'release checklist: complete consistent release passes' -Body 
         Assert $Result.Ok "expected the release checklist to pass: $($Result.Errors -join '; ')"
         # The consumer verifier itself must also exit 0 on the sandbox dist
         # (the release job's gate), proving the whole chain agrees.
-        $Verify = Invoke-ConsumerVerifier -Sandbox $Root
+        $Verify = Invoke-ConsumerVerifier -Sandbox $Root -ChecksumName $script:GoldenChecksumFile
         Assert ($Verify.ExitCode -eq 0) "expected consumer verifier exit 0, got $($Verify.ExitCode)`n$($Verify.Output)"
     }
     finally {
@@ -691,7 +761,7 @@ Invoke-Test -Name 'release checklist: complete consistent release passes' -Body 
     }
 }
 
-# 13. Missing nextide-cli.exe fails.
+# 14. Missing nextide-cli.exe fails.
 Invoke-Test -Name 'release checklist: missing nextide-cli.exe fails' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -706,7 +776,7 @@ Invoke-Test -Name 'release checklist: missing nextide-cli.exe fails' -Body {
     }
 }
 
-# 14. Missing nextide-shell.exe fails.
+# 15. Missing nextide-shell.exe fails.
 Invoke-Test -Name 'release checklist: missing nextide-shell.exe fails' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -720,11 +790,11 @@ Invoke-Test -Name 'release checklist: missing nextide-shell.exe fails' -Body {
     }
 }
 
-# 15. Missing SHA256SUMS.txt fails.
-Invoke-Test -Name 'release checklist: missing SHA256SUMS.txt fails' -Body {
+# 16. Missing checksum manifest (the stage.checksum_file name) fails.
+Invoke-Test -Name 'release checklist: missing checksum manifest fails' -Body {
     $Root = New-ReleaseSandbox
     try {
-        Remove-Item -LiteralPath (Join-Path $Root 'dist\windows\SHA256SUMS.txt') -Force
+        Remove-Item -LiteralPath (Join-Path $Root ('dist\windows\' + $script:GoldenChecksumFile)) -Force
         $Result = Assert-ReleaseFileManifest -Sandbox $Root -GoldenManifestPath $ManifestSource
         Assert (-not $Result.Ok) 'expected the missing checksum manifest to fail the checklist'
         Assert ($Result.Errors -join ';' -match 'release attachment missing') "expected a missing-attachment error: $($Result.Errors -join '; ')"
@@ -734,7 +804,7 @@ Invoke-Test -Name 'release checklist: missing SHA256SUMS.txt fails' -Body {
     }
 }
 
-# 16. Missing release-metadata/manifest.json fails.
+# 17. Missing release-metadata/manifest.json fails.
 Invoke-Test -Name 'release checklist: missing release-metadata/manifest.json fails' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -748,7 +818,7 @@ Invoke-Test -Name 'release checklist: missing release-metadata/manifest.json fai
     }
 }
 
-# 17. A tampered binary is caught by the consumer verifier (hash mismatch).
+# 18. A tampered binary is caught by the consumer verifier (hash mismatch).
 Invoke-Test -Name 'release checklist: tampered binary fails consumer verification' -Body {
     $Root = New-ReleaseSandbox
     try {
@@ -763,7 +833,7 @@ Invoke-Test -Name 'release checklist: tampered binary fails consumer verificatio
     }
 }
 
-# 18. An extra unlisted file in dist fails the consumer verifier's exact-match
+# 19. An extra unlisted file in dist fails the consumer verifier's exact-match
 #     contract.
 Invoke-Test -Name 'release checklist: extra unlisted file in dist fails' -Body {
     $Root = New-ReleaseSandbox
@@ -778,7 +848,7 @@ Invoke-Test -Name 'release checklist: extra unlisted file in dist fails' -Body {
     }
 }
 
-# 19. A checksum manifest whose entry set does not match the manifest artifact
+# 20. A checksum manifest whose entry set does not match the manifest artifact
 #     list fails — even though every listed file exists and hashes match (the
 #     release would attach checksums for files the manifest never declared).
 Invoke-Test -Name 'release checklist: checksum entries not matching the artifact list fail' -Body {
@@ -787,7 +857,7 @@ Invoke-Test -Name 'release checklist: checksum entries not matching the artifact
         $Dist = Join-Path $Root 'dist\windows'
         $Extra = Join-Path $Dist 'extra.bin'
         New-FakeFile -Path $Extra -Content 'undisclosed binary'
-        Write-ChecksumManifest -Path (Join-Path $Dist 'SHA256SUMS.txt') -Entries @{
+        Write-ChecksumManifest -Path (Join-Path $Dist $script:GoldenChecksumFile) -Entries @{
             'nextide-cli.exe'   = (Get-Sha256Hex (Join-Path $Dist 'nextide-cli.exe'))
             'nextide-shell.exe' = (Get-Sha256Hex (Join-Path $Dist 'nextide-shell.exe'))
             'extra.bin'         = (Get-Sha256Hex $Extra)
@@ -795,7 +865,7 @@ Invoke-Test -Name 'release checklist: checksum entries not matching the artifact
         # The consumer verifier alone would accept this directory (every
         # listed file exists and matches); the artifact-list cross-check is
         # what catches it.
-        $Verify = Invoke-ConsumerVerifier -Sandbox $Root
+        $Verify = Invoke-ConsumerVerifier -Sandbox $Root -ChecksumName $script:GoldenChecksumFile
         Assert ($Verify.ExitCode -eq 0) "expected consumer verifier exit 0 here, got $($Verify.ExitCode)`n$($Verify.Output)"
         $Result = Assert-ReleaseFileManifest -Sandbox $Root -GoldenManifestPath $ManifestSource
         Assert (-not $Result.Ok) 'expected the extra checksum entry to fail the checklist'
@@ -806,7 +876,7 @@ Invoke-Test -Name 'release checklist: checksum entries not matching the artifact
     }
 }
 
-# 20. A release-metadata manifest that is not byte-identical to the committed
+# 21. A release-metadata manifest that is not byte-identical to the committed
 #     manifest fails (the job's SHA-256 compare before publishing).
 Invoke-Test -Name 'release checklist: metadata manifest not byte-identical fails' -Body {
     $Root = New-ReleaseSandbox
@@ -824,7 +894,7 @@ Invoke-Test -Name 'release checklist: metadata manifest not byte-identical fails
     }
 }
 
-# 21. A zero-byte CLI binary fails the non-empty (smoke-gate simulation)
+# 22. A zero-byte CLI binary fails the non-empty (smoke-gate simulation)
 #     assertion — the job would attach a binary that could not run.
 Invoke-Test -Name 'release checklist: zero-byte CLI binary fails (smoke-gate simulation)' -Body {
     $Root = New-ReleaseSandbox
@@ -832,13 +902,13 @@ Invoke-Test -Name 'release checklist: zero-byte CLI binary fails (smoke-gate sim
         $Dist = Join-Path $Root 'dist\windows'
         $Cli = Join-Path $Dist 'nextide-cli.exe'
         $null = New-Item -ItemType File -Path $Cli -Force
-        Write-ChecksumManifest -Path (Join-Path $Dist 'SHA256SUMS.txt') -Entries @{
+        Write-ChecksumManifest -Path (Join-Path $Dist $script:GoldenChecksumFile) -Entries @{
             'nextide-cli.exe'   = (Get-Sha256Hex $Cli)
             'nextide-shell.exe' = (Get-Sha256Hex (Join-Path $Dist 'nextide-shell.exe'))
         }
         # The checksum contract still holds for a zero-byte file, so only the
         # non-empty gate rejects it — exactly the gap the smoke step closes.
-        $Verify = Invoke-ConsumerVerifier -Sandbox $Root
+        $Verify = Invoke-ConsumerVerifier -Sandbox $Root -ChecksumName $script:GoldenChecksumFile
         Assert ($Verify.ExitCode -eq 0) "expected consumer verifier exit 0 here, got $($Verify.ExitCode)`n$($Verify.Output)"
         $Result = Assert-ReleaseFileManifest -Sandbox $Root -GoldenManifestPath $ManifestSource
         Assert (-not $Result.Ok) 'expected the zero-byte binary to fail the checklist'
@@ -849,11 +919,44 @@ Invoke-Test -Name 'release checklist: zero-byte CLI binary fails (smoke-gate sim
     }
 }
 
+# 23. A renamed stage.checksum_file is honored by the checklist: the
+#     attachment list, the consumer verifier and the entry-set cross-check all
+#     resolve the declared name (the pipeline's single source of truth), so
+#     the only thing that rejects a modified metadata manifest is the
+#     byte-identity contract — exactly like the real release job, which
+#     consumes the same committed manifest for the checksum file name and the
+#     byte-identity check.
+Invoke-Test -Name 'release checklist: renamed stage.checksum_file is honored (byte-identity still enforced)' -Body {
+    $Root = New-ReleaseSandbox
+    try {
+        $Dist = Join-Path $Root 'dist\windows'
+        $Meta = Join-Path $Root 'release-metadata'
+        $Renamed = 'CHECKSUMS.txt'
+        # Re-stage the checksum manifest under the renamed file and re-write
+        # the metadata manifest declaring it (no longer byte-identical to the
+        # committed one — that is the only failure this checklist may report).
+        Move-Item -LiteralPath (Join-Path $Dist $script:GoldenChecksumFile) -Destination (Join-Path $Dist $Renamed) -Force
+        $Json = Get-Content -Raw -LiteralPath (Join-Path $Meta 'manifest.json') | ConvertFrom-Json
+        $Json.stage.checksum_file = $Renamed
+        Set-Content -LiteralPath (Join-Path $Meta 'manifest.json') -Value ($Json | ConvertTo-Json -Depth 10) -Encoding UTF8
+        $Result = Assert-ReleaseFileManifest -Sandbox $Root -GoldenManifestPath $ManifestSource
+        Assert (-not $Result.Ok) 'expected the checklist to reject the modified metadata manifest'
+        $Joined = $Result.Errors -join ';'
+        Assert ($Joined -match 'byte-identical') "expected the byte-identity error, got: $Joined"
+        Assert ($Joined -notmatch 'release attachment missing') 'renamed checksum file must be found under the declared name'
+        Assert ($Joined -notmatch 'consumer verifier rejected') 'renamed checksum file must pass the consumer verifier under the declared name'
+        Assert ($Joined -notmatch 'do not match the manifest artifact files') 'renamed checksum file must pass the artifact-list cross-check'
+    }
+    finally {
+        Remove-Sandbox $Root
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Part 3 — self-audit.
 # ---------------------------------------------------------------------------
 
-# 22. The script's own source must not contain any network or release-creation
+# 24. The script's own source must not contain any network or release-creation
 #     command invocation: this suite can never touch the network and can never
 #     create a GitHub Release, by construction. The only child process it ever
 #     launches is the repository's consumer-side verifier against sandbox

@@ -85,17 +85,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve release channel from manifest (artifact name suffix)
-        # Read release.release_channel out of the committed packaging manifest
-        # (packaging/windows/manifest.json) so the workflow artifact carries
-        # the channel in its name: stable and beta runs can never overwrite
-        # each other's artifact. Read-only parse of a local file — no network,
-        # no cargo invocation. The channel must be exactly stable or beta, the
-        # same rule build.ps1 enforces (and the self-test gate and the
-        # -SkipBuild run re-verify against the same committed manifest), so an
-        # undeclared channel fails the run here, before the self-test gate, the
-        # release build, and staging. The value is also exposed as the step
-        # output release_channel for any later step to consume.
+      - name: Resolve release channel and checksum file from manifest (artifact name suffix)
+        # Read release.release_channel and stage.checksum_file out of the
+        # committed packaging manifest (packaging/windows/manifest.json) so the
+        # workflow artifact carries the channel in its name — stable and beta
+        # runs can never overwrite each other's artifact — and so the checksum
+        # manifest name flows from the single source of truth instead of being
+        # hardcoded: build.ps1 generates exactly the file stage.checksum_file
+        # declares, and the verify gates and release publish steps below
+        # consume that same declared name. Read-only parse of a local file —
+        # no network, no cargo invocation. The channel must be exactly stable
+        # or beta and the checksum file must be non-blank, the same rules
+        # build.ps1 enforces (and the self-test gate and the -SkipBuild run
+        # re-verify against the same committed manifest), so an undeclared
+        # channel or checksum file fails the run here, before the self-test
+        # gate, the release build, and staging. The values are also exposed as
+        # the step outputs release_channel and checksum_file for any later step
+        # to consume.
         id: release-channel
         shell: pwsh
         run: |
@@ -104,8 +110,14 @@ jobs:
           if ($Channel -ne 'stable' -and $Channel -ne 'beta') {
             throw "Manifest release.release_channel must be exactly stable or beta, got: '$Channel'"
           }
-          Write-Host "release_channel=$Channel"
+          $ChecksumFile = ''
+          if ($null -ne $Manifest.stage) { $ChecksumFile = [string]$Manifest.stage.checksum_file }
+          if ([string]::IsNullOrWhiteSpace($ChecksumFile)) {
+            throw 'Manifest stage.checksum_file is missing or blank'
+          }
+          Write-Host "release_channel=$Channel checksum_file=$ChecksumFile"
           "release_channel=$Channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "checksum_file=$ChecksumFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -114,7 +126,7 @@ jobs:
         # Pre-packaging self-test gate: this is the CI job's explicit
         # verification of the packaging manifest in all four required areas,
         # exercised through build.ps1's own validation by the sandboxed suite
-        # (23 cases, zero framework):
+        # (26 cases, zero framework):
         #   - manifest validity:  missing/invalid JSON, schema_version,
         #                         artifact list, path escapes
         #   - version:            product.version == Cargo.toml
@@ -154,10 +166,10 @@ jobs:
         # covered (manifest validity, version, target, release metadata,
         # checksum file name) against the committed manifest.json and the
         # real Cargo.toml before staging anything, then verifies each staged
-        # artifact by size and SHA-256 and writes the SHA256SUMS.txt checksum
-        # manifest from the verified hashes (re-verifying it by parsing it
-        # back). No rebuild: the release binaries from the step above are
-        # staged as-is.
+        # artifact by size and SHA-256 and writes the manifest-declared
+        # checksum manifest (stage.checksum_file, resolved by the step above)
+        # from the verified hashes (re-verifying it by parsing it back). No
+        # rebuild: the release binaries from the step above are staged as-is.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -SkipBuild
 
       - name: Smoke-test the staged CLI artifact (nextide-cli.exe smoke)
@@ -171,27 +183,30 @@ jobs:
         # would block the runner).
         run: .\dist\windows\nextide-cli.exe smoke
 
-      - name: Verify SHA256SUMS.txt before dist artifact upload
+      - name: Verify ${{ steps.release-channel.outputs.checksum_file }} before dist artifact upload
         # Pre-upload gate for the checksum manifest that ships inside
-        # dist/windows. build.ps1 -SkipBuild (step above) generated
-        # SHA256SUMS.txt from the verified staged hashes and already re-verified
-        # it; this step runs the repository's consumer-side verifier
-        # (packaging/windows/verify-checksums.ps1 — the same script dist
-        # consumers use) read-only against the exact directory about to be
-        # uploaded — no dependencies, no network, nothing written — proving
+        # dist/windows. build.ps1 -SkipBuild (step above) generated the
+        # manifest-declared checksum file (stage.checksum_file, resolved right
+        # after checkout) from the verified staged hashes and already
+        # re-verified it; this step runs the repository's consumer-side
+        # verifier (packaging/windows/verify-checksums.ps1 — the same script
+        # dist consumers use) read-only against the exact directory about to
+        # be uploaded — no dependencies, no network, nothing written — proving
         # the manifest parses line by line ('<64-hex-sha256>  <file>'), every
         # named file exists, every entry's hash equals the actual SHA-256 of
         # the file, and the directory matches the manifest exactly (no
         # missing, corrupt, extra or duplicate entries). Any failure exits
         # non-zero before the upload, so the checksum manifest that ships is
         # proven correct, not just present.
-        run: powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir dist\windows
+        env:
+          CHECKSUM_FILE: ${{ steps.release-channel.outputs.checksum_file }}
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir dist\windows -ChecksumFile "dist\windows\$env:CHECKSUM_FILE"
 
       - name: Upload dist/windows artifact
         # The artifact name carries the manifest's release_channel suffix
         # (resolved by the step above), so stable and beta runs produce
         # distinct artifacts and can never overwrite each other. The uploaded
-        # directory includes the SHA256SUMS.txt checksum manifest generated
+        # directory includes the manifest-declared checksum manifest generated
         # and verified by build.ps1 -SkipBuild and re-verified by the step
         # above, so consumers of the artifact can verify every binary against
         # the manifest that ships with it.
@@ -330,12 +345,17 @@ jobs:
     # the packaging job already proved equals the [workspace.package] version
     # in the root Cargo.toml — so the release is always tagged with exactly
     # the version the artifacts claim. The job's own gate rules are proven
-    # first by a sandboxed simulation suite (test-release-sim.ps1, 22 cases,
+    # first by a sandboxed simulation suite (test-release-sim.ps1, 24 cases,
     # zero framework) that runs right after checkout, before anything is
     # downloaded or published: it exercises the tag/version rejection rules
     # and the four-file release file manifest against throwaway %TEMP%
     # sandboxes — no network access, no GitHub Release ever created, the
-    # repository never touched.
+    # repository never touched. The checksum file attached to the release is
+    # not hardcoded: its name flows from the committed manifest's
+    # stage.checksum_file (the same single source of truth build.ps1 generates
+    # from), resolved by the release-meta step below and consumed by the
+    # verify and publish steps, so a manifest that renames the checksum file
+    # keeps the whole chain consistent instead of breaking it incoherently.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: packaging-windows
     runs-on: windows-latest
@@ -351,17 +371,20 @@ jobs:
       - name: Verify release job simulation (test-release-sim.ps1 gate)
         # Pre-publish self-test gate for this job's own rules, run in a
         # sandbox before anything is downloaded or published. The zero-framework
-        # suite (22 cases) proves, in two parts, exactly what this job gates:
+        # suite (24 cases) proves, in two parts, exactly what this job gates:
         #   - tag/version rejection rules (the "Resolve release metadata from
-        #     manifest (channel + version vs tag)" logic): channel must be
-        #     exactly stable or beta, product.version must be non-blank, the
-        #     pushed tag must be exactly v<product.version> — non-v tags,
-        #     malformed semver (v0.1, v0.1.0.1), pre-release tags (v0.1.0-beta),
-        #     tags that disagree with the manifest version, invalid channels,
-        #     blank versions, invalid JSON and missing manifests are all
-        #     rejected; the committed manifest resolves with its matching tag.
+        #     manifest (channel + version + checksum file vs tag)" logic):
+        #     channel must be exactly stable or beta, product.version must be
+        #     non-blank, stage.checksum_file must be non-blank, the pushed tag
+        #     must be exactly v<product.version> — non-v tags, malformed
+        #     semver (v0.1, v0.1.0.1), pre-release tags (v0.1.0-beta), tags
+        #     that disagree with the manifest version, invalid channels, blank
+        #     versions or checksum files, invalid JSON and missing manifests
+        #     are all rejected; the committed manifest resolves with its
+        #     matching tag.
         #   - release file manifest (the four files the publish step attaches:
-        #     nextide-cli.exe, nextide-shell.exe, SHA256SUMS.txt and
+        #     nextide-cli.exe, nextide-shell.exe, the manifest-declared
+        #     checksum file (stage.checksum_file) and
         #     release-metadata/manifest.json): every attachment present and
         #     non-empty, the dist directory passing the repository's own
         #     consumer-side verifier (verify-checksums.ps1 — the same gate
@@ -374,18 +397,24 @@ jobs:
         # downloaded or published.
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\test-release-sim.ps1
 
-      - name: Resolve release metadata from manifest (channel + version vs tag)
+      - name: Resolve release metadata from manifest (channel + version + checksum file vs tag)
         # Read the committed packaging/windows/manifest.json (read-only local
         # parse, no network, no cargo invocation — same source and same
         # stable/beta rule the packaging job's resolve step and build.ps1
         # enforce) and assert the final consistency link: the pushed tag must
         # be exactly `v<product.version>` (v-prefixed semver), so the release
         # is created under the tag that names the artifacts' validated
-        # version. The resolved channel and version are exposed as step
-        # outputs so the artifact downloads and the release notes below can
-        # consume them. Any mismatch — a non-v tag, a malformed version, or a
-        # tag that disagrees with the manifest — fails the run before
-        # anything is downloaded or published.
+        # version. The step also reads stage.checksum_file — the manifest
+        # declares the name of the checksum manifest that ships inside
+        # dist/windows, and it must be non-blank (build.ps1 and the packaging
+        # job already proved the full leaf-name validation; this step only
+        # needs the value for the verify and publish steps below and fails
+        # fast rather than silently defaulting). The resolved channel, version
+        # and checksum file are exposed as step outputs so the artifact
+        # downloads, the verify gate and the release notes below can consume
+        # them. Any mismatch — a non-v tag, a malformed version, a tag that
+        # disagrees with the manifest, or a blank checksum file — fails the
+        # run before anything is downloaded or published.
         id: release-meta
         shell: pwsh
         env:
@@ -410,6 +439,11 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($Version)) {
             throw 'Manifest product.version is missing or blank'
           }
+          $ChecksumFile = ''
+          if ($null -ne $Manifest.stage) { $ChecksumFile = [string]$Manifest.stage.checksum_file }
+          if ([string]::IsNullOrWhiteSpace($ChecksumFile)) {
+            throw 'Manifest stage.checksum_file is missing or blank'
+          }
           $Tag = $env:REF_NAME
           if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
             throw "Release tag '$Tag' is not a v-prefixed semver tag (expected e.g. v0.1.0)"
@@ -417,9 +451,10 @@ jobs:
           if ($Tag.Substring(1) -ne $Version) {
             throw "Release tag '$Tag' does not match manifest product.version '$Version' (tag must be v<product.version>)"
           }
-          Write-Host "release: channel=$Channel version=$Version tag=$Tag"
+          Write-Host "release: channel=$Channel version=$Version checksum_file=$ChecksumFile tag=$Tag"
           "channel=$Channel"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "version=$Version"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "checksum_file=$ChecksumFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Download dist/windows artifact (channel-suffixed)
         # Download the exact staged directory the packaging job verified and
@@ -461,14 +496,20 @@ jobs:
           }
           Write-Host "manifest.json verified: downloaded artifact is byte-identical to the committed manifest"
 
-      - name: Verify SHA256SUMS.txt of downloaded dist (consumer path)
+      - name: Verify ${{ steps.release-meta.outputs.checksum_file }} of downloaded dist (consumer path)
         # Re-verify the downloaded artifact with the repository's consumer-side
         # verifier — the exact script dist consumers use — read-only against
         # the exact files about to be published (no dependencies, no network).
-        # This is the same verification the packaging job ran before upload,
-        # re-run here on the downloaded bytes, so the release can never attach
-        # a dist whose checksum manifest does not match its own files.
-        run: powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir dist\windows
+        # The checksum manifest name is the one the manifest declares
+        # (stage.checksum_file, resolved by the release-meta step above), so a
+        # renamed checksum file is verified under its declared name, exactly
+        # like the packaging job's pre-upload gate. This is the same
+        # verification the packaging job ran before upload, re-run here on the
+        # downloaded bytes, so the release can never attach a dist whose
+        # checksum manifest does not match its own files.
+        env:
+          CHECKSUM_FILE: ${{ steps.release-meta.outputs.checksum_file }}
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir dist\windows -ChecksumFile "dist\windows\$env:CHECKSUM_FILE"
 
       - name: Smoke-test the downloaded CLI artifact
         # End-to-end proof that the exact binary being published runs: execute
@@ -482,22 +523,23 @@ jobs:
 
       - name: Publish GitHub Release
         # Create the GitHub Release for the pushed tag with the verified
-        # artifacts attached: both release binaries, the SHA256SUMS.txt
-        # checksum manifest that proves them, and the validated
-        # manifest.json release metadata. gh is preinstalled on the runner;
-        # the release is created under the tag pushed (v<product.version>,
-        # asserted above) targeting the tagged commit. If a release for this
-        # tag already exists, gh fails with a non-zero exit and the job fails
-        # — a release is never silently overwritten. The notes state the
-        # version/channel and point consumers at the checksum manifest, which
-        # can be verified with `sha256sum -c SHA256SUMS.txt` or
-        # verify-checksums.ps1.
+        # artifacts attached: both release binaries, the manifest-declared
+        # checksum manifest (stage.checksum_file, resolved by the release-meta
+        # step above) that proves them, and the validated manifest.json
+        # release metadata. gh is preinstalled on the runner; the release is
+        # created under the tag pushed (v<product.version>, asserted above)
+        # targeting the tagged commit. If a release for this tag already
+        # exists, gh fails with a non-zero exit and the job fails — a release
+        # is never silently overwritten. The notes state the version/channel
+        # and point consumers at the checksum manifest, which can be verified
+        # with `sha256sum -c <checksum file>` or verify-checksums.ps1.
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           CHANNEL: ${{ steps.release-meta.outputs.channel }}
           VERSION: ${{ steps.release-meta.outputs.version }}
+          CHECKSUM_FILE: ${{ steps.release-meta.outputs.checksum_file }}
         run: |
           $T = [char]96  # backtick, for markdown code spans in the notes
           $Notes = @"
@@ -506,18 +548,18 @@ jobs:
           Windows x86_64 release binaries (pinned target x86_64-pc-windows-msvc), built with
           cargo build --release --locked and staged/verified by packaging/windows/build.ps1 from
           the committed packaging/windows/manifest.json. Every binary is covered by the
-          SHA256SUMS.txt checksum manifest attached below (GNU sha256sum -c compatible).
+          $env:CHECKSUM_FILE checksum manifest attached below (GNU sha256sum -c compatible).
 
           **Artifacts**
 
           - nextide-cli.exe — NextIDE command-line interface (usage/help and the editor-kernel smoke flow)
           - nextide-shell.exe — NextIDE headless desktop shell bootstrap (command registry, Git status/diff model layer)
-          - SHA256SUMS.txt — SHA-256 checksum manifest (one '<hash>  <file>' line per binary)
+          - $env:CHECKSUM_FILE — SHA-256 checksum manifest (one '<hash>  <file>' line per binary)
           - manifest.json — validated release metadata (license / publisher / release_channel / artifact list)
 
           **Verify**
 
-          - ${T}sha256sum -c SHA256SUMS.txt${T} (GNU/coreutils) or
+          - ${T}sha256sum -c $env:CHECKSUM_FILE${T} (GNU/coreutils) or
           - ${T}powershell -ExecutionPolicy Bypass -File packaging\windows\verify-checksums.ps1 -DistDir <dir>${T}
           "@
           $NotesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
@@ -525,7 +567,7 @@ jobs:
           gh release create "$env:GITHUB_REF_NAME" `
             'dist/windows/nextide-cli.exe' `
             'dist/windows/nextide-shell.exe' `
-            'dist/windows/SHA256SUMS.txt' `
+            "dist/windows/$env:CHECKSUM_FILE" `
             'release-metadata/manifest.json' `
             --title "NextIDE $env:VERSION ($env:CHANNEL)" `
             --notes-file $NotesFile
