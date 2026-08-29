@@ -35,6 +35,17 @@
 //! - [`marker_for`] looks up one path's marker for tree-row badges; paths are
 //!   matched as-is (snapshot paths are relative to the repository top level,
 //!   which equals the workspace root in the normal case).
+//! - [`aggregate_directory_status`] aggregates every [`TreeStatus`] whose
+//!   path is a directory itself (for example a submodule entry) or a
+//!   component-wise descendant of it into one [`StatusKind`] for file-tree
+//!   *directory* badges: the most severe kind among the matching entries
+//!   (conflicts outrank two-sided changes, which outrank one-sided changes,
+//!   which outrank untracked; `Clean` entries carry no badge and are
+//!   ignored), or `None` when no changed entry is under the directory — the
+//!   same optional contract as [`marker_for`]. Renames and copies count by
+//!   their current path only, so the disappearing `original` path is not
+//!   re-marked. The projection is pure and deterministic: it never executes
+//!   git and never depends on iteration order.
 //!
 //! [`GitStatusAdapter`] is the mapping contract, with default methods that
 //! delegate to the free functions; [`DefaultGitStatusAdapter`] is the
@@ -302,6 +313,36 @@ pub fn marker_for(snapshot: &GitStatusSnapshot, path: &Path) -> Option<StatusKin
         .map(|entry| status_kind(entry.state))
 }
 
+/// Aggregates one directory's pending Git status for file-tree badges.
+///
+/// An entry belongs to `directory` when its [`TreeStatus::path`] equals
+/// `directory` (a directory-level entry, for example a submodule change) or
+/// is nested beneath it. Matching is component-wise via `Path::starts_with`,
+/// so `src/lib.rs` belongs to `src` while `src2/lib.rs` and `src-file.rs`
+/// do not; the empty path aggregates the whole repository. Rename and copy
+/// entries count by their current path only — the disappearing
+/// [`TreeStatus::original`] path is deliberately not re-marked, consistent
+/// with [`marker_for`] and [`tree_statuses`].
+///
+/// The aggregate is the most severe [`StatusKind`] among the matching
+/// entries — the minimum by the enum's `Ord`, which orders by severity
+/// (conflicts outrank two-sided changes, which outrank one-sided changes,
+/// which outrank untracked). [`StatusKind::Clean`] entries carry no badge
+/// and are ignored, so a directory whose matching entries are all clean
+/// aggregates exactly like an empty one. Returns `None` when no changed
+/// entry is under the directory — mirroring [`marker_for`]'s optional
+/// contract — and `Some` otherwise. The projection is pure and
+/// deterministic: it only reads the given statuses, never executes git, and
+/// never depends on iteration order.
+pub fn aggregate_directory_status(statuses: &[TreeStatus], directory: &Path) -> Option<StatusKind> {
+    statuses
+        .iter()
+        .filter(|status| status.kind.is_change())
+        .filter(|status| status.path == directory || status.path.starts_with(directory))
+        .map(|status| status.kind)
+        .min()
+}
+
 /// The mapping contract from a kernel snapshot to the UI-facing models.
 ///
 /// Every method has a default implementation delegating to the module's free
@@ -333,6 +374,16 @@ pub trait GitStatusAdapter {
     /// Looks up the marker for one tree path, if the snapshot reports it.
     fn marker_for(&self, snapshot: &GitStatusSnapshot, path: &Path) -> Option<StatusKind> {
         marker_for(snapshot, path)
+    }
+
+    /// Aggregates one directory's status for tree badges; see the free
+    /// [`aggregate_directory_status`] function for the exact semantics.
+    fn aggregate_directory_status(
+        &self,
+        statuses: &[TreeStatus],
+        directory: &Path,
+    ) -> Option<StatusKind> {
+        aggregate_directory_status(statuses, directory)
     }
 }
 
@@ -716,6 +767,275 @@ mod tests {
         assert_eq!(
             adapter.marker_for(&snapshot, std::path::Path::new("new.txt")),
             marker_for(&snapshot, std::path::Path::new("new.txt"))
+        );
+    }
+
+    /// Builds a `TreeStatus` with a given kind; the raw state is a
+    /// placeholder because aggregation only reads `path` and `kind`.
+    fn tree_status(path: &str, kind: StatusKind) -> TreeStatus {
+        TreeStatus {
+            path: std::path::PathBuf::from(path),
+            kind,
+            state: state("  "),
+            original: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_directory_status_returns_none_for_empty_and_unmatched() {
+        // No entries at all: every directory is clean.
+        let empty: Vec<TreeStatus> = Vec::new();
+        assert_eq!(aggregate_directory_status(&empty, Path::new("src")), None);
+
+        let statuses = vec![
+            tree_status("src/main.rs", StatusKind::Staged),
+            tree_status("notes.md", StatusKind::Untracked),
+        ];
+        // A directory with no entries under it is clean.
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("lib")),
+            None
+        );
+        // A path that merely shares a string prefix is not a descendant.
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src2")),
+            None
+        );
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src-file.rs")),
+            None
+        );
+        // Clean entries carry no badge: a directory whose matching entries
+        // are all clean aggregates exactly like an empty one.
+        let clean_only = vec![tree_status("src/main.rs", StatusKind::Clean)];
+        assert_eq!(
+            aggregate_directory_status(&clean_only, Path::new("src")),
+            None
+        );
+    }
+
+    #[test]
+    fn aggregate_directory_status_prioritizes_by_severity() {
+        // The six kinds in ascending severity, matching the enum's documented
+        // `Ord` contract (higher index = lower severity).
+        let ordered = [
+            StatusKind::Conflicted,
+            StatusKind::StagedAndUnstaged,
+            StatusKind::Staged,
+            StatusKind::Unstaged,
+            StatusKind::Untracked,
+            StatusKind::Clean,
+        ];
+        // Every pair: the more severe kind must win the aggregate.
+        for high in 0..ordered.len() {
+            for low in high + 1..ordered.len() {
+                let statuses = vec![
+                    tree_status("src/high.rs", ordered[high]),
+                    tree_status("src/low.rs", ordered[low]),
+                ];
+                assert_eq!(
+                    aggregate_directory_status(&statuses, Path::new("src")),
+                    Some(ordered[high]),
+                    "{:?} must outrank {:?}",
+                    ordered[high],
+                    ordered[low]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_directory_status_conflict_wins_over_every_mix() {
+        let statuses = vec![
+            tree_status("src/conflict.rs", StatusKind::Conflicted),
+            tree_status("src/both.rs", StatusKind::StagedAndUnstaged),
+            tree_status("src/staged.rs", StatusKind::Staged),
+            tree_status("src/unstaged.rs", StatusKind::Unstaged),
+            tree_status("src/untracked.rs", StatusKind::Untracked),
+        ];
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src")),
+            Some(StatusKind::Conflicted)
+        );
+    }
+
+    #[test]
+    fn aggregate_directory_status_returns_the_kind_of_a_single_entry() {
+        for kind in [
+            StatusKind::Conflicted,
+            StatusKind::StagedAndUnstaged,
+            StatusKind::Staged,
+            StatusKind::Unstaged,
+            StatusKind::Untracked,
+        ] {
+            let statuses = vec![tree_status("src/main.rs", kind)];
+            assert_eq!(
+                aggregate_directory_status(&statuses, Path::new("src")),
+                Some(kind),
+                "a directory with a single {kind:?} entry aggregates to it"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_directory_status_matches_nested_descendants_component_wise() {
+        let statuses = vec![
+            tree_status("src/feature/mod.rs", StatusKind::Unstaged),
+            tree_status("src/lib.rs", StatusKind::Staged),
+        ];
+        // The deepest directory sees only its own descendants.
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src/feature")),
+            Some(StatusKind::Unstaged)
+        );
+        // Ancestors aggregate every descendant by severity.
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src")),
+            Some(StatusKind::Staged)
+        );
+    }
+
+    #[test]
+    fn aggregate_directory_status_aggregates_across_all_nesting_levels() {
+        let statuses = vec![
+            tree_status("a/b/c/d/conflict.rs", StatusKind::Conflicted),
+            tree_status("a/b/untracked.txt", StatusKind::Untracked),
+        ];
+        for directory in ["a", "a/b", "a/b/c", "a/b/c/d"] {
+            assert_eq!(
+                aggregate_directory_status(&statuses, Path::new(directory)),
+                Some(StatusKind::Conflicted),
+                "every ancestor of the conflict must aggregate to it"
+            );
+        }
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("a/x")),
+            None
+        );
+    }
+
+    #[test]
+    fn aggregate_directory_status_excludes_siblings_and_prefix_only_paths() {
+        let statuses = vec![
+            tree_status("src/main.rs", StatusKind::Unstaged),
+            tree_status("src-extra/main.rs", StatusKind::Staged),
+            tree_status("srcfile.rs", StatusKind::Untracked),
+            tree_status("other/main.rs", StatusKind::Conflicted),
+        ];
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src")),
+            Some(StatusKind::Unstaged)
+        );
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src-extra")),
+            Some(StatusKind::Staged)
+        );
+    }
+
+    #[test]
+    fn aggregate_directory_status_counts_a_directory_level_entry() {
+        // A status entry whose path *is* the directory (for example a
+        // submodule change) marks that directory directly.
+        let statuses = vec![tree_status("vendor", StatusKind::Unstaged)];
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("vendor")),
+            Some(StatusKind::Unstaged)
+        );
+    }
+
+    #[test]
+    fn aggregate_directory_status_root_aggregates_everything() {
+        let statuses = vec![
+            tree_status("src/main.rs", StatusKind::Unstaged),
+            tree_status("Cargo.toml", StatusKind::Staged),
+        ];
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("")),
+            Some(StatusKind::Staged)
+        );
+    }
+
+    #[test]
+    fn aggregate_directory_status_is_order_independent() {
+        let forward = vec![
+            tree_status("src/conflict.rs", StatusKind::Conflicted),
+            tree_status("src/untracked.rs", StatusKind::Untracked),
+            tree_status("src/staged.rs", StatusKind::Staged),
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        let shuffled = vec![forward[2].clone(), forward[0].clone(), forward[1].clone()];
+        for statuses in [&forward, &reversed, &shuffled] {
+            assert_eq!(
+                aggregate_directory_status(statuses, Path::new("src")),
+                Some(StatusKind::Conflicted),
+                "aggregation must not depend on iteration order"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_directory_status_matches_renames_by_current_path_only() {
+        // A rename is reported under its current path; the disappearing
+        // `original` path is deliberately not re-marked, consistent with
+        // `marker_for` and `tree_statuses`.
+        let renamed = TreeStatus {
+            path: PathBuf::from("lib/new.rs"),
+            kind: StatusKind::Staged,
+            state: state("R "),
+            original: Some(PathBuf::from("src/old.rs")),
+        };
+        let statuses = vec![renamed];
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("lib")),
+            Some(StatusKind::Staged)
+        );
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src")),
+            None
+        );
+    }
+
+    #[test]
+    fn default_adapter_aggregates_directories_like_the_free_function() {
+        let adapter = DefaultGitStatusAdapter;
+        let statuses = vec![
+            tree_status("src/main.rs", StatusKind::Unstaged),
+            tree_status("src/feature/mod.rs", StatusKind::Untracked),
+            tree_status("lib/mod.rs", StatusKind::Conflicted),
+        ];
+        for directory in ["src", "src/feature", "lib", "other", ""] {
+            assert_eq!(
+                adapter.aggregate_directory_status(&statuses, Path::new(directory)),
+                aggregate_directory_status(&statuses, Path::new(directory))
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_directory_status_composes_with_tree_statuses() {
+        let snapshot = snapshot(vec![
+            entry("??", "src/untracked.txt", None),
+            entry(" M", "src/feature/mod.rs", None),
+            entry("M ", "lib/mod.rs", None),
+            entry("UU", "conflict.rs", None),
+        ]);
+        let statuses = tree_statuses(&snapshot);
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src")),
+            Some(StatusKind::Unstaged)
+        );
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("src/feature")),
+            Some(StatusKind::Unstaged)
+        );
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("lib")),
+            Some(StatusKind::Staged)
+        );
+        assert_eq!(
+            aggregate_directory_status(&statuses, Path::new("")),
+            Some(StatusKind::Conflicted)
         );
     }
 }

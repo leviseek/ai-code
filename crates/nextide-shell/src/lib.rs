@@ -23,8 +23,8 @@ pub use commands::{
 };
 pub use event_loop::{EventLoop, HeadlessEventLoop};
 pub use git_status::{
-    marker_for, status_kind, summary, summary_text, tree_statuses, DefaultGitStatusAdapter,
-    GitStatusAdapter, GitStatusSummary, StatusKind, TreeStatus,
+    aggregate_directory_status, marker_for, status_kind, summary, summary_text, tree_statuses,
+    DefaultGitStatusAdapter, GitStatusAdapter, GitStatusSummary, StatusKind, TreeStatus,
 };
 pub use input::{command_for_input, UiInput};
 pub use keymap::{command_for, KeyChord};
