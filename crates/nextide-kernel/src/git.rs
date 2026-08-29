@@ -317,6 +317,26 @@
 //! - Staged changes are never discarded: the worktree is rewritten from the
 //!   index, so a path with staged modifications keeps them.
 //!
+//! [`restore_staged(root, paths)`](restore_staged) discards the named paths'
+//! *staged* changes with `git -C <root> restore --staged -- <paths>` and
+//! returns the fresh [`GitStatusSnapshot`] from [`status`]: the index entries
+//! for the named paths are reset to HEAD, so staged changes are un-staged —
+//! worktree files are never touched, so an unstaged edit on top of a staged
+//! change keeps both. Every path is validated before git is spawned with the
+//! same rules as [`stage`], [`unstage`] and [`restore`]: non-empty, rooted at
+//! `root` (relative, free of parent, root and drive components), not
+//! `:`-prefixed (git pathspec magic), and passed as its own argument after the
+//! `--` separator — so option-like names such as `--help` or `-f` are restored
+//! literally — while an empty `paths` slice is rejected with
+//! [`io::ErrorKind::InvalidInput`]. A `.` pathspec un-stages everything under
+//! `root` (git resolves it relative to `root`), like [`unstage`].
+//!
+//! ## Dangerous-operation boundary (restore --staged)
+//!
+//! `restore_staged` rewrites the *index* from HEAD for the named paths:
+//! staged changes are discarded from the index and cannot be recovered unless
+//! they were committed or stashed first, while the worktree is never touched.
+//!
 //! [`stash_push(root, message)`](stash_push) moves the repository's tracked
 //! changes (staged and unstaged) into a new stash entry with
 //! `git -C <root> stash push [--message=<message>]` and returns the fresh
@@ -2802,6 +2822,79 @@ fn run_git_restore(program: &str, root: &Path, paths: &[&Path]) -> io::Result<()
 /// Validates a caller-supplied restore path: see [`check_index_path`].
 fn check_restore_path(path: &Path) -> io::Result<()> {
     check_index_path(path, "restore path")
+}
+
+/// Discards the given paths' staged changes and returns the resulting
+/// [`GitStatusSnapshot`] from [`status`].
+///
+/// Runs `git -C <root> restore --staged -- <paths>`: no shell, and every path
+/// is passed as its own argument after the `--` separator, so option-like
+/// names such as `--help` or `-f` are restored literally. Paths are validated
+/// before git is spawned with the same rules as [`stage`], [`unstage`] and
+/// [`restore`]: non-empty, rooted at `root` (relative and free of parent, root
+/// and drive components) and not `:`-prefixed (git pathspec magic); an empty
+/// `paths` slice is rejected the same way.
+///
+/// `--staged` makes the *index* the worktree being rewritten and HEAD the
+/// source: the named paths' index entries are reset to HEAD — staged changes
+/// are un-staged — while the worktree files are never touched, so an unstaged
+/// edit on top of a staged change keeps both. Untracked files are never
+/// affected, and a path with nothing staged is a no-op. See the
+/// "Dangerous-operation boundary (restore --staged)" section in the module
+/// docs.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::NotFound`] if `root` does not exist or `git` is not on
+///   `PATH`.
+/// - [`io::ErrorKind::NotADirectory`] if `root` exists but is not a
+///   directory.
+/// - [`io::ErrorKind::InvalidInput`] if `paths` is empty or contains a path
+///   that is not rooted at `root` or starts with `:`.
+/// - [`io::ErrorKind::Other`] if `git restore` exits non-zero (for example a
+///   pathspec that matches nothing in the index — such as an untracked or
+///   non-existent path — or an unmerged path); git's message is included.
+/// - [`io::ErrorKind::InvalidData`] if the fresh [`status`] output cannot be
+///   parsed or reports a path that escapes the repository root.
+pub fn restore_staged(root: &Path, paths: &[&Path]) -> io::Result<GitStatusSnapshot> {
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    if paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one path must be restored",
+        ));
+    }
+    for path in paths {
+        check_restore_staged_path(path)?;
+    }
+    run_git_restore_staged("git", root, paths)?;
+    status(root)
+}
+
+/// Runs `program -C root restore --staged -- <paths>`; split out so tests can
+/// exercise the spawn-failure path with a program that does not exist.
+fn run_git_restore_staged(program: &str, root: &Path, paths: &[&Path]) -> io::Result<()> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(root)
+        .arg("restore")
+        .arg("--staged")
+        .arg("--")
+        .args(paths)
+        .output()?;
+    ensure_git_success(&output, "restore --staged")
+}
+
+/// Validates a caller-supplied restore `--staged` path: see
+/// [`check_index_path`].
+fn check_restore_staged_path(path: &Path) -> io::Result<()> {
+    check_index_path(path, "restore --staged path")
 }
 
 /// Stashes the repository's tracked changes and returns the resulting
@@ -5624,6 +5717,307 @@ mod tests {
             return;
         }
         let error = restore(&root, &[Path::new("a.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- restore_staged() argument safety (no git binary needed) ----
+
+    #[test]
+    fn restore_staged_missing_root_is_not_found() {
+        let missing = std::env::temp_dir().join(format!(
+            "nextide-restore-staged-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(
+            restore_staged(&missing, &[Path::new("a.txt")])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn restore_staged_file_root_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "nextide-restore-staged-notdir-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            restore_staged(&file, &[Path::new("a.txt")])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotADirectory
+        );
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn restore_staged_empty_paths_is_invalid_input() {
+        let root = temp_dir("restorestagedempty");
+        let error = restore_staged(&root, &[]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_rejects_unrooted_and_magic_paths() {
+        let root = temp_dir("restorestagedbad");
+        for path in [
+            Path::new(""),
+            Path::new("/etc/passwd"),
+            Path::new("..\\outside.txt"),
+            Path::new("a/../../outside.txt"),
+            Path::new("C:\\windows\\file.txt"),
+            Path::new("C:drive-relative.txt"),
+            Path::new("\\\\server\\share\\file.txt"),
+            Path::new(":(top)etc"),
+            Path::new(":(exclude)secret"),
+        ] {
+            let error = restore_staged(&root, &[path]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "path {path:?} should be rejected"
+            );
+        }
+        // `.` (un-stage everything under root) passes validation.
+        check_restore_staged_path(Path::new(".")).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_git_binary_for_restore_staged_surfaces_as_not_found() {
+        let root = temp_dir("restorestagednobinary");
+        let error =
+            run_git_restore_staged("nextide-no-such-git-binary", &root, &[Path::new("a.txt")])
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- restore_staged() integration (requires a git binary) ----
+
+    #[test]
+    fn restore_staged_unstages_staged_changes_and_keeps_worktree_edits() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorestagedunst", &[("a.txt", "base")]);
+        fs::write(root.join("a.txt"), "staged").unwrap();
+        stage(&root, &[Path::new("a.txt")]).unwrap();
+        fs::write(root.join("a.txt"), "dirty").unwrap();
+
+        // The index returns to HEAD while the worktree edit survives: a.txt
+        // is now an unstaged modification only.
+        let snapshot = restore_staged(&root, &[Path::new("a.txt")]).unwrap();
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "dirty");
+        let entry = find(&snapshot, "a.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_unstages_a_staged_new_file_to_untracked() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorestagednew", &[("a.txt", "a")]);
+        fs::write(root.join("new.txt"), "n").unwrap();
+        stage(&root, &[Path::new("new.txt")]).unwrap();
+        let before = status(&root).unwrap();
+        assert_eq!(
+            find(&before, "new.txt").state,
+            GitFileState::new(GitStatusCode::Added, GitStatusCode::Unmodified)
+        );
+
+        // new.txt is not in HEAD, so restoring the index entry un-stages it:
+        // the file stays in the worktree and becomes untracked again.
+        let snapshot = restore_staged(&root, &[Path::new("new.txt")]).unwrap();
+        assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "n");
+        let entry = find(&snapshot, "new.txt");
+        assert!(entry.state.is_untracked());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_turns_a_staged_deletion_into_an_unstaged_deletion() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorestageddel", &[("gone.txt", "x")]);
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        stage(&root, &[Path::new("gone.txt")]).unwrap();
+        let before = status(&root).unwrap();
+        assert_eq!(
+            find(&before, "gone.txt").state,
+            GitFileState::new(GitStatusCode::Deleted, GitStatusCode::Unmodified)
+        );
+
+        // The index entry returns to HEAD (the file exists in the index
+        // again) while the worktree file stays deleted: an unstaged deletion.
+        let snapshot = restore_staged(&root, &[Path::new("gone.txt")]).unwrap();
+        assert!(!root.join("gone.txt").exists());
+        let entry = find(&snapshot, "gone.txt");
+        assert_eq!(
+            entry.state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Deleted)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_handles_option_like_quoted_and_whitespace_paths() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo(
+            "restorestagedopt",
+            &[("--help", "help"), ("with space 中文.txt", "w")],
+        );
+        fs::write(root.join("--help"), "dirty-help").unwrap();
+        fs::write(root.join("with space 中文.txt"), "dirty-w").unwrap();
+        stage(
+            &root,
+            &[Path::new("--help"), Path::new("with space 中文.txt")],
+        )
+        .unwrap();
+        let snapshot = restore_staged(
+            &root,
+            &[Path::new("--help"), Path::new("with space 中文.txt")],
+        )
+        .unwrap();
+        // Un-staged: the worktree keeps the dirty edits and both files now
+        // report as unstaged modifications.
+        assert_eq!(
+            find(&snapshot, "--help").state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        assert_eq!(
+            find(&snapshot, "with space 中文.txt").state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("--help")).unwrap(),
+            "dirty-help"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("with space 中文.txt")).unwrap(),
+            "dirty-w"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_with_dot_unstages_the_whole_root() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorestageddot", &[("a.txt", "a"), ("sub/b.txt", "b")]);
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("sub/b.txt"), "B").unwrap();
+        stage(&root, &[Path::new(".")]).unwrap();
+
+        // Un-staging the whole root keeps both worktree edits.
+        let snapshot = restore_staged(&root, &[Path::new(".")]).unwrap();
+        assert_eq!(
+            find(&snapshot, "a.txt").state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        assert_eq!(
+            find(&snapshot, "sub/b.txt").state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(root.join("sub/b.txt")).unwrap(), "B");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_from_nested_root_resolves_paths_relative_to_root() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo(
+            "restorestagednested",
+            &[("sub/a.txt", "a"), ("sub/b.txt", "b")],
+        );
+        fs::write(root.join("sub/a.txt"), "A").unwrap();
+        fs::write(root.join("sub/b.txt"), "B").unwrap();
+        stage(&root, &[Path::new("sub/a.txt"), Path::new("sub/b.txt")]).unwrap();
+
+        // The pathspec is resolved relative to `root` (the nested directory):
+        // only a.txt's index entry returns to HEAD; b.txt stays staged.
+        let snapshot = restore_staged(&root.join("sub"), &[Path::new("a.txt")]).unwrap();
+        assert_eq!(
+            find(&snapshot, "sub/a.txt").state,
+            GitFileState::new(GitStatusCode::Unmodified, GitStatusCode::Modified)
+        );
+        assert_eq!(
+            find(&snapshot, "sub/b.txt").state,
+            GitFileState::new(GitStatusCode::Modified, GitStatusCode::Unmodified)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_with_nothing_staged_is_a_no_op() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorestagedclean", &[("a.txt", "a")]);
+        let snapshot = restore_staged(&root, &[Path::new("a.txt")]).unwrap();
+        assert!(snapshot.is_clean());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_nonexistent_path_propagates_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = init_repo("restorestagedmiss", &[("a.txt", "a")]);
+        let error = restore_staged(&root, &[Path::new("no-such-file.txt")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("did not match any file(s)"),
+            "message was: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_staged_non_repo_directory_fails_with_git_error() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let root = temp_dir("restorestagednonrepo");
+        if inside_existing_repo(&root) {
+            eprintln!("skipping: temp dir is nested inside an existing git repository");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let error = restore_staged(&root, &[Path::new("a.txt")]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let message = error.to_string();
         assert!(
